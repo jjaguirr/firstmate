@@ -170,6 +170,52 @@ SH
   done
 }
 
+# fm_fake_treehouse_lease <fakebin>: install a deterministic Treehouse stub
+# for spawn tests. It models the durable lease contract used by ordinary task
+# creation: get returns one path plus its opaque lease identity, status returns
+# that same exact lease, and return succeeds. Callers select the leased path
+# with FM_FAKE_PANE_PATH or FM_FAKE_TREEHOUSE_PATH.
+fm_fake_treehouse_lease() {
+  local fakebin=$1
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+path=${FM_FAKE_TREEHOUSE_PATH:-${FM_FAKE_PANE_PATH:-}}
+[ -n "$path" ] || exit 1
+record="$(dirname "$0")/.treehouse-lease-record"
+holder=
+for arg in "$@"; do
+  case "$arg" in --lease-holder=*) holder=${arg#--lease-holder=} ;; esac
+done
+if [ -z "$holder" ]; then
+  previous=
+  for arg in "$@"; do
+    if [ "$previous" = --lease-holder ]; then
+      holder=$arg
+      break
+    fi
+    previous=$arg
+  done
+fi
+lease_id="lease-${holder:-fixture}"
+case "${1:-}" in
+  get)
+    printf '%s\t%s\t%s\n' "$path" "$lease_id" "$holder" > "$record"
+    printf '{"path":"%s","lease_id":"%s","lease_holder":"%s"}\n' "$path" "$lease_id" "$holder"
+    ;;
+  status)
+    [ -f "$record" ] || exit 1
+    IFS=$'\t' read -r path lease_id holder < "$record"
+    printf '[{"path":"%s","status":"leased","lease_id":"%s","lease_holder":"%s"}]\n' "$path" "$lease_id" "$holder"
+    exit 0
+    ;;
+  return) exit 0 ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/treehouse"
+}
+
 # fm_fake_version_tool <fakebin> <tool> <override-env-var> <default-version>
 # The stub answers `--version` with <override-env-var> when that variable is set
 # and non-empty, and with <default-version> otherwise; every other invocation

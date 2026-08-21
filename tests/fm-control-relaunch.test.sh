@@ -36,9 +36,14 @@ TMP_ROOT=$(fm_test_tmproot fm-control-relaunch)
 mkdir -p "$TMP_ROOT"
 TMP_ROOT=$(cd "$TMP_ROOT" && pwd)
 TASK_TMPS=()
+REATTACH_TEST_PIDS=()
 
 relaunch_cleanup() {
-  local d
+  local d pid
+  for pid in "${REATTACH_TEST_PIDS[@]:-}"; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
   for d in "${TASK_TMPS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
@@ -111,6 +116,19 @@ case "${1:-}" in
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
   list-windows) [ -f "$D/windows" ] && cat "$D/windows"; exit 0 ;;
+  new-window)
+    [ -z "${FM_FAKE_NEW_WINDOW_FAIL:-}" ] || exit 1
+    name=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -n) name=${2:-}; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -n "$name" ] || exit 1
+    printf '%s\n' "$name" > "$D/windows"
+    printf '%s\n' '@replacement'
+    exit 0 ;;
 esac
 exit 0
 SH
@@ -120,6 +138,19 @@ SH
 exit 0
 SH
   chmod +x "$fb/sleep"
+  cat > "$fb/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  status)
+    cat "$FM_FAKE_DIR/treehouse-status"
+    exit 0
+    ;;
+  return) exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$fb/treehouse"
 }
 
 # new_case <name> [id] -> echoes a case dir with a live claude ship task.
@@ -158,6 +189,22 @@ add_ship_task() {
   printf '%s\n' "fm-$id" > "$dir/fake/windows"
   printf '%s' "$wt" > "$dir/fake/cwd"
   TASK_TMPS+=("/tmp/fm-$id")
+}
+
+add_treehouse_lease() {  # <case-dir> <id> [holder]
+  local dir=$1 id=$2 holder=${3:-} home="$1/home" wt lease_id
+  wt="$dir/wt"
+  # shellcheck source=/dev/null
+  . "$ROOT/bin/fm-worktree-lease-lib.sh"
+  [ -n "$holder" ] || holder=$(fm_worktree_lease_holder "$home" "$id")
+  lease_id="lease-$id"
+  {
+    echo "worktree_lease_id=$lease_id"
+    echo "worktree_lease_holder=$holder"
+    echo "worktree_lease_home=$home"
+  } >> "$home/state/$id.meta"
+  printf '[{"path":"%s","status":"leased","lease_id":"%s","lease_holder":"%s"}]\n' \
+    "$wt" "$lease_id" "$holder" > "$dir/fake/treehouse-status"
 }
 
 run_control() {  # <case-dir> <args...>
@@ -1312,6 +1359,133 @@ test_spawn_relaunch_refuses_a_pane_outside_the_worktree() {
   pass "fm-spawn --relaunch: refuses to start a replacement outside the copy holding the work"
 }
 
+# --- 7. missing-endpoint reattach -------------------------------------------
+
+test_missing_endpoint_reattaches_the_exact_clean_or_dirty_worktree() {
+  local dir out rc branch custom
+  dir=$(new_case missing-reattach rl40)
+  add_ship_task "$dir" rl40 claude
+  add_treehouse_lease "$dir" rl40
+  branch=$(git -C "$dir/wt" rev-parse --abbrev-ref HEAD)
+  printf 'uncommitted work\n' > "$dir/wt/dirty.txt"
+  custom='delivery_receipt=preserve-me'
+  printf '%s\n' "$custom" >> "$dir/home/state/rl40.meta"
+  : > "$dir/fake/windows"
+
+  out=$(run_control "$dir" rl40 relaunch --note "endpoint disappeared after preserving local work"); rc=$?
+  expect_code 0 "$rc" "a missing endpoint with an exact lease should reattach"$'\n'"$out"
+  assert_contains "$out" "relaunched rl40" "reattach should use the normal operator command"
+  [ "$(meta_field "$dir" rl40 window)" = "fmses:fm-rl40" ] \
+    || fail "reattach should recreate only the recorded session endpoint"
+  [ "$(meta_field "$dir" rl40 worktree)" = "$dir/wt" ] \
+    || fail "reattach must retain the exact recorded worktree"
+  [ "$(meta_field "$dir" rl40 worktree_lease_id)" = lease-rl40 ] \
+    || fail "reattach must retain the opaque Treehouse lease identity"
+  [ "$(meta_field "$dir" rl40 delivery_receipt)" = preserve-me ] \
+    || fail "reattach must retain independent durable metadata"
+  [ "$(git -C "$dir/wt" rev-parse --abbrev-ref HEAD)" = "$branch" ] \
+    || fail "reattach must not change the worktree branch"
+  [ "$(cat "$dir/wt/dirty.txt")" = "uncommitted work" ] \
+    || fail "reattach must retain uncommitted work"
+  assert_grep 'fm-rl40' "$dir/fake/windows" \
+    "reattach should create one replacement endpoint in the recorded session"
+  [ "$(journal_field "$dir" rl40 exit_result)" = endpoint-missing-reattach ] \
+    || fail "the transaction journal should distinguish missing-endpoint recovery"
+  pass "fm-control relaunch: a missing endpoint reattaches exactly one clean or dirty leased worktree"
+}
+
+test_missing_endpoint_refuses_a_foreign_lease_without_creating_an_agent() {
+  local dir out rc meta_before brief_before
+  dir=$(new_case foreign-lease rl41)
+  add_ship_task "$dir" rl41 claude
+  add_treehouse_lease "$dir" rl41 firstmate-foreign-rl41
+  : > "$dir/fake/windows"
+  cp "$dir/home/state/rl41.meta" "$dir/meta.before"
+  cp "$dir/home/data/rl41/brief.md" "$dir/brief.before"
+
+  out=$(run_control "$dir" rl41 relaunch --note "must not adopt foreign work"); rc=$?
+  expect_code 1 "$rc" "a foreign Treehouse lease must refuse reattach"
+  assert_contains "$out" "exact live Treehouse lease" "the refusal should name ownership proof"
+  cmp -s "$dir/home/state/rl41.meta" "$dir/meta.before" \
+    || fail "foreign-lease refusal must retain the original durable record"
+  cmp -s "$dir/home/data/rl41/brief.md" "$dir/brief.before" \
+    || fail "foreign-lease refusal must not append a progress note"
+  [ ! -s "$dir/fake/windows" ] || fail "foreign-lease refusal must not create a replacement endpoint"
+  pass "fm-control relaunch: a missing endpoint never adopts a foreign Treehouse lease"
+}
+
+test_missing_endpoint_refuses_an_absent_worktree_without_creating_an_agent() {
+  local dir out rc
+  dir=$(new_case missing-worktree-reattach rl42)
+  add_ship_task "$dir" rl42 claude
+  add_treehouse_lease "$dir" rl42
+  : > "$dir/fake/windows"
+  mv "$dir/wt" "$dir/wt-absent"
+
+  out=$(run_control "$dir" rl42 relaunch --note "worktree must be restored first"); rc=$?
+  expect_code 1 "$rc" "an absent worktree must refuse missing-endpoint reattach"
+  assert_contains "$out" "recorded worktree" "the refusal should name the missing local copy"
+  [ ! -s "$dir/fake/windows" ] || fail "missing-worktree refusal must not create an endpoint"
+  pass "fm-control relaunch: a missing endpoint refuses when its exact worktree is absent"
+}
+
+test_missing_endpoint_launch_failure_keeps_the_prior_durable_record() {
+  local dir out rc
+  dir=$(new_case missing-launch-failure rl43)
+  add_ship_task "$dir" rl43 claude
+  add_treehouse_lease "$dir" rl43
+  : > "$dir/fake/windows"
+  cp "$dir/home/state/rl43.meta" "$dir/meta.before"
+
+  out=$(FM_FAKE_NEW_WINDOW_FAIL=1 run_control "$dir" rl43 relaunch --note "replacement creation failed"); rc=$?
+  expect_code 1 "$rc" "a failed replacement endpoint create must fail the transaction"
+  assert_contains "$out" "replacement agent" "the control plane should name the failed replacement"
+  cmp -s "$dir/home/state/rl43.meta" "$dir/meta.before" \
+    || fail "failed missing-endpoint launch must retain the prior durable record"
+  [ "$(journal_field "$dir" rl43 phase)" = failed:launching ] \
+    || fail "failed missing-endpoint launch must record its launch phase"
+  [ "$(journal_field "$dir" rl43 rollback)" = prior-record-kept ] \
+    || fail "failed missing-endpoint launch must retain its recoverable record"
+  pass "fm-control relaunch: missing-endpoint launch failure rolls back to the prior durable record"
+}
+
+test_missing_endpoint_refuses_a_live_process_in_the_recorded_worktree() {
+  local dir out rc live_pid
+  dir=$(new_case live-worktree-process rl45)
+  add_ship_task "$dir" rl45 claude
+  add_treehouse_lease "$dir" rl45
+  : > "$dir/fake/windows"
+  (cd "$dir/wt" && exec sleep 30) &
+  live_pid=$!
+  REATTACH_TEST_PIDS+=("$live_pid")
+
+  out=$(run_control "$dir" rl45 relaunch --note "must not duplicate detached worker"); rc=$?
+  expect_code 1 "$rc" "a process still rooted in the worktree must refuse reattach"
+  assert_contains "$out" "still run from its recorded worktree" \
+    "the refusal should name the detached-process proof"
+  [ ! -s "$dir/fake/windows" ] || fail "live-process refusal must not create a replacement endpoint"
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  REATTACH_TEST_PIDS=()
+  pass "fm-control relaunch: a missing endpoint refuses while a live worktree process remains"
+}
+
+test_spawn_relaunch_reattaches_a_missing_endpoint_from_the_record() {
+  local dir out rc
+  dir=$(new_case direct-missing-reattach rl44)
+  add_ship_task "$dir" rl44 claude
+  add_treehouse_lease "$dir" rl44
+  : > "$dir/fake/windows"
+
+  out=$(run_spawn "$dir" rl44 --relaunch --harness claude); rc=$?
+  expect_code 0 "$rc" "direct spawn relaunch should recover a proven missing endpoint"$'\n'"$out"
+  [ "$(meta_field "$dir" rl44 worktree)" = "$dir/wt" ] \
+    || fail "direct missing-endpoint reattach must retain the recorded worktree"
+  assert_grep 'fm-rl44' "$dir/fake/windows" \
+    "direct missing-endpoint reattach must create a replacement endpoint"
+  pass "fm-spawn --relaunch: a proven missing endpoint reattaches the recorded leased worktree"
+}
+
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
@@ -1358,3 +1532,9 @@ test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_contradicting_flags
 test_spawn_relaunch_refuses_an_unrecorded_task
 test_spawn_relaunch_refuses_a_pane_outside_the_worktree
+test_missing_endpoint_reattaches_the_exact_clean_or_dirty_worktree
+test_missing_endpoint_refuses_a_foreign_lease_without_creating_an_agent
+test_missing_endpoint_refuses_an_absent_worktree_without_creating_an_agent
+test_missing_endpoint_launch_failure_keeps_the_prior_durable_record
+test_missing_endpoint_refuses_a_live_process_in_the_recorded_worktree
+test_spawn_relaunch_reattaches_a_missing_endpoint_from_the_record

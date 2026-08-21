@@ -31,10 +31,15 @@
 #              busy, then submits the harness's exit command. Postcondition:
 #              the backend's recovery-grade classifier reports the agent gone.
 #              Already-stopped is success (idempotent).
-#   relaunch   Transactionally replace the running agent with a new one, in the
-#              SAME endpoint and SAME worktree, on the same or a newly chosen
-#              harness/model/effort - so switching harness is one ordinary use
-#              of this verb. With no explicit axis, a secondmate re-resolves its
+#   relaunch   Transactionally replace the running agent with a new one in the
+#              SAME endpoint and SAME worktree, or reattach a positively
+#              missing ordinary-worker endpoint by creating one replacement in
+#              its exact recorded worktree. A missing endpoint is accepted only
+#              for a ship or scout whose durable Treehouse lease proves the
+#              exact task/home/worktree binding; labels, paths, and branches do
+#              not prove ownership. The recorded tmux or named Herdr session
+#              must create the replacement safely and its shell must bind to
+#              that worktree. With no explicit axis, a secondmate re-resolves its
 #              durable config/secondmate-harness pin (harness plus its optional
 #              model and effort tokens) exactly as any other respawn does, while
 #              a ship or scout keeps the exact adapter already recorded for it.
@@ -44,12 +49,12 @@
 #              inherits the local copy but none of the conversation; a
 #              secondmate reconciles its own home's records at startup, so its
 #              standing charter is never rewritten.
-#              Records a durable checkpoint and that note, exits the old agent,
-#              then delegates the launch to its single owner,
-#              bin/fm-spawn.sh --relaunch. A failure before publication keeps
-#              the prior durable record in place and reports the concrete
+#              Records a durable checkpoint and that note, exits an existing
+#              old agent when present, then delegates the launch to its single
+#              owner, bin/fm-spawn.sh --relaunch. A failure before publication
+#              keeps the prior durable record in place and reports the concrete
 #              state; it never leaves a half-transitioned task claiming to be
-#              running.
+#              running or returns a recorded worktree.
 #
 # Teardown and discard are NOT verbs here and never will be. `exit` stops an
 # agent and preserves everything else; removing a worktree, killing an
@@ -82,6 +87,11 @@
 #     than reported as successful blind.
 #   - An ambiguous or unreadable endpoint state refuses; only a positively
 #     classified state acts.
+#   - Missing-endpoint reattach refuses when the worktree or its exact durable
+#     lease is absent, foreign, ambiguous, or unreadable, when any live process
+#     remains rooted in the worktree, or when the recorded backend/session
+#     cannot safely create and bind one replacement endpoint. zellij, orca, and cmux remain unsupported
+#     because their adapters cannot prove a vanished endpoint agent-free.
 #
 # Environment knobs (all bounded waits, seconds):
 #   FM_CONTROL_POLL              poll interval for postcondition waits (0.5)
@@ -130,6 +140,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-busy-lib.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
+# shellcheck source=bin/fm-worktree-lease-lib.sh
+. "$SCRIPT_DIR/fm-worktree-lease-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
@@ -150,6 +162,7 @@ CONTROL_LOCK=
 CONTROL_LOCK_HELD=0
 RELAUNCH_ACTIVE=0
 RELAUNCH_PHASE=start
+RELAUNCH_MISSING_ENDPOINT=0
 
 control_cleanup() {
   local status=$?
@@ -290,6 +303,7 @@ LABEL="fm-$ID"
 RECORDED_HARNESS=$(fm_meta_get "$META" harness)
 KIND=$(fm_meta_get "$META" kind)
 WT=$(fm_meta_get "$META" worktree)
+PROJ=$(fm_meta_get "$META" project)
 [ -n "$KIND" ] || KIND=ship
 
 HARNESS=$(fm_control_harness_family "$RECORDED_HARNESS") \
@@ -574,7 +588,7 @@ relaunch_rollback() {
           ;;
       esac
       ;;
-    exited|launching)
+    reattaching|exited|launching)
       if [ "$RELAUNCH_AGENT_CONFIRMED" = 1 ]; then
         journal_write "failed:$RELAUNCH_PHASE" "rollback=none-new-agent-confirmed" || true
         echo "error: $ID's replacement is running on $TARGET_HARNESS, but transaction completion could not be persisted; its published record was retained for reconciliation" >&2
@@ -590,7 +604,11 @@ relaunch_rollback() {
         echo "error: $ID was relaunched on $TARGET_HARNESS but no running agent could be confirmed; its work is preserved at $WT" >&2
       else
         journal_write "failed:$RELAUNCH_PHASE" "rollback=prior-record-kept" || true
-        echo "error: $ID's agent was stopped but the replacement did not launch; no agent is running, and its work plus the recorded progress note are preserved at $WT" >&2
+        if [ "$RELAUNCH_MISSING_ENDPOINT" = 1 ]; then
+          echo "error: $ID's endpoint was already missing and the replacement did not launch; its prior durable record, work, and recorded progress note are preserved at $WT" >&2
+        else
+          echo "error: $ID's agent was stopped but the replacement did not launch; no agent is running, and its work plus the recorded progress note are preserved at $WT" >&2
+        fi
       fi
       ;;
   esac
@@ -766,7 +784,7 @@ record_note() {
 }
 
 do_relaunch() {
-  local exit_result state note_line
+  local exit_result state note_line missing_endpoint=0
   local -a spawn_args
 
   require_state_verified_backend relaunch
@@ -796,6 +814,30 @@ do_relaunch() {
     note_line="note=none"
   fi
   safe_checkpoint
+  state=$(agent_state)
+  case "$state" in
+    alive|dead) ;;
+    missing)
+      case "$KIND" in
+        ship|scout) ;;
+        *) die "task $ID is a $KIND task; missing-endpoint reattach is supported only for ordinary ship or scout workers" ;;
+      esac
+      [ -n "$PROJ" ] || die "task $ID has no recorded project, so its missing endpoint cannot prove worktree ownership"
+      fm_worktree_lease_verify_meta "$META" "$PROJ" "$WT" "$FM_HOME" "$ID" \
+        || die "task $ID's missing endpoint can be reattached only when its recorded worktree has one exact live Treehouse lease for this task and home; refusing ambiguous or foreign ownership"
+      if fm_worktree_lease_no_process_cwd "$WT"; then
+        :
+      else
+        case "$?" in
+          1) die "task $ID's endpoint is missing but process(es) ${FM_WORKTREE_LEASE_LIVE_PIDS:-unknown} still run from its recorded worktree; refusing to create a second agent" ;;
+          *) die "task $ID's endpoint is missing but the host cannot safely prove its recorded worktree has no live process; refusing to create a second agent" ;;
+        esac
+      fi
+      missing_endpoint=1
+      RELAUNCH_MISSING_ENDPOINT=1
+      ;;
+    *) die "task $ID's endpoint reads '$state'; relaunch requires a positively classified agent state" ;;
+  esac
   cp -p "$META" "$META_PRIOR" || die "could not preserve task $ID's durable record before relaunching"
   RELAUNCH_ACTIVE=1
   journal_write checkpoint "${CHECKPOINT_LINES[@]}" "$note_line"
@@ -803,9 +845,14 @@ do_relaunch() {
   record_note
   journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"
 
-  journal_write stopping "${CHECKPOINT_LINES[@]}" "$note_line"
-  exit_result=$(do_exit)
-  journal_write exited "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
+  if [ "$missing_endpoint" = 1 ]; then
+    exit_result=endpoint-missing-reattach
+    journal_write reattaching "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
+  else
+    journal_write stopping "${CHECKPOINT_LINES[@]}" "$note_line"
+    exit_result=$(do_exit)
+    journal_write exited "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
+  fi
 
   # The launch owner (fm-spawn --relaunch) clears the previous incarnation's
   # per-task harness wiring before arming the new one, so nothing to do here.

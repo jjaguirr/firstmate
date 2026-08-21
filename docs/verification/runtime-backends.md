@@ -596,6 +596,23 @@ ok - real herdr: an agent that does not stop fails closed instead of being repor
 The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so registering and not registering an agent on a plain shell pane exercises exactly the gate every lifecycle verb depends on, with no real agent launched.
 That command is the guard that refreshes this record; run it after every Herdr upgrade rather than trusting the version above.
 
+Missing-endpoint reattach was measured on 2026-08-21 against the installed Herdr 0.7.3 through an isolated non-default lab session.
+
+```sh
+HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
+  tests/fm-control-herdr-reattach-e2e.test.sh
+```
+
+Observed output:
+
+```text
+ok - real Herdr lab: a missing pane reattaches the exact dirty leased worktree in its recorded named session
+```
+
+The fixture creates an ordinary task through `bin/fm-spawn.sh`, closes only its recorded pane through the lab helper, then runs `bin/fm-spawn.sh <id> --relaunch`.
+It proves the replacement pane is in the same named session, the task metadata retains one exact worktree and durable lease, the branch and dirty file remain unchanged, and the fake Treehouse provider received no second `get` allocation.
+The test's manual Herdr calls all pass through `bin/fm-herdr-lab.sh`, whose teardown rechecks the untouched default session before stopping and deleting the lab.
+
 ### Away-mode transport
 
 The Pi/Herdr return and injection path was reverified on Herdr 0.7.3 and Pi 0.80.7:

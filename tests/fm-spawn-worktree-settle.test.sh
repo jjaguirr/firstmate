@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Regression test for the fm-spawn.sh treehouse-get worktree-detection settle
-# loop (bin/fm-spawn.sh, the `for _ in $(seq 1 60)` loop after `treehouse get`).
+# Regression test for the fm-spawn.sh durable-lease endpoint binding loop.
 #
 # On some tmux/WSL setups a brand-new window's pane_current_path transiently
 # reports a stale, unrelated-but-real path on the very first poll, before the
@@ -23,7 +22,7 @@ TMP_ROOT=$(fm_test_tmproot fm-spawn-worktree-settle)
 # make_settle_fakebin <dir> builds a fake tmux whose `#{pane_current_path}`
 # query returns FM_FAKE_PANE_STALE for the first FM_FAKE_PANE_STALE_READS
 # calls, then FM_FAKE_PANE_PATH forever after - reproducing a pane that
-# transiently reports a stale cwd before settling into the real worktree.
+# transiently reports a stale cwd before settling into the leased worktree.
 make_settle_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -54,7 +53,7 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  fm_fake_treehouse_lease "$fakebin"
   printf '%s\n' "$fakebin"
 }
 
@@ -101,8 +100,8 @@ run_settle_spawn() {
 }
 
 # A single stale first read (the exact incident) must not be accepted: the
-# loop should keep polling until two consecutive reads agree, landing on the
-# real settled worktree instead.
+# loop should keep polling until the endpoint reports the exact leased
+# worktree, never merely a plausible non-project checkout.
 test_single_stale_first_read_is_not_accepted() {
   local rec id out status
   id=settle-single-stale-z1
@@ -120,9 +119,8 @@ test_single_stale_first_read_is_not_accepted() {
   pass "a single transient stale pane_current_path read is not accepted as the worktree"
 }
 
-# A pane that reports the real worktree from the very first read still only
-# costs the loop's existing one-second inter-poll sleep to confirm - not an
-# extra full cycle on top of that.
+# A pane that reports the exact leased worktree from the first read returns
+# without an extra confirmation cycle.
 test_already_settled_pane_costs_one_confirm_sleep() {
   local rec id out status start end elapsed
   id=settle-already-settled-z2
@@ -137,8 +135,8 @@ test_already_settled_pane_costs_one_confirm_sleep() {
   expect_code 0 "$status" "spawn should succeed when the pane is already settled"
   assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" \
     "meta did not record the already-settled worktree"
-  [ "$elapsed" -le 5 ] || fail "already-settled pane took ${elapsed}s to confirm - expected close to the single inter-poll sleep"
-  pass "an already-settled pane confirms via the existing inter-poll sleep, not an extra full cycle"
+  [ "$elapsed" -le 5 ] || fail "already-settled pane took ${elapsed}s to confirm - expected no extended polling"
+  pass "an already-settled pane binds to its leased worktree without an extra confirmation cycle"
 }
 
 test_single_stale_first_read_is_not_accepted
