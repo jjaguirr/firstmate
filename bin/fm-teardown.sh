@@ -455,7 +455,6 @@ ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 WORKTREE_LEASE_ID=
 WORKTREE_LEASE_HOLDER=
-WORKTREE_LEASE_HOME=
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
@@ -467,7 +466,6 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] \
   fi
   WORKTREE_LEASE_ID=$FM_WORKTREE_LEASE_ID
   WORKTREE_LEASE_HOLDER=$FM_WORKTREE_LEASE_HOLDER
-  WORKTREE_LEASE_HOME=$FM_WORKTREE_LEASE_HOME
 fi
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes

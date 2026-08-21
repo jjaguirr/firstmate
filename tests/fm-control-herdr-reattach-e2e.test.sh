@@ -117,8 +117,9 @@ case "$NEW_WINDOW" in "$HERDR_LAB_SESSION":*) ;; *) fail 'reattach moved to a di
   || fail 'reattach changed the recorded worktree branch'
 [ "$(cat "$WT/dirty.txt")" = 'preserved dirty work' ] \
   || fail 'reattach discarded uncommitted work'
-[ "$(grep -c '^worktree=' "$META")" = 1 ] && grep -Fqx "worktree=$WT" "$META" \
-  || fail 'reattach allocated or published a different worktree'
+if [ "$(grep -c '^worktree=' "$META")" != 1 ] || ! grep -Fqx "worktree=$WT" "$META"; then
+  fail 'reattach allocated or published a different worktree'
+fi
 # The stub's lease record appears only after the original fresh spawn. Reattach
 # may inspect status but must not acquire another worktree.
 [ "$(grep -c '^get$' "$SCRATCH/treehouse.log")" = 1 ] \

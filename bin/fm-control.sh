@@ -846,7 +846,7 @@ do_relaunch() {
   journal_write noted "${CHECKPOINT_LINES[@]}" "$note_line"
 
   if [ "$missing_endpoint" = 1 ]; then
-    exit_result=endpoint-missing-reattach
+    exit_result='endpoint-missing-reattach'
     journal_write reattaching "${CHECKPOINT_LINES[@]}" "$note_line" "exit_result=$exit_result"
   else
     journal_write stopping "${CHECKPOINT_LINES[@]}" "$note_line"

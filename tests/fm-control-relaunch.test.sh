@@ -1395,7 +1395,7 @@ test_missing_endpoint_reattaches_the_exact_clean_or_dirty_worktree() {
 }
 
 test_missing_endpoint_refuses_a_foreign_lease_without_creating_an_agent() {
-  local dir out rc meta_before brief_before
+  local dir out rc
   dir=$(new_case foreign-lease rl41)
   add_ship_task "$dir" rl41 claude
   add_treehouse_lease "$dir" rl41 firstmate-foreign-rl41
