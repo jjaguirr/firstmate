@@ -116,8 +116,8 @@ EOF
 }
 
 # Print the consolidated OPEN DECISIONS section: every still-open
-# needs-decision/blocked, fleet-wide, folded from the durable status logs by
-# fm-classify-lib.sh's status_open_decisions fold (via its cursor-backed
+# needs-decision/blocked, fleet-wide, from the durable status fold and shared
+# task answerability verdict in fm-classify-lib.sh (via its cursor-backed
 # scan_open_decisions_incremental wrapper) rather than from the annotations
 # above, so a decision buried under later unrelated appends cannot be silently
 # missed. Informational `note:` lines and pending-reply resolutions are not

@@ -347,6 +347,42 @@ test_previous_fold_cache_is_refolded_under_current_semantics() {
   pass "an old fold cache is rebuilt once before same-version incremental reads resume"
 }
 
+# A lifecycle reconciliation must not mutate the durable cursor's open set.
+# When an active run starts, the recurring surface disappears immediately even
+# without a new status byte; when it parks again, the old durable decision
+# returns through the same cursor without a synthetic resolved/reopen event.
+test_run_step_supersession_preserves_the_incremental_durable_set() {
+  local dir state fakebin status out cursor before after
+  dir=$(make_case cursor-run-step-supersession)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  status="$state/task8.status"
+  out="$dir/drain.out"
+  cursor="$state/.task8.open-decisions-cursor"
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "initial drain before run supersession failed"
+  grep -F 'task8 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "precondition: the durable decision did not surface"
+  before=$(LC_ALL=C cksum "$cursor")
+
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain during active run supersession failed"
+  [ ! -s "$out" ] || fail "a superseded decision still surfaced: $(cat "$out")"
+  after=$(LC_ALL=C cksum "$cursor")
+  [ "$after" = "$before" ] \
+    || fail "run supersession rewrote the durable cursor instead of only reconciling its presentation"
+
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting captain decision' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after the run parked failed"
+  grep -F 'task8 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "the durable decision did not re-surface after the run parked: $(cat "$out")"
+  pass "run-step supersession leaves the cursor-backed durable decision available for a later parked run"
+}
+
 test_truncated_log_falls_back_to_a_full_refold_not_a_dropped_decision
 test_same_size_rewrite_is_detected_via_inode_identity
 test_read_failure_preserves_state_for_retry
@@ -354,3 +390,4 @@ test_cursor_cache_read_failure_refolds_without_replaying_unread_status
 test_pre_fix_cursor_refolds_corr_tagged_decision
 test_previous_fold_cache_is_refolded_under_current_semantics
 test_buried_decision_survives_many_growing_drains_and_resolution_clears_it
+test_run_step_supersession_preserves_the_incremental_durable_set

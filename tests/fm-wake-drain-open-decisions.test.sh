@@ -158,6 +158,29 @@ test_buried_decision_surfaces_on_the_empty_queue_fast_path() {
   pass "a buried open decision surfaces even when the wake queue itself is empty"
 }
 
+test_active_run_step_suppresses_a_superseded_decision_without_trusting_a_pane() {
+  local dir state out fakebin
+  dir=$(make_case active-run-supersession)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/drain.out"
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$state/task9.status"
+
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain failed while reconciling an active run-step"
+  if grep -F 'OPEN DECISIONS' "$out" >/dev/null; then
+    fail "a run-step-superseded decision still surfaced: $(cat "$out")"
+  fi
+
+  FM_FAKE_CREW_STATE='state: working · source: pane · rendered activity only' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain failed while checking pane-only activity"
+  grep -F 'task9 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "pane activity incorrectly closed a decision: $(cat "$out")"
+  pass "OPEN DECISIONS suppresses only authoritative active run-step supersession"
+}
+
 test_status_symlink_is_not_followed() {
   local dir state out
   dir=$(make_case status-symlink)
@@ -223,4 +246,5 @@ test_reserved_key_namespace_is_owned_by_its_library
 test_no_open_decisions_prints_nothing
 test_open_decision_surfaces_even_with_an_unrelated_queued_wake
 test_buried_decision_surfaces_on_the_empty_queue_fast_path
+test_active_run_step_suppresses_a_superseded_decision_without_trusting_a_pane
 test_status_symlink_is_not_followed

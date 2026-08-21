@@ -32,7 +32,8 @@
 # bin/ script (which sets its own SCRIPT_DIR) or directly by a test.
 _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_CLASSIFY_LIB_DIR="."
 
-# The crew current-state reader used for the "provably working" decision.
+# The crew current-state reader used for lifecycle reconciliation and the
+# "provably working" decision.
 # Overridable so tests can stub the run-step/pane verdict without a real worktree
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
@@ -177,10 +178,14 @@ status_is_paused_or_captain_held() {  # <status-line>
 # (last_status_line above) cannot represent "an earlier decision is still open
 # after a later, unrelated event": a subsequent done/paused/working line silently
 # masks a still-open needs-decision. status_open_decisions is the ONE authoritative
-# statement of the status-fold contract that fixes this - a needs-decision/blocked
-# line OPENS a keyed decision, and only an explicit resolution or a verified
-# captain-held backlog transfer referencing that key CLOSES it; a later unrelated
-# terminal line never clears an open captain decision.
+# statement of the durable status-fold contract that fixes this - a
+# needs-decision/blocked line OPENS a keyed decision, and only an explicit
+# resolution or a verified captain-held backlog transfer referencing that key
+# CLOSES it. status_open_decisions_for_task is the corresponding current
+# answerability verdict: it preserves that durable fold, then removes the set
+# only when fm-crew-state proves this task has resumed on an active run-step.
+# A pane read never closes a decision, and a later unrelated terminal line never
+# clears an open captain decision.
 # Who WRITES the closing line is owned elsewhere: the answering firstmate closes
 # at answer time through fm-send's --resolve-key (bin/fm-send.sh header), and a
 # worker self-closes only a blocker that cleared without an answer (bin/fm-brief.sh
@@ -447,6 +452,35 @@ EOF
   printf '%s' "$verb"
 }
 
+# Reconcile one durable open set with the task lifecycle. A matching active
+# no-mistakes run-step proves a previously raised task-local decision was
+# superseded when work resumed, so the current open set is empty. Do not use a
+# pane verdict here: rendered terminal activity can prove work is in progress
+# for wake triage, but cannot close a captain decision. An unreadable or
+# malformed current-state result fails open to the durable set.
+_fm_open_decisions_reconcile_active_run() {  # <task-id> <open-set>
+  local task=$1 open=$2 current
+  [ -n "$open" ] || return 0
+  current=$("$FM_CREW_STATE_BIN" "$task" 2>/dev/null) || {
+    printf '%s' "$open"
+    return 0
+  }
+  case "$current" in
+    'state: working · source: run-step'*) return 0 ;;
+  esac
+  printf '%s' "$open"
+}
+
+# Current answerability verdict for one task's keyed status decisions.
+# The durable event fold above remains the source of every key and continues to
+# drive the incremental cursor; _fm_open_decisions_reconcile_active_run is the
+# one lifecycle rule both consumers share.
+status_open_decisions_for_task() {  # <task-id> <status-file>
+  local task=$1 f=$2 open
+  open=$(status_open_decisions "$f")
+  _fm_open_decisions_reconcile_active_run "$task" "$open"
+}
+
 # Fleet-wide wrapper around status_open_decisions: scans every task's status
 # log under <state> and prefixes each still-open decision with its owning task
 # id, so a per-wake or per-session surface can print the consolidated open set
@@ -459,7 +493,7 @@ scan_open_decisions() {  # <state>
   for f in "$state"/*.status; do
     [ -e "$f" ] || continue
     task=$(basename "$f"); task="${task%.status}"
-    open=$(status_open_decisions "$f") || continue
+    open=$(status_open_decisions_for_task "$task" "$f") || continue
     [ -n "$open" ] || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -687,6 +721,18 @@ status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>]
   printf '%s' "$open"
 }
 
+# Incremental counterpart to status_open_decisions_for_task. It first advances
+# the durable cursor-backed fold, then applies exactly the same active-run
+# reconciliation as the whole-file answerability verdict. A run supersession is
+# intentionally not written into the cursor: if the run later parks, the still
+# durable keyed decision becomes visible again without requiring a synthetic
+# status event.
+status_open_decisions_incremental_for_task() {  # <task-id> <status-file> [<captured-end-offset>]
+  local task=$1 f=$2 captured_end=${3:-} open
+  open=$(status_open_decisions_incremental "$f" "$captured_end") || return 1
+  _fm_open_decisions_reconcile_active_run "$task" "$open"
+}
+
 # Incremental sibling of scan_open_decisions: same fleet-wide directory walk and
 # output shape ("<task>\t<key>\t<verb>\t<note>" per open decision), but folds
 # each task's status log through status_open_decisions_incremental instead of
@@ -697,7 +743,7 @@ scan_open_decisions_incremental() {  # <state>
   for f in "$state"/*.status; do
     [ -e "$f" ] || continue
     task=$(basename "$f"); task="${task%.status}"
-    open=$(status_open_decisions_incremental "$f") || continue
+    open=$(status_open_decisions_incremental_for_task "$task" "$f") || continue
     [ -n "$open" ] || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -895,7 +941,7 @@ scan_open_decisions_snapshot() {  # <state> <task-and-endpoint-snapshot>
   while IFS=$(printf '\t') read -r task endpoint ident; do
     [ -n "$task" ] || continue
     f="$state/$task.status"
-    open=$(status_open_decisions_incremental "$f" "$endpoint") || return 1
+    open=$(status_open_decisions_incremental_for_task "$task" "$f" "$endpoint") || return 1
     [ -n "$open" ] || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue

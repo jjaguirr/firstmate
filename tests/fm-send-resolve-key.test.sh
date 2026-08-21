@@ -106,6 +106,61 @@ drain_out() {  # <home>
   FM_STATE_OVERRIDE="$1/state" "$DRAIN" 2>/dev/null
 }
 
+# The classifier consumes fm-crew-state's stable public line, so this narrow
+# fixture lets the public send and drain interfaces share a current run-step
+# verdict without manufacturing a second decision parser in either test.
+make_decision_state_reader() {  # <dir> -> echoes executable path
+  local reader="$1/fake-decision-crew-state.sh"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${FM_FAKE_DECISION_CURRENT:-state: unknown · source: none}"
+SH
+  chmod +x "$reader"
+  printf '%s\n' "$reader"
+}
+
+run_send_with_current_state() {  # <fakebin> <home> <send-log> <reader> <fm-send args...>
+  local fb=$1 home=$2 log=$3 reader=$4
+  shift 4
+  : > "$log"
+  env PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_CREW_STATE_BIN="$reader" \
+    "$SEND" "$@" 2>/dev/null
+}
+
+drain_out_with_current_state() {  # <home> <reader> [<fakebin>]
+  local home=$1 reader=$2 fakebin=${3:-}
+  if [ -n "$fakebin" ]; then
+    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$home/state" FM_CREW_STATE_BIN="$reader" "$DRAIN" 2>/dev/null
+  else
+    FM_STATE_OVERRIDE="$home/state" FM_CREW_STATE_BIN="$reader" "$DRAIN" 2>/dev/null
+  fi
+}
+
+setup_hold_home() {  # <name> -> echoes a minimal tasks-axi-backed home
+  local home
+  home=$(setup_home "$1")
+  mkdir -p "$home/data" "$home/config" "$home/projects"
+  cp "$ROOT/.tasks.toml" "$home/.tasks.toml"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+## Done
+EOF
+  printf '%s\n' "$home"
+}
+
+run_decision_hold() {  # <home> <command args...>
+  local home=$1
+  shift
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
+    "$ROOT/bin/fm-decision-hold.sh" "$@"
+}
+
 test_answer_send_closes_open_decision() {
   local dir fb log home rc out
   dir="$TMP_ROOT/closes"; mkdir -p "$dir"
@@ -130,6 +185,111 @@ test_answer_send_closes_open_decision() {
     fail "the answered decision still lists as open: $out"
   fi
   pass "fm-send --resolve-key: the answer send itself closes the open decision"
+}
+
+# The real public interfaces must agree on the same fixture at each state:
+# durable open, explicit resolution, and a stale event superseded by an active
+# run-step. A status line remains the durable record in the latter case, but it
+# is not answerable and must not be presented while the run is active.
+test_send_and_drain_share_open_resolved_and_run_superseded_verdicts() {
+  local dir fb log home reader out rc worktree head
+  dir="$TMP_ROOT/shared-verdicts"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  reader=$(make_decision_state_reader "$dir")
+  home=$(setup_home shared-verdicts)
+  fm_write_meta "$home/state/open.meta" "window=sess:fm-open" "kind=ship"
+  printf 'needs-decision [key=api-shape]: pick REST or RPC\n' > "$home/state/open.status"
+
+  FM_FAKE_DECISION_CURRENT='state: parked · source: run-step · awaiting answer'
+  export FM_FAKE_DECISION_CURRENT
+  out=$(drain_out_with_current_state "$home" "$reader")
+  printf '%s' "$out" | grep -F 'open [key=api-shape] needs-decision: pick REST or RPC' >/dev/null \
+    || fail "precondition: drain did not surface the durable open key: $out"
+  run_send_with_current_state "$fb" "$home" "$log" "$reader" open --resolve-key api-shape "use REST"; rc=$?
+  expect_code 0 "$rc" "the same open key listed by drain should be answerable by fm-send"
+  grep -F 'resolved [key=api-shape]: answered: use REST' "$home/state/open.status" >/dev/null \
+    || fail "fm-send did not write the supported durable resolution"
+
+  out=$(drain_out_with_current_state "$home" "$reader")
+  [ -z "$out" ] || fail "an explicitly resolved key still surfaced in drain: $out"
+  run_send_with_current_state "$fb" "$home" "$log" "$reader" open --resolve-key api-shape "duplicate"; rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-send accepted a key after its durable resolution"
+  [ ! -s "$log" ] || fail "fm-send typed a duplicate answer for a resolved key: $(cat "$log")"
+
+  worktree="$dir/resumed-worktree"
+  fm_git_identity fmtest fmtest@example.invalid
+  git init -q "$worktree"
+  git -C "$worktree" commit -q --allow-empty -m init
+  git -C "$worktree" checkout -q -b fm/resumed
+  head=$(git -C "$worktree" rev-parse HEAD)
+  cat > "$fb/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}:${2:-}" in
+  axi:status) printf '%s\n' "${FM_FAKE_AXI_STATUS:-}" ;;
+esac
+SH
+  chmod +x "$fb/no-mistakes"
+  fm_write_meta "$home/state/resumed.meta" "window=sess:fm-resumed" "kind=ship" "worktree=$worktree"
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$home/state/resumed.status"
+  FM_FAKE_AXI_STATUS=$(cat <<EOF
+run:
+  id: "01RUN"
+  branch: fm/resumed
+  status: running
+  head: "$head"
+  pr: ""
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    review,running,0,0
+EOF
+)
+  export FM_FAKE_AXI_STATUS
+  out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
+  [ -z "$out" ] || fail "drain presented a decision superseded by an active run-step: $out"
+  run_send_with_current_state "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" resumed --resolve-key rollout "phase it"; rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-send accepted a key superseded by an active run-step"
+  [ ! -s "$log" ] || fail "fm-send typed a superseded answer: $(cat "$log")"
+  if grep -F 'resolved [key=rollout]' "$home/state/resumed.status" >/dev/null; then
+    fail "fm-send wrote a resolution for a non-answerable superseded key: $(cat "$home/state/resumed.status")"
+  fi
+  unset FM_FAKE_AXI_STATUS
+  pass "fm-send and OPEN DECISIONS agree for durable open, resolved, and active-run-superseded keys"
+}
+
+# A transferred decision is deliberately absent from the status presentation:
+# its active captain hold is now the only durable owner. The same real send
+# closes that hold, while drain never resurrects the already-transferred status
+# copy as an OPEN DECISION.
+test_send_and_drain_preserve_transferred_captain_holds() {
+  local dir fb log home reader out rc show
+  command -v tasks-axi >/dev/null 2>&1 || { pass "fm-send and OPEN DECISIONS transferred-hold agreement (tasks-axi unavailable)"; return; }
+  dir="$TMP_ROOT/transferred-hold"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  reader=$(make_decision_state_reader "$dir")
+  home=$(setup_hold_home transferred-hold)
+  (cd "$home" && tasks-axi add origin "Review the sample route" --kind ship --repo sample --start) >/dev/null \
+    || fail "could not create the transferred-hold origin"
+  fm_write_meta "$home/state/origin.meta" "window=sess:fm-origin" "kind=ship"
+  printf 'needs-decision [key=route]: choose route north or route south\n' > "$home/state/origin.status"
+  run_decision_hold "$home" hold origin route --title "Choose the sample route" \
+    --reason "captain route choice pending" --repo sample >/dev/null \
+    || fail "could not create a captain hold for the transferred decision"
+  run_decision_hold "$home" complete origin route >/dev/null \
+    || fail "could not transfer the status decision to its captain hold"
+  grep -F 'captain-held [key=route]' "$home/state/origin.status" >/dev/null \
+    || fail "precondition: transfer did not close the status ledger copy"
+
+  out=$(drain_out_with_current_state "$home" "$reader")
+  [ -z "$out" ] || fail "drain resurrected a transferred status decision: $out"
+  run_send_with_current_state "$fb" "$home" "$log" "$reader" origin --resolve-key route "choose north"; rc=$?
+  expect_code 0 "$rc" "fm-send should resolve an active transferred captain hold"
+  show=$(cd "$home" && tasks-axi show origin-decision-route --full)
+  assert_contains "$show" 'state: done' "chat answer did not close the transferred captain hold"
+  assert_contains "$show" 'Resolution mode: answered' "transferred hold missed the shared answer-time close path"
+  out=$(drain_out_with_current_state "$home" "$reader")
+  [ -z "$out" ] || fail "drain presented a transferred-and-resolved decision: $out"
+  pass "fm-send and OPEN DECISIONS preserve one-owner transferred captain holds"
 }
 
 # The answerer's close is this home's own bookkeeping: it must not re-wake the
@@ -497,6 +657,8 @@ test_flag_misuse_refuses() {
 }
 
 test_answer_send_closes_open_decision
+test_send_and_drain_share_open_resolved_and_run_superseded_verdicts
+test_send_and_drain_preserve_transferred_captain_holds
 test_answer_close_is_self_announced
 test_colon_first_key_position_is_answerable
 test_answer_starts_work_never_orphans

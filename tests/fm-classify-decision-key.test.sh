@@ -262,6 +262,46 @@ test_incremental_agrees_with_full_fold_across_appends() {
   pass "the incremental fold matches the full fold across appends in both key positions"
 }
 
+# A resumed no-mistakes run supersedes a stale task-local decision, but a busy
+# pane does not. The current answerability wrappers must agree in their whole
+# and cursor-backed forms while retaining the durable key so it can reappear if
+# the run later parks.
+test_active_run_step_reconciles_both_decision_folds_without_using_pane_text() {
+  local dir f reader full incremental raw
+  dir=$(case_dir run-step-supersession)
+  f="$dir/task.status"
+  reader="$dir/fake-crew-state.sh"
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$f"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${FM_FAKE_DECISION_CURRENT:-state: unknown · source: none}"
+SH
+  chmod +x "$reader"
+
+  FM_FAKE_DECISION_CURRENT='state: working · source: run-step · validating'
+  FM_CREW_STATE_BIN="$reader"
+  export FM_FAKE_DECISION_CURRENT FM_CREW_STATE_BIN
+  full=$(status_open_decisions_for_task task "$f")
+  incremental=$(status_open_decisions_incremental_for_task task "$f")
+  [ -z "$full" ] && [ -z "$incremental" ] \
+    || fail "an active run-step did not suppress both current decision folds: full='$full' incremental='$incremental'"
+
+  raw=$(status_open_decisions "$f")
+  assert_contains "$raw" $'rollout\tneeds-decision' \
+    "run supersession rewrote the durable decision instead of reconciling it"
+
+  FM_FAKE_DECISION_CURRENT='state: working · source: pane · rendered activity only'
+  export FM_FAKE_DECISION_CURRENT
+  full=$(status_open_decisions_for_task task "$f")
+  incremental=$(status_open_decisions_incremental_for_task task "$f")
+  assert_contains "$full" $'rollout\tneeds-decision' \
+    "pane text incorrectly suppressed the whole decision verdict"
+  [ "$incremental" = "$full" ] \
+    || fail "pane-safe incremental verdict diverged from the whole verdict: '$incremental' vs '$full'"
+  unset FM_FAKE_DECISION_CURRENT FM_CREW_STATE_BIN
+  pass "active run-step supersession is shared by whole and incremental decision folds without trusting pane text"
+}
+
 test_stated_key_is_honored_in_both_positions
 test_bare_keyless_line_still_folds_to_default
 test_resolution_closes_across_positions
@@ -338,3 +378,4 @@ EOF
 
 test_closing_verb_separates_resolution_from_durable_transfer
 test_closing_verb_tracks_the_last_transition_in_both_positions
+test_active_run_step_reconciles_both_decision_folds_without_using_pane_text
