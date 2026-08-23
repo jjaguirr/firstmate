@@ -1305,6 +1305,139 @@ test_local_only_force_overrides_unpushed() {
   pass "local-only worktree with unpushed work is torn down under --force (escape hatch)"
 }
 
+# Durable Treehouse lease cases. The lease guards only the return step: a
+# worktree that is already gone has nothing to return, while a present
+# worktree must still prove ownership even under --force.
+add_lease_meta() {  # <case-dir> [holder]
+  local case_dir=$1 holder=${2:-}
+  # shellcheck source=bin/fm-worktree-lease-lib.sh
+  . "$ROOT/bin/fm-worktree-lease-lib.sh"
+  [ -n "$holder" ] || holder=$(fm_worktree_lease_holder "$(cd "$ROOT" && pwd -P)" task-x1)
+  {
+    echo "worktree_lease_id=lease-x1"
+    echo "worktree_lease_holder=$holder"
+    echo "worktree_lease_home=$(cd "$ROOT" && pwd -P)"
+  } >> "$case_dir/state/task-x1.meta"
+}
+
+add_logging_treehouse() {  # <case-dir> <status-json>
+  local case_dir=$1
+  printf '%s\n' "$2" > "$case_dir/treehouse-status"
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_TREEHOUSE_LOG"
+case "${1:-}" in
+  status) cat "$FM_FAKE_TREEHOUSE_STATUS"; exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+}
+
+run_lease_teardown() {  # <case-dir> <args...>
+  local case_dir=$1; shift
+  FM_HOME="$ROOT" FM_FAKE_TREEHOUSE_LOG="$case_dir/treehouse.log" \
+    FM_FAKE_TREEHOUSE_STATUS="$case_dir/treehouse-status" \
+    run_teardown "$case_dir" "$@"
+}
+
+test_lease_absent_worktree_is_torn_down_under_force() {
+  local case_dir rc
+  case_dir=$(make_case lease-absent-worktree)
+  write_meta "$case_dir" local-only ship
+  add_lease_meta "$case_dir"
+  add_logging_treehouse "$case_dir" '[]'
+  git -C "$case_dir/project" worktree remove --force "$case_dir/wt"
+  [ ! -d "$case_dir/wt" ] || fail "lease-absent-worktree: fixture still has a worktree"
+
+  set +e
+  run_lease_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "lease-absent-worktree: a gone worktree has nothing to return"$'\n'"$(cat "$case_dir/stderr")"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "lease-absent-worktree: REFUSED printed for an absent worktree"
+  assert_absent "$case_dir/state/task-x1.meta" "lease-absent-worktree: teardown left the task record"
+  ! grep -q '^return ' "$case_dir/treehouse.log" 2>/dev/null \
+    || fail "lease-absent-worktree: teardown tried to return an absent worktree"
+  pass "teardown: a leased task whose worktree is already gone is torn down without hand-editing metadata"
+}
+
+test_lease_mismatch_with_present_worktree_refuses_even_under_force() {
+  local case_dir rc wt_real
+  case_dir=$(make_case lease-mismatch)
+  write_meta "$case_dir" local-only ship
+  add_lease_meta "$case_dir"
+  wt_real=$(cd "$case_dir/wt" && pwd -P)
+  add_logging_treehouse "$case_dir" \
+    "[{\"path\":\"$wt_real\",\"status\":\"leased\",\"lease_id\":\"lease-other\",\"lease_holder\":\"firstmate-other-task-x1\"}]"
+
+  set +e
+  run_lease_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "lease-mismatch: a present worktree leased elsewhere must refuse"
+  grep -q 'REFUSED: task task-x1.s Treehouse lease record no longer proves' "$case_dir/stderr" \
+    || fail "lease-mismatch: refusal should name the lease proof: $(cat "$case_dir/stderr")"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "lease-mismatch: refusal must retain the task record"
+  [ -d "$case_dir/wt" ] || fail "lease-mismatch: refusal must retain the worktree"
+  ! grep -q '^return ' "$case_dir/treehouse.log" 2>/dev/null \
+    || fail "lease-mismatch: refusal must not return the worktree"
+  pass "teardown: a present worktree whose lease no longer proves ownership refuses, --force included"
+}
+
+test_lease_pool_entry_absent_under_force_is_nothing_to_return() {
+  local case_dir rc
+  case_dir=$(make_case lease-pool-absent)
+  write_meta "$case_dir" local-only ship
+  add_lease_meta "$case_dir"
+  add_logging_treehouse "$case_dir" '[]'
+
+  set +e
+  run_lease_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "lease-pool-absent: without --force an unlisted worktree must refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "lease-pool-absent: refusal missing without --force"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "lease-pool-absent: refusal must retain the task record"
+
+  set +e
+  run_lease_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "lease-pool-absent: --force treats an unlisted worktree as nothing to return"$'\n'"$(cat "$case_dir/stderr")"
+  grep -q 'nothing to return' "$case_dir/stderr" \
+    || fail "lease-pool-absent: --force should say the worktree was treated as nothing to return"
+  assert_absent "$case_dir/state/task-x1.meta" "lease-pool-absent: teardown left the task record"
+  ! grep -q '^return ' "$case_dir/treehouse.log" 2>/dev/null \
+    || fail "lease-pool-absent: teardown must not return a worktree the pool no longer lists"
+  [ -d "$case_dir/wt" ] || fail "lease-pool-absent: a worktree the pool does not own must be left in place"
+  pass "teardown: --force treats a positively unlisted pool entry as nothing to return"
+}
+
+test_lease_verified_worktree_returns_with_exact_lease_guards() {
+  local case_dir rc wt_real holder
+  case_dir=$(make_case lease-verified)
+  write_meta "$case_dir" local-only ship
+  add_lease_meta "$case_dir"
+  holder=$(grep '^worktree_lease_holder=' "$case_dir/state/task-x1.meta" | cut -d= -f2-)
+  wt_real=$(cd "$case_dir/wt" && pwd -P)
+  add_logging_treehouse "$case_dir" \
+    "[{\"path\":\"$wt_real\",\"status\":\"leased\",\"lease_id\":\"lease-x1\",\"lease_holder\":\"$holder\"}]"
+
+  set +e
+  run_lease_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "lease-verified: a matching lease returns the worktree"$'\n'"$(cat "$case_dir/stderr")"
+  grep -Fq -- "return --force $case_dir/wt --if-lease-id lease-x1 --if-lease-holder $holder" "$case_dir/treehouse.log" \
+    || fail "lease-verified: return must carry the exact lease guards: $(cat "$case_dir/treehouse.log")"
+  assert_absent "$case_dir/state/task-x1.meta" "lease-verified: teardown left the task record"
+  pass "teardown: a verified lease returns the worktree with exact lease guards"
+}
+
 test_teardown_missing_busy_sidecar_completes() {
   local case_dir gen rc
   case_dir=$(make_case missing-busy-sidecar)
@@ -2600,6 +2733,10 @@ test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
 test_teardown_missing_busy_sidecar_completes
+test_lease_absent_worktree_is_torn_down_under_force
+test_lease_mismatch_with_present_worktree_refuses_even_under_force
+test_lease_pool_entry_absent_under_force_is_nothing_to_return
+test_lease_verified_worktree_returns_with_exact_lease_guards
 test_herdr_teardown_clears_escalation_marker
 test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes
 test_herdr_flat_teardown_refuses_records_on_unparseable_presence

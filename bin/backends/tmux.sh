@@ -139,6 +139,21 @@ fm_backend_tmux_kill() {  # <target>
   tmux kill-window -t "=$session:=$window" 2>/dev/null || true
 }
 
+# fm_backend_tmux_kill_window_id: close exactly one window by the immutable
+# window id `new-window -P` returned, never by a name that another window in
+# the session could share. Used to abort an unpublished replacement endpoint.
+fm_backend_tmux_kill_window_id() {  # <window-id>
+  local wid=${1:-}
+  case "$wid" in
+    @*) ;;
+    *) return 1 ;;
+  esac
+  case "${wid#@}" in
+    ''|*[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  tmux kill-window -t "$wid" 2>/dev/null
+}
+
 # fm_backend_tmux_current_command: <target>'s live foreground process name -
 # tmux's own `#{pane_current_command}`, already resolved from the pty's
 # foreground process group (verified empirically with real tmux 3.6a: a

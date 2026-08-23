@@ -455,17 +455,27 @@ ORCA_WORKTREE_ID=$(fm_meta_get "$META" orca_worktree_id)
 ORCA_PATH_MATCH_VERIFIED=0
 WORKTREE_LEASE_ID=
 WORKTREE_LEASE_HOLDER=
+WORKTREE_RETURN_SKIP=0
 
 KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] \
+# The lease only guards the return step: a worktree that is already gone has
+# nothing to return, so its record is still torn down. While the worktree
+# exists, the durable lease must still prove this home owns it, --force
+# included; --force may only treat a pool entry Treehouse positively no longer
+# lists as nothing to return.
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ -d "$WT" ] \
    && grep -q '^worktree_lease_' "$META" 2>/dev/null; then
-  if ! fm_worktree_lease_verify_meta "$META" "$PROJ" "$WT" "$FM_HOME" "$ID"; then
+  if fm_worktree_lease_verify_meta "$META" "$PROJ" "$WT" "$FM_HOME" "$ID"; then
+    WORKTREE_LEASE_ID=$FM_WORKTREE_LEASE_ID
+    WORKTREE_LEASE_HOLDER=$FM_WORKTREE_LEASE_HOLDER
+  elif [ "$FORCE" = "--force" ] && fm_worktree_lease_pool_entry_absent "$PROJ" "$WT"; then
+    echo "teardown: --force: Treehouse no longer lists $WT in $PROJ's pool; treating task $ID's recorded worktree as nothing to return" >&2
+    WORKTREE_RETURN_SKIP=1
+  else
     echo "REFUSED: task $ID's Treehouse lease record no longer proves this home owns $WT; preserving the task record and worktree." >&2
     exit 1
   fi
-  WORKTREE_LEASE_ID=$FM_WORKTREE_LEASE_ID
-  WORKTREE_LEASE_HOLDER=$FM_WORKTREE_LEASE_HOLDER
 fi
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
@@ -2444,7 +2454,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
-elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
+elif [ -d "$WT" ] && [ "$KIND" != secondmate ] && [ "$WORKTREE_RETURN_SKIP" != 1 ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then

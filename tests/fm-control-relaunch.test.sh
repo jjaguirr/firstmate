@@ -116,6 +116,10 @@ case "${1:-}" in
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
   list-windows) [ -f "$D/windows" ] && cat "$D/windows"; exit 0 ;;
+  kill-window)
+    printf '%s\n' "$*" >> "$D/killed"
+    : > "$D/windows"
+    exit 0 ;;
   new-window)
     [ -z "${FM_FAKE_NEW_WINDOW_FAIL:-}" ] || exit 1
     name=
@@ -1449,6 +1453,163 @@ test_missing_endpoint_launch_failure_keeps_the_prior_durable_record() {
   pass "fm-control relaunch: missing-endpoint launch failure rolls back to the prior durable record"
 }
 
+test_missing_endpoint_post_create_failure_closes_the_replacement_endpoint() {
+  local dir out rc
+  dir=$(new_case missing-post-create-failure rl46)
+  add_ship_task "$dir" rl46 claude
+  add_treehouse_lease "$dir" rl46
+  : > "$dir/fake/windows"
+  cp "$dir/home/state/rl46.meta" "$dir/meta.before"
+  printf '%s' "$dir/proj" > "$dir/fake/cwd"
+
+  out=$(run_control "$dir" rl46 relaunch --note "replacement shell drifted"); rc=$?
+  expect_code 1 "$rc" "a replacement whose shell is outside the worktree must fail the transaction"
+  assert_contains "$out" "replacement agent" "the control plane should name the failed replacement"
+  assert_grep 'kill-window -t @replacement' "$dir/fake/killed" \
+    "the aborted reattach must close the replacement window by its exact id"
+  [ ! -s "$dir/fake/windows" ] \
+    || fail "a failed post-create reattach must not leave an orphan replacement endpoint"
+  cmp -s "$dir/home/state/rl46.meta" "$dir/meta.before" \
+    || fail "failed post-create reattach must retain the prior durable record"
+  [ "$(journal_field "$dir" rl46 rollback)" = prior-record-kept ] \
+    || fail "failed post-create reattach must retain its recoverable record"
+
+  printf '%s' "$dir/wt" > "$dir/fake/cwd"
+  out=$(run_control "$dir" rl46 relaunch --note "retry after the orphan was closed"); rc=$?
+  expect_code 0 "$rc" "the next reattach must succeed once the orphan endpoint is gone"$'\n'"$out"
+  pass "fm-control relaunch: a post-create reattach failure closes its replacement endpoint and stays recoverable"
+}
+
+test_missing_endpoint_success_does_not_close_the_published_endpoint() {
+  local dir out rc
+  dir=$(new_case missing-keep-endpoint rl47)
+  add_ship_task "$dir" rl47 claude
+  add_treehouse_lease "$dir" rl47
+  : > "$dir/fake/windows"
+
+  out=$(run_control "$dir" rl47 relaunch --note "endpoint disappeared"); rc=$?
+  expect_code 0 "$rc" "a clean reattach should succeed"$'\n'"$out"
+  [ ! -e "$dir/fake/killed" ] \
+    || fail "a successful reattach must never close the endpoint its record names"
+  assert_grep 'fm-rl47' "$dir/fake/windows" "the published replacement endpoint must remain"
+  pass "fm-control relaunch: a published replacement endpoint is never closed on exit"
+}
+
+test_dead_relaunch_refuses_unvalidatable_lease_metadata() {
+  local dir out rc
+  dir=$(new_case dead-bad-lease rl48)
+  add_ship_task "$dir" rl48 claude
+  add_treehouse_lease "$dir" rl48 firstmate-foreign-rl48
+  printf 'zsh' > "$dir/fake/command"
+  cp "$dir/home/state/rl48.meta" "$dir/meta.before"
+
+  out=$(run_spawn "$dir" rl48 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "lease lines that do not validate must refuse a dead-endpoint relaunch"
+  assert_contains "$out" "durable lease proof" "the refusal should name the lease proof"
+  cmp -s "$dir/home/state/rl48.meta" "$dir/meta.before" \
+    || fail "a refused relaunch must retain the prior durable record with its lease lines"
+  [ -z "$(cat "$dir/fake/literal")" ] || fail "a refused relaunch must not launch a harness"
+  pass "fm-spawn --relaunch: lease metadata that fails validation refuses instead of vanishing"
+}
+
+test_dead_relaunch_carries_validated_lease_metadata() {
+  local dir out rc
+  dir=$(new_case dead-keep-lease rl49)
+  add_ship_task "$dir" rl49 claude
+  add_treehouse_lease "$dir" rl49
+  printf 'zsh' > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" rl49 --relaunch --harness claude); rc=$?
+  expect_code 0 "$rc" "a dead-endpoint relaunch with a valid lease should succeed"$'\n'"$out"
+  [ "$(meta_field "$dir" rl49 worktree_lease_id)" = lease-rl49 ] \
+    || fail "a dead-endpoint relaunch must carry the lease id forward"
+  [ "$(meta_field "$dir" rl49 worktree_lease_home)" = "$dir/home" ] \
+    || fail "a dead-endpoint relaunch must carry the lease home forward"
+  pass "fm-spawn --relaunch: a dead endpoint republishes its validated lease proof"
+}
+
+# fm-control must take the replacement endpoint from the record fm-spawn
+# publishes, not from the record it read before the launch: on Herdr a
+# missing-endpoint reattach names a NEW pane id. The launch owner is replaced
+# by a stub that publishes exactly such a record, and a canned herdr CLI
+# classifies the old pane as gone and the new one as a live agent.
+make_herdr_reattach_case() {  # <name> <id> -> echoes case dir
+  local name=$1 id=$2 dir entry
+  dir=$(new_case "$name" "$id")
+  mkdir -p "$dir/bin"
+  for entry in "$ROOT"/bin/*; do
+    ln -s "$entry" "$dir/bin/$(basename "$entry")"
+  done
+  rm -f "$dir/bin/fm-spawn.sh"
+  cat > "$dir/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+id=$1
+printf '%s\n' "$*" >> "$FM_FAKE_DIR/spawn-args"
+meta="$FM_HOME/state/$id.meta"
+tmp="$meta.stub"
+sed -e 's/^window=.*/window=labses:pane-new/' -e 's/^herdr_pane_id=.*/herdr_pane_id=pane-new/' \
+  -e '/^control_relaunch_tx=/d' "$meta" > "$tmp"
+printf 'control_relaunch_tx=%s\n' "${FM_CONTROL_RELAUNCH_TX:-}" >> "$tmp"
+mv -f "$tmp" "$meta"
+SH
+  chmod +x "$dir/bin/fm-spawn.sh"
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "$FM_FAKE_DIR/herdr-calls"
+case "${1:-} ${2:-}" in
+  "pane get")
+    case "${3:-}" in
+      pane-new) printf '{"result":{"pane":{"pane_id":"pane-new"}}}\n' ;;
+      *) printf '{"error":{"code":"pane_not_found"}}\n' ;;
+    esac
+    exit 0 ;;
+  "agent get")
+    case "${3:-}" in
+      pane-new) printf '{"result":{"agent":{"agent_status":"idle"}}}\n' ;;
+      *) printf '{"error":{"code":"agent_not_found"}}\n' ;;
+    esac
+    exit 0 ;;
+esac
+printf '{"error":{"code":"unexpected"}}\n'
+exit 1
+SH
+  chmod +x "$dir/fakebin/herdr"
+  add_ship_task "$dir" "$id" claude
+  add_treehouse_lease "$dir" "$id"
+  sed -i.bak -e "s/^window=.*/window=labses:pane-old/" "$dir/home/state/$id.meta"
+  rm -f "$dir/home/state/$id.meta.bak"
+  {
+    echo "backend=herdr"
+    echo "herdr_session=labses"
+    echo "herdr_workspace_id=ws-1"
+    echo "herdr_tab_id=tab-old"
+    echo "herdr_pane_id=pane-old"
+  } >> "$dir/home/state/$id.meta"
+  printf '%s\n' "$dir"
+}
+
+test_herdr_missing_endpoint_reattach_waits_on_the_published_pane() {
+  local dir out rc
+  dir=$(make_herdr_reattach_case herdr-reattach rl50)
+
+  out=$(HERDR_SESSION=labses env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" \
+    FM_SPAWN_NO_GUARD=1 FM_CONTROL_POLL=0.01 FM_CONTROL_EXIT_WAIT=0.05 FM_CONTROL_LAUNCH_WAIT=0.2 \
+    "$dir/bin/fm-control.sh" rl50 relaunch --note "pane vanished" 2>&1); rc=$?
+  expect_code 0 "$rc" "a Herdr reattach must confirm the replacement on its newly published pane"$'\n'"$out"
+  assert_contains "$out" "endpoint=labses:pane-new" "the success line must name the published replacement pane"
+  assert_grep 'rl50 --relaunch --harness claude' "$dir/fake/spawn-args" \
+    "the control plane must delegate the launch to its single owner"
+  assert_grep 'agent get pane-new' "$dir/fake/herdr-calls" \
+    "the alive wait must classify the published replacement pane"
+  [ "$(journal_field "$dir" rl50 phase)" = complete ] \
+    || fail "the transaction must complete once the replacement pane is alive"
+  [ "$(journal_field "$dir" rl50 exit_result)" = endpoint-missing-reattach ] \
+    || fail "the journal should distinguish missing-endpoint recovery"
+  pass "fm-control relaunch: a Herdr reattach polls the pane the published record names"
+}
+
 test_missing_endpoint_refuses_a_live_process_in_the_recorded_worktree() {
   local dir out rc live_pid
   dir=$(new_case live-worktree-process rl45)
@@ -1537,4 +1698,9 @@ test_missing_endpoint_refuses_a_foreign_lease_without_creating_an_agent
 test_missing_endpoint_refuses_an_absent_worktree_without_creating_an_agent
 test_missing_endpoint_launch_failure_keeps_the_prior_durable_record
 test_missing_endpoint_refuses_a_live_process_in_the_recorded_worktree
+test_missing_endpoint_post_create_failure_closes_the_replacement_endpoint
+test_missing_endpoint_success_does_not_close_the_published_endpoint
+test_dead_relaunch_refuses_unvalidatable_lease_metadata
+test_dead_relaunch_carries_validated_lease_metadata
+test_herdr_missing_endpoint_reattach_waits_on_the_published_pane
 test_spawn_relaunch_reattaches_a_missing_endpoint_from_the_record

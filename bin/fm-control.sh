@@ -870,6 +870,14 @@ do_relaunch() {
     die "the replacement agent for $ID could not be launched on $TARGET_HARNESS"
   fi
 
+  # The published record is the only authority for where the replacement
+  # lives: a missing-endpoint reattach on Herdr names a NEW pane id, so the
+  # target captured from the prior record would poll the vanished endpoint.
+  fm_backend_validate_task_endpoint "$META" "$ID" \
+    || die "the replacement agent for $ID was published with an endpoint this plane cannot verify"
+  BACKEND=$FM_BACKEND_VALIDATED_BACKEND
+  T=$FM_BACKEND_VALIDATED_TARGET
+
   state=$(wait_agent_state "$LAUNCH_WAIT" alive) || {
     die "the replacement agent for $ID did not come up within ${LAUNCH_WAIT}s (endpoint reads '$state')"
   }

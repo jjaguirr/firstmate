@@ -105,7 +105,8 @@ Switching harness is therefore one ordinary relaunch rather than a separate mech
 - An ambiguous or unreadable endpoint state refuses.
   Only a positively classified state acts.
 - A missing-endpoint reattach refuses when the worktree is absent, the durable Treehouse lease is absent, duplicated, foreign, or unreadable, any live process remains rooted in that worktree, the new endpoint cannot be created in the recorded session, or its shell is not bound to the recorded worktree.
-  Its rollback retains the prior metadata and local copy when publishing a replacement cannot complete.
+  Its rollback retains the prior metadata and local copy when publishing a replacement cannot complete, and closes the one replacement endpoint it created by exact id so a transient failure leaves no orphan shell rooted in the worktree.
+  After publication the control plane re-reads the durable record for the replacement endpoint, since a Herdr reattach names a new pane id.
 - `fm-spawn --relaunch` independently applies the same rules, so a direct invocation cannot join a live agent, adopt a foreign worktree, or start outside the copy holding the work.
 
 ## Capability matrix

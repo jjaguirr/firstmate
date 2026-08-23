@@ -49,6 +49,22 @@ fm_worktree_lease_status_exact() {  # <project> <worktree> <lease-id> <holder>
     ' >/dev/null 2>&1
 }
 
+# fm_worktree_lease_pool_entry_absent: true (0) only when Treehouse's live
+# status inventory parses and positively lists NO entry for <worktree>. An
+# unreadable inventory, a missing tool, or any listed entry (leased or not)
+# returns 1, so absence is never inferred from a failed read.
+fm_worktree_lease_pool_entry_absent() {  # <project> <worktree>
+  local project=${1:-} worktree=${2:-} project_real worktree_real status matches
+  project_real=$(fm_worktree_lease_canonical_dir "$project") || return 1
+  worktree_real=$(fm_worktree_lease_canonical_dir "$worktree") || return 1
+  command -v treehouse >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  status=$(cd "$project_real" && treehouse status --json 2>/dev/null) || return 1
+  matches=$(printf '%s' "$status" | jq -r --arg path "$worktree_real" \
+    'if type == "array" then [.[] | select(.path == $path)] | length else error("not an array") end' 2>/dev/null) || return 1
+  [ "$matches" = 0 ]
+}
+
 fm_worktree_lease_read_meta() {  # <meta> <home> <task-id>
   local meta=${1:-} home=${2:-} id=${3:-} home_real count
   FM_WORKTREE_LEASE_ID=

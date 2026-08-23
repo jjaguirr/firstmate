@@ -679,6 +679,8 @@ RELAUNCH_REPLACEMENT_HARNESS=
 RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 RELAUNCH_ENDPOINT_MISSING=0
+RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=
+RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=
 SPAWN_WORKTREE_LEASE_ACTIVE=0
 SPAWN_WORKTREE_LEASE_ID=
 SPAWN_WORKTREE_LEASE_HOLDER=
@@ -701,6 +703,19 @@ parse_orca_worktree_result() {
   else
     ORCA_TERMINAL=
   fi
+}
+
+# relaunch_replacement_endpoint_close: close the one replacement endpoint a
+# missing-endpoint reattach created by its exact id, so an abort before the
+# durable record names it leaves no orphan shell rooted in the worktree.
+relaunch_replacement_endpoint_close() {  # <backend> <exact-target>
+  local backend=$1 target=$2
+  [ -n "$target" ] || return 1
+  case "$backend" in
+    tmux) fm_backend_tmux_kill_window_id "$target" ;;
+    herdr) fm_backend_kill herdr "$target" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
 }
 
 spawn_abort_cleanup() {
@@ -746,6 +761,16 @@ spawn_abort_cleanup() {
   if [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" = 1 ]; then
     HERDR_PRESENTATION_ORDER_LOCK_HELD=0
     fm_lock_release "$HERDR_PRESENTATION_ORDER_LOCK" || true
+  fi
+  if [ -n "$RELAUNCH_REPLACEMENT_ENDPOINT_TARGET" ] \
+     && [ "$SPAWN_META_PUBLISH_STARTED" = 0 ]; then
+    if ! relaunch_replacement_endpoint_close \
+        "$RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND" \
+        "$RELAUNCH_REPLACEMENT_ENDPOINT_TARGET"; then
+      echo "warning: could not close the unpublished replacement endpoint $RELAUNCH_REPLACEMENT_ENDPOINT_TARGET after aborted reattach of $ID" >&2
+    fi
+    RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=
+    RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=
   fi
   if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
     ORCA_ABORT_CLEANUP=0
@@ -1085,11 +1110,15 @@ if [ "$RELAUNCH" -eq 1 ]; then
     # firstmate process's current parent.
     RELAUNCH_HERDR_PANE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_pane_id)
   fi
-  if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] \
-     && fm_worktree_lease_read_meta "$RELAUNCH_META" "$FM_HOME" "$ID"; then
-    SPAWN_WORKTREE_LEASE_ID=$FM_WORKTREE_LEASE_ID
-    SPAWN_WORKTREE_LEASE_HOLDER=$FM_WORKTREE_LEASE_HOLDER
-    SPAWN_WORKTREE_LEASE_HOME=$FM_WORKTREE_LEASE_HOME
+  if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+    if fm_worktree_lease_read_meta "$RELAUNCH_META" "$FM_HOME" "$ID"; then
+      SPAWN_WORKTREE_LEASE_ID=$FM_WORKTREE_LEASE_ID
+      SPAWN_WORKTREE_LEASE_HOLDER=$FM_WORKTREE_LEASE_HOLDER
+      SPAWN_WORKTREE_LEASE_HOME=$FM_WORKTREE_LEASE_HOME
+    elif grep -q '^worktree_lease_' "$RELAUNCH_META" 2>/dev/null; then
+      echo "error: task $ID records Treehouse lease metadata that does not validate for this task and home; refusing to republish the task without its durable lease proof" >&2
+      exit 1
+    fi
   fi
   # With no explicit harness, a relaunch reuses the harness already recorded
   # for this task. It must NOT fall through to the fresh-spawn config
@@ -1943,6 +1972,8 @@ if [ "$RELAUNCH" -eq 1 ]; then
         }
         T="$SES:$W"
         WT_TARGET=$WID
+        RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=tmux
+        RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=$WID
         ;;
       herdr)
         # The active named Herdr session is a safety boundary. A replacement
@@ -1973,6 +2004,8 @@ EOF
         }
         T="$HERDR_SES:$HERDR_PANE_ID"
         WT_TARGET=$T
+        RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=herdr
+        RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=$T
         ;;
       *)
         echo "error: backend '$BACKEND' cannot safely create a missing-endpoint replacement" >&2
@@ -2799,10 +2832,13 @@ if [ "$RELAUNCH" -eq 1 ]; then
   fm_lock_release "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=0
 fi
-# From this point the durable task record owns its matching Treehouse lease.
-# A later launch-handoff failure must leave both together for reconciliation,
-# never return a worktree that is already recorded as this task's local copy.
+# From this point the durable task record owns its matching Treehouse lease
+# and names the replacement endpoint. A later launch-handoff failure must leave
+# them together for reconciliation, never return a worktree that is already
+# recorded as this task's local copy or close an endpoint the record names.
 SPAWN_WORKTREE_LEASE_ACTIVE=0
+RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=
+RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=
 if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   # The record is published, so this task is now part of the set a teardown
   # enumerates and locks per task. The set lock is only needed across that
