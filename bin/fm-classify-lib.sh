@@ -479,6 +479,9 @@ _fm_decision_stated_key() {  # <status-line> -> key slug
 # transition: a progress line stating a key drops that key's record. Every key
 # open in the durable set but absent here was followed by its own progress
 # line, which is the per-key evidence the active-run reconciliation needs.
+# The drop honors the reserved-namespace rule exactly as every other
+# transition does, so a reserved key is witnessed only by a line that speaks
+# its owner's vocabulary.
 # Fails (status 1, nothing printed) when the bytes cannot be re-read, so the
 # caller can keep the durable set rather than reconcile against nothing.
 _fm_open_decisions_with_keyed_progress() {  # <status-file> [<captured-end-offset>]
@@ -496,7 +499,9 @@ _fm_open_decisions_with_keyed_progress() {  # <status-file> [<captured-end-offse
   while IFS= read -r line || [ -n "$line" ]; do
     verb=$(status_line_verb "$line")
     if _fm_status_verb_is_progress "$verb" && key=$(_fm_decision_stated_key "$line"); then
-      open=$(_fm_decision_drop "$open" "$key")
+      if _fm_decision_key_transition_allowed "$key" "$(status_line_note "$line")"; then
+        open=$(_fm_decision_drop "$open" "$key")
+      fi
       continue
     fi
     open=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held")
@@ -577,10 +582,12 @@ EOF
 # drive the incremental cursor; _fm_open_decisions_reconcile_active_run is the
 # one lifecycle rule both consumers share. A caller that already holds the
 # task's current-state line (status_task_run_state) passes it as the third
-# argument so the verdict and its explanation come from one read.
-status_open_decisions_for_task() {  # <task-id> <status-file> [<current-state-line>]
+# argument so the verdict and its explanation come from one read, and one that
+# already folded the durable set passes it as the fourth so the log is not
+# folded again.
+status_open_decisions_for_task() {  # <task-id> <status-file> [<current-state-line>] [<durable-open-set>]
   local task=$1 f=$2 open current
-  open=$(status_open_decisions "$f")
+  if [ $# -ge 4 ]; then open=$4; else open=$(status_open_decisions "$f"); fi
   [ -n "$open" ] || return 0
   if [ $# -ge 3 ]; then current=$3; else current=$(status_task_run_state "$task" "$f"); fi
   _fm_open_decisions_reconcile_active_run "$f" "$open" "$current"

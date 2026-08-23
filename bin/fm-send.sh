@@ -435,12 +435,18 @@ if [ -n "$RESOLVE_KEYS" ]; then
   fi
   RESOLVE_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
   RESOLVE_STATUS_FILE="$STATE/$RESOLVE_TASK_ID.status"
-  # One current-state read feeds both the verdict and, on refusal, the
+  # The durable set is folded once and reused by the verdict. The current
+  # state is read once, only when that set is non-empty (the reconcile is a
+  # no-op otherwise), and feeds both the verdict and, on refusal, the
   # explanation, so the refusal can never describe a different run than the
   # one that produced the verdict.
   resolve_durable_set=$(status_open_decisions "$RESOLVE_STATUS_FILE")
-  resolve_current_state=$(status_task_run_state "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE")
-  resolve_open_set=$(status_open_decisions_for_task "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE" "$resolve_current_state")
+  resolve_current_state=''
+  resolve_open_set=''
+  if [ -n "$resolve_durable_set" ]; then
+    resolve_current_state=$(status_task_run_state "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE")
+    resolve_open_set=$(status_open_decisions_for_task "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE" "$resolve_current_state" "$resolve_durable_set")
+  fi
   resolve_superseded_set=$(status_open_decisions_superseded "$resolve_durable_set" "$resolve_open_set")
   for k in $RESOLVE_KEYS; do
     case "$resolve_open_set" in

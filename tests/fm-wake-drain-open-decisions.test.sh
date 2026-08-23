@@ -199,6 +199,39 @@ test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past() {
 # the fake span reader below serves those honestly and fails only the
 # reconciliation's re-read (the third and last span read of a drain); the
 # surfaced warning proves that read, not an earlier one, is what failed.
+test_reserved_key_stays_presented_under_a_foreign_progress_line_and_empty_sets_skip_the_state_read() {
+  local dir state out reader calls
+  dir=$(make_case active-run-reserved-key)
+  state="$dir/state"
+  out="$dir/drain.out"
+  reader="$dir/counting-crew-state.sh"
+  calls="$dir/crew-state-calls"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$FM_FAKE_CREW_STATE_CALLS"
+printf 'state: working · source: run-step · ci running\n'
+SH
+  chmod +x "$reader"
+  fm_write_meta "$state/task11.meta" "window=sess:fm-task11" "kind=ship"
+  {
+    printf 'blocked [key=pending-reply-abcdef0123456789]: pending-reply-missed: task=ios pending-reply-id=abcdef0123456789 request=ship it\n'
+    printf 'working [key=pending-reply-abcdef0123456789]: retrying delivery\n'
+  } > "$state/task11.status"
+  fm_write_meta "$state/task12.meta" "window=sess:fm-task12" "kind=ship"
+  printf 'needs-decision [key=gone]: pick one\nresolved [key=gone]: picked\n' > "$state/task12.status"
+
+  FM_FAKE_CREW_STATE_CALLS="$calls" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$reader" "$DRAIN" > "$out" \
+    || fail "drain failed over a reserved key and an empty durable set"
+  grep -F 'task11 [key=pending-reply-abcdef0123456789] blocked: pending-reply-missed:' "$out" >/dev/null \
+    || fail "a foreign same-key progress line superseded a reserved key in OPEN DECISIONS: $(cat "$out")"
+  if grep -F 'task12' "$out" >/dev/null; then
+    fail "a durably resolved key surfaced: $(cat "$out")"
+  fi
+  [ "$(cat "$calls")" = task11 ] \
+    || fail "the current-state read ran for a task with an empty durable set, or not for the open one: $(cat "$calls")"
+  pass "OPEN DECISIONS keeps a reserved key open against foreign progress and reads state only for non-empty sets"
+}
+
 test_reconcile_re_read_failure_keeps_the_decision_presented() {
   local dir state out err fakebin span calls
   dir=$(make_case active-run-read-failure)
@@ -309,5 +342,6 @@ test_no_open_decisions_prints_nothing
 test_open_decision_surfaces_even_with_an_unrelated_queued_wake
 test_buried_decision_surfaces_on_the_empty_queue_fast_path
 test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past
+test_reserved_key_stays_presented_under_a_foreign_progress_line_and_empty_sets_skip_the_state_read
 test_reconcile_re_read_failure_keeps_the_decision_presented
 test_status_symlink_is_not_followed

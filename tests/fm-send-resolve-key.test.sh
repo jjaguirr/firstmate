@@ -384,6 +384,53 @@ SH
   pass "fm-send and OPEN DECISIONS both keep a key open when the reconcile re-read fails"
 }
 
+# fm-send must agree with drain on a reserved key that a foreign same-key
+# progress line tried to witness: it is still open, so the answer is delivered
+# rather than refused as superseded. And a key whose durable set is empty is
+# refused as closed without ever paying for the current-state read.
+test_send_keeps_reserved_keys_answerable_and_skips_state_reads_for_empty_sets() {
+  local dir fb log home reader calls out rc err
+  dir="$TMP_ROOT/reserved-and-empty"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
+  reader="$dir/counting-crew-state.sh"
+  calls="$dir/crew-state-calls"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$FM_FAKE_CREW_STATE_CALLS"
+printf 'state: working · source: run-step · ci running\n'
+SH
+  chmod +x "$reader"
+  home=$(setup_home reserved-and-empty)
+  fm_write_meta "$home/state/parent.meta" "window=sess:fm-parent" "kind=ship"
+  {
+    printf 'blocked [key=pending-reply-abcdef0123456789]: pending-reply-missed: task=ios pending-reply-id=abcdef0123456789 request=ship it\n'
+    printf 'working [key=pending-reply-abcdef0123456789]: retrying delivery\n'
+  } > "$home/state/parent.status"
+  fm_write_meta "$home/state/settled.meta" "window=sess:fm-settled" "kind=ship"
+  printf 'needs-decision [key=gone]: pick one\nresolved [key=gone]: picked\n' > "$home/state/settled.status"
+  export FM_FAKE_CREW_STATE_CALLS="$calls"
+
+  out=$(FM_STATE_OVERRIDE="$home/state" FM_CREW_STATE_BIN="$reader" "$DRAIN" 2>/dev/null)
+  printf '%s' "$out" | grep -F 'parent [key=pending-reply-abcdef0123456789] blocked:' >/dev/null \
+    || fail "drain superseded a reserved key on a foreign progress line: $out"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" parent --resolve-key pending-reply-abcdef0123456789 "resend it"; rc=$?
+  expect_code 0 "$rc" "a reserved key drain still lists must stay answerable by fm-send"
+  grep -F 'resend it' "$log" >/dev/null || fail "the reserved-key answer was not delivered: $(cat "$log")"
+  if grep -F 'superseded' "$err" >/dev/null; then
+    fail "fm-send called a reserved key superseded: $(cat "$err")"
+  fi
+
+  : > "$calls"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" settled --resolve-key gone "again"; rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-send answered a durably resolved key"
+  [ ! -s "$log" ] || fail "fm-send typed an answer for a resolved key: $(cat "$log")"
+  grep -F 'already closed or mistyped' "$err" >/dev/null \
+    || fail "a durably closed key was not refused as closed or mistyped: $(cat "$err")"
+  [ ! -s "$calls" ] || fail "fm-send read the current state for an empty durable set: $(cat "$calls")"
+  unset FM_FAKE_CREW_STATE_CALLS
+  pass "fm-send keeps a reserved key answerable and skips the state read for an empty durable set"
+}
+
 # A transferred decision is deliberately absent from the status presentation:
 # its active captain hold is now the only durable owner. The same real send
 # closes that hold, while drain never resurrects the already-transferred status
@@ -786,6 +833,7 @@ test_flag_misuse_refuses() {
 test_answer_send_closes_open_decision
 test_send_and_drain_share_open_resolved_and_run_superseded_verdicts
 test_send_and_drain_keep_a_key_open_when_the_reconcile_re_read_fails
+test_send_keeps_reserved_keys_answerable_and_skips_state_reads_for_empty_sets
 test_send_and_drain_preserve_transferred_captain_holds
 test_answer_close_is_self_announced
 test_colon_first_key_position_is_answerable

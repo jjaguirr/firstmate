@@ -350,6 +350,38 @@ test_reconcile_re_read_failure_keeps_every_key_open() {
   pass "a status re-read failure keeps every durable key open in both folds and is reported"
 }
 
+# A reserved key (bin/fm-pending-reply-lib.sh's pending-reply-<id>) may only be
+# witnessed by a progress line that speaks its owner's vocabulary, exactly as
+# the durable fold requires of its open and close transitions; a foreign
+# same-key progress line leaves it open in both verdicts under an active run.
+test_reserved_key_is_not_superseded_by_a_foreign_progress_line() {
+  local dir f reader full incremental raw
+  dir=$(case_dir run-step-reserved-key)
+  f="$dir/task.status"
+  reader="$dir/fake-crew-state.sh"
+  fm_write_meta "$dir/task.meta" "window=sess:fm-task" "kind=ship"
+  {
+    printf 'blocked [key=pending-reply-abcdef0123456789]: pending-reply-missed: task=ios pending-reply-id=abcdef0123456789 request=ship it\n'
+    printf 'working [key=pending-reply-abcdef0123456789]: retrying delivery\n'
+    printf 'needs-decision [key=plain]: pick one\n'
+    printf 'working [key=plain]: went ahead\n'
+  } > "$f"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "state: working · source: run-step · ci running"\n' > "$reader"
+  chmod +x "$reader"
+  raw=$(status_open_decisions "$f")
+  full=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_for_task task "$f")
+  incremental=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_incremental_for_task task "$f")
+  assert_contains "$full" $'pending-reply-abcdef0123456789\tblocked' \
+    "a foreign same-key progress line superseded a reserved key in the whole verdict"
+  if printf '%s' "$full" | grep -F $'plain\t' >/dev/null; then
+    fail "an ordinary key with its own progress line was not superseded: '$full'"
+  fi
+  [ "$incremental" = "$full" ] \
+    || fail "incremental verdict diverged from the whole verdict on a reserved key: '$incremental' vs '$full'"
+  [ "$raw" != "$full" ] || fail "precondition: the durable set should still hold the plain key: '$raw'"
+  pass "a reserved key is witnessed only by its owner's vocabulary, in both folds"
+}
+
 # A decision raised with no later progress line has no ordering witness, so an
 # active run-step leaves it open in both folds even when it is the only line.
 test_mid_run_decision_without_later_progress_stays_open_under_active_run() {
@@ -484,5 +516,6 @@ test_closing_verb_separates_resolution_from_durable_transfer
 test_closing_verb_tracks_the_last_transition_in_both_positions
 test_active_run_step_reconciles_both_decision_folds_per_key_without_using_pane_text
 test_mid_run_decision_without_later_progress_stays_open_under_active_run
+test_reserved_key_is_not_superseded_by_a_foreign_progress_line
 test_reconcile_re_read_failure_keeps_every_key_open
 test_current_state_read_is_gated_to_local_ship_tasks
