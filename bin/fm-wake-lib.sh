@@ -792,6 +792,18 @@ fm_lock_try_acquire() {
     return 0
   fi
 
+  # A failed owner-directory creation leaves no lock to reclaim.
+  # Treat it as a failed attempt rather than recursively trying an unbounded
+  # chain of nonexistent steal locks. Bail only when the steal lock is absent
+  # too: an orphaned dead-pid steal with no primary must still fall through
+  # to the reclaim path below, or fm_lock_acquire_wait callers wedge forever
+  # (tests/fm-watcher-lock.test.sh covers both cases).
+  steal="$lockdir.steal"
+  if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ] \
+    && [ ! -e "$steal" ] && [ ! -L "$steal" ]; then
+    return 1
+  fi
+
   # Compare against ${BASHPID:-$$} inline, never via a command substitution:
   # $() forks a subshell whose BASHPID is not this frame's pid.
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
@@ -820,7 +832,6 @@ fm_lock_try_acquire() {
     return 1
   fi
 
-  steal="$lockdir.steal"
   if ! fm_lock_try_acquire "$steal"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=

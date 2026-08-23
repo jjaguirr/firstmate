@@ -13,6 +13,9 @@ WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 LIB="$ROOT/bin/fm-wake-lib.sh"
 
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$ROOT/bin/fm-timeout-lib.sh"
+
 TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 
 mark_pr_check_migration_complete() {
@@ -218,6 +221,51 @@ test_lock_single_winner_under_concurrency() {
   wins=$(awk 'NF { c++ } END { print c + 0 }' "$marker")
   [ "$wins" -eq 1 ] || fail "expected exactly one lock winner under concurrency, got $wins"
   pass "concurrent fm_lock_try_acquire yields exactly one winner"
+}
+
+test_lock_creation_failure_does_not_recurse_through_steal_locks() {
+  local dir state fakebin lock rc
+  dir=$(make_case lock-create-failure)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lock="$dir/unwritable.lock"
+  mkdir -p "$fakebin"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$fakebin/mktemp"
+  chmod 0755 "$fakebin/mktemp"
+  rc=0
+  # shellcheck disable=SC2016 # Expansion is deliberately deferred to the child shell.
+  fm_run_timed 2 env PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then exit 10; fi
+  ' _ "$LIB" "$lock" || rc=$?
+  [ "$rc" -eq 0 ] || fail "owner-directory creation failure did not return promptly (rc=$rc)"
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] || fail "failed lock acquisition published a lock"
+  [ ! -e "$lock.steal" ] && [ ! -L "$lock.steal" ] || fail "failed lock acquisition entered the steal path"
+  pass "owner-directory creation failure returns without recursive steal locks"
+}
+
+test_lock_reclaims_orphaned_dead_pid_steal_lock() {
+  local dir state lock steal owner dead rc newpid
+  dir=$(make_case lock-orphan-steal)
+  state="$dir/state"
+  lock="$state/.contend.lock"
+  steal="$lock.steal"
+  owner="$steal.owner.orphan"
+  dead=$(dead_pid)
+  mkdir "$owner"
+  printf '%s\n' "$dead" > "$owner/pid"
+  ln -s "$owner" "$steal"
+  rc=0
+  # shellcheck disable=SC2016 # Expansion is deliberately deferred to the child shell.
+  newpid=$(fm_run_timed 5 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then cat "$2/pid"; else exit 7; fi
+  ' _ "$LIB" "$lock") || rc=$?
+  [ "$rc" -eq 0 ] || fail "orphaned dead-pid steal lock was not reclaimed (rc=$rc)"
+  [ -n "$newpid" ] && [ "$newpid" != "$dead" ] || fail "reclaimed lock has no fresh pid (got '$newpid')"
+  [ -L "$lock" ] || fail "reclaim did not publish the primary lock"
+  [ ! -e "$steal" ] && [ ! -L "$steal" ] || fail "orphaned steal lock survived reclaim"
+  pass "orphaned dead-pid steal lock with no primary is reclaimed"
 }
 
 test_lock_steals_dead_pid_lock() {
@@ -1107,6 +1155,8 @@ test_stale_watch_reclaim_publishes_before_clear
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
 test_lock_single_winner_under_concurrency
+test_lock_creation_failure_does_not_recurse_through_steal_locks
+test_lock_reclaims_orphaned_dead_pid_steal_lock
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
