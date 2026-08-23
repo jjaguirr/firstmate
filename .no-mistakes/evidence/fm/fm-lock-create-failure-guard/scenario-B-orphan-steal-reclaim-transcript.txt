@@ -1,0 +1,11 @@
+=== Scenario B: orphaned dead-pid x.lock.steal with NO x.lock (stealer died between remove and recreate) ===
+Expected: fm_lock_try_acquire reclaims, publishes x.lock with fresh pid, removes orphan steal (rc=0).
+dead pid used: 999999
+[base] rc=0 newpid=971463 | primary_lock_exists=yes steal_exists=no
+[c0e96b0] rc=1 held_pid=<> | primary_lock_exists=no steal_exists=yes
+[target] rc=0 newpid=971675 | primary_lock_exists=yes steal_exists=no
+
+=== Scenario B2: same orphan, through fm_lock_acquire_wait (what fm-watch wake-queue / fm-pr-check callers use) ===
+[base] rc=0 (124 = spun until 4s bound) elapsed=0.21s out=acquired pid=971842
+[c0e96b0] rc=124 (124 = spun until 4s bound) elapsed=4.01s out=
+[target] rc=0 (124 = spun until 4s bound) elapsed=0.21s out=acquired pid=972834

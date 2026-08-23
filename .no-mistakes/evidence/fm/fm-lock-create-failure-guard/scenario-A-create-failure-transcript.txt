@@ -1,0 +1,6 @@
+=== Scenario A: owner-directory creation fails (mktemp -d exits 1), no lock or steal present ===
+Expected after fix: fm_lock_try_acquire returns 1 promptly; no lock / steal artifacts left behind.
+Host timeout mechanism: timeout; bound = 5s; outer rc 124 = still running at bound.
+[base    ] outer rc=124 elapsed=5.01s inner="<killed at bound, no return>" leftover=[]
+[c0e96b0 ] outer rc=1   elapsed=0.04s inner="try_acquire rc=1 FM_LOCK_HELD_PID=<>" leftover=[]
+[target  ] outer rc=1   elapsed=0.04s inner="try_acquire rc=1 FM_LOCK_HELD_PID=<>" leftover=[]

@@ -1,0 +1,21 @@
+=== Regression matrix: new tests vs library revisions (rc!=0 = test failed) ===
+[base 3d125ad / create-failure test (expect FAIL: recursion hangs until bound)] rc=1
+    not ok - owner-directory creation failure did not return promptly (rc=124)
+
+[base 3d125ad / orphan-steal-reclaim test (expect pass: pre-existing reclaim path)] rc=0
+    ok - orphaned dead-pid steal lock with no primary is reclaimed
+
+[c0e96b0 (round-1 broad guard) / create-failure test (expect pass)] rc=0
+    ok - owner-directory creation failure returns without recursive steal locks
+
+[c0e96b0 (round-1 broad guard) / orphan-steal-reclaim test (expect FAIL: reviewer-found wedge)] rc=1
+    not ok - orphaned dead-pid steal lock was not reclaimed (rc=7)
+
+[target 11c97cd / both tests, host timeout mechanism (timeout)] rc=0
+    ok - owner-directory creation failure returns without recursive steal locks
+    ok - orphaned dead-pid steal lock with no primary is reclaimed
+
+[target 11c97cd / both tests, FM_TIMEOUT_MECHANISM_OVERRIDE=bash (no GNU timeout, macOS-like)] rc=0
+    ok - owner-directory creation failure returns without recursive steal locks
+    ok - orphaned dead-pid steal lock with no primary is reclaimed
+
