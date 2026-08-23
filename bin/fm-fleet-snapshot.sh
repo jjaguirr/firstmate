@@ -478,9 +478,9 @@ task_json_lines() {
     # still-open captain decision, the set is derived purely from the keyed fold
     # (never from report bodies or decision-like prose), and only a lifecycle
     # signal the crew has provably moved past clears it. This surface deliberately
-    # keeps no rule of its own; see that function for the triage policy and for
-    # exactly where it parts company with the answerability verdict fm-send's
-    # --resolve-key and the wake drain share.
+    # keeps no rule of its own; see that function for the triage policy, which is
+    # wholesale rather than per-key, and for exactly where it parts company with
+    # the answerability verdict fm-send's --resolve-key and the wake drain share.
     current_line=$(printf '%s' "$current_json" | jq -r '.raw // ""')
     open_decisions_tsv=$(status_open_decisions_for_triage "$id" "$status_log" "$kind" "$current_line")
     open_decisions_json=$(printf '%s' "$open_decisions_tsv" | jq -R -s '

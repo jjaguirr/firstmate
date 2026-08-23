@@ -476,6 +476,58 @@ test_run_supersession_reads_only_new_appends_across_drains() {
   pass "run-step supersession folds only new appends across successive drains"
 }
 
+# The prefetch that warms the crew-state verdicts before the presentation lock
+# folds the same cursor the in-lock scan reads, so it commits: each task's new
+# appends are read, span-copied and folded ONCE per drain, not once per surface.
+# The probe records one line per fold, so counting its lines for this drain is
+# the direct evidence.
+test_each_delta_is_folded_once_per_drain() {
+  local dir state fakebin status out probe folds increment_bytes probe_bytes
+  dir=$(make_case cursor-single-fold)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  status="$state/task10.status"
+  out="$dir/drain.out"
+  probe="$dir/probe.tsv"
+  fm_write_meta "$state/task10.meta" "window=sess:fm-task10" "kind=ship"
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+
+  # Bootstrap: no fleet presentation manifest exists yet, so the prefetch may
+  # not move a cursor the unread surface still seeds from.
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "bootstrap drain failed"
+  grep -F 'task10 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "precondition: the decision did not surface: $(cat "$out")"
+  [ -f "$state/.status-presentation-cursor" ] \
+    || fail "precondition: the bootstrap drain did not commit a fleet presentation manifest"
+
+  : > "$probe"
+  increment_bytes=$(append_filler "$status" 20)
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review' \
+    FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "steady-state drain failed"
+  grep -F 'task10 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "the decision stopped surfacing on the steady-state drain: $(cat "$out")"
+  folds=$(grep -Fc "$(printf '%s\t' "$status")" "$probe")
+  [ "$folds" = 1 ] \
+    || fail "the drain folded this task's delta $folds times, expected exactly 1: $(cat "$probe")"
+  probe_bytes=$(last_probe_bytes "$probe" "$status")
+  [ "$probe_bytes" = "$increment_bytes" ] \
+    || fail "the single fold read $probe_bytes bytes, expected this round's $increment_bytes-byte increment"
+
+  # An unread informational line must still reach the UNREAD surface: the
+  # prefetch commits the open-decisions cursor, never the presentation manifest.
+  printf 'note: the staging secret was rotated\n' >> "$status"
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain over a new informational line failed"
+  grep -F 'the staging secret was rotated' "$out" >/dev/null \
+    || fail "committing the open-decisions cursor before the lock swallowed an unread answer: $(cat "$out")"
+  pass "each task's delta is folded exactly once per drain and unread status still surfaces"
+}
+
 test_truncated_log_falls_back_to_a_full_refold_not_a_dropped_decision
 test_same_size_rewrite_is_detected_via_inode_identity
 test_read_failure_preserves_state_for_retry
@@ -485,3 +537,4 @@ test_previous_fold_cache_is_refolded_under_current_semantics
 test_buried_decision_survives_many_growing_drains_and_resolution_clears_it
 test_run_step_supersession_preserves_the_incremental_durable_set
 test_run_supersession_reads_only_new_appends_across_drains
+test_each_delta_is_folded_once_per_drain

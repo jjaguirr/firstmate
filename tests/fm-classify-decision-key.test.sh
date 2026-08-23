@@ -325,9 +325,10 @@ SH
 # The one-shot whole-file verdict re-reads the log to build its witness set, so
 # a read failure there must keep every durable key open and say so, never
 # reconcile against an empty witness set. The incremental verdict has no such
-# re-read - its witness set rides the same cursor as its durable set - so a
-# read failure there must instead leave BOTH carried sets untouched: the
-# verdict cannot flip, and new bytes stay unfolded until a read succeeds.
+# re-read - its witness set rides the same cursor as its durable set - but it
+# must fail the same way: the cursor stays put, every durable key is kept open
+# (nothing may be called run-superseded on evidence the call could not read),
+# the failure is announced, and the held-back bytes fold once a read succeeds.
 test_reconcile_re_read_failure_keeps_every_key_open() {
   local dir f reader span full incremental raw err grown
   dir=$(case_dir run-step-read-failure)
@@ -350,16 +351,17 @@ test_reconcile_re_read_failure_keeps_every_key_open() {
   [ -z "$incremental" ] || fail "precondition: the incremental verdict did not supersede the witnessed key: '$incremental'"
   printf 'blocked [key=creds]: need the staging secret\n' >> "$f"
   incremental=$(FM_CREW_STATE_BIN="$reader" FM_STATUS_SPAN_READER="$span" status_open_decisions_incremental_for_task task "$f" 2>"$err")
-  [ -z "$incremental" ] \
-    || fail "a failed read flipped the carried incremental verdict: '$incremental'"
-  [ ! -s "$err" ] || fail "the incremental verdict re-read the log instead of using carried state: $(cat "$err")"
+  assert_contains "$incremental" $'rollout\tneeds-decision' \
+    "a failed read still reported a key as run-superseded on evidence it could not read"
+  grep -F 'could not read' "$err" >/dev/null \
+    || fail "a failed incremental read was silent, so a wedged reader is indistinguishable from a quiet fleet: $(cat "$err")"
   grown=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_incremental_for_task task "$f")
   assert_contains "$grown" $'creds\tblocked' \
     "the append held back by the failed read never folded once the read recovered"
   case "$grown" in
     *$'rollout\t'*) fail "the witnessed key resurfaced after the read recovered: '$grown'" ;;
   esac
-  pass "a re-read failure keeps every key open in the whole verdict and freezes the carried incremental one"
+  pass "a read failure keeps every durable key open in both verdicts and says so"
 }
 
 # A reserved key (bin/fm-pending-reply-lib.sh's pending-reply-<id>) may only be

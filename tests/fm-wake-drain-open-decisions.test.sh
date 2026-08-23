@@ -231,10 +231,11 @@ SH
 # The per-drain path carries its witness set in the same cursor as its durable
 # set, so the active-run verdict is answered from folded state instead of a
 # whole-log re-read. This pins the consequence: a span read that fails outright
-# advances neither set, so the verdict cannot flip in either direction, and the
-# unread delta is still folded once the read recovers.
+# advances neither set, is announced on stderr rather than leaving a wedged
+# reader indistinguishable from a quiet fleet, and the unread delta is still
+# folded once the read recovers.
 test_carried_witness_state_survives_a_read_failure() {
-  local dir state out fakebin reader cursor before after
+  local dir state out err fakebin reader cursor before after
   dir=$(make_case active-run-read-failure)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -258,11 +259,14 @@ test_carried_witness_state_survives_a_read_failure() {
   before=$(LC_ALL=C cksum "$cursor")
 
   printf 'blocked [key=creds]: need the staging secret\n' >> "$state/task10.status"
+  err="$dir/drain.err"
   FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
     FM_STATUS_SPAN_READER="$reader" \
-    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" 2>"$err" \
     || fail "drain failed instead of preserving carried fold state when its read failed"
   [ ! -s "$out" ] || fail "a failed read emitted a partial presentation: $(cat "$out")"
+  grep -F 'could not read' "$err" >/dev/null \
+    || fail "the drain froze its open-decisions fold silently: $(cat "$err")"
   after=$(LC_ALL=C cksum "$cursor")
   [ "$after" = "$before" ] || fail "a failed read advanced or rewrote the carried fold state"
 

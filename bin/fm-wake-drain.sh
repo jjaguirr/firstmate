@@ -129,13 +129,14 @@ EOF
 # whole lifetime, while still never dropping an old buried decision (see
 # fm-classify-lib.sh's "incremental (cursor-backed) open-decisions fold"). The
 # answerability verdict adds no status re-read at all: the same cursor carries
-# the witness set the run-supersession rule needs, so it too folds only the new
-# appends. Its one non-file input is an fm-crew-state read per LOCAL SHIP task
-# whose durable set is non-empty (never for a scout, secondmate, or remote
-# mate), and fm-crew-state is not a pure read, so print_status_presentation
-# warms every such verdict through status_task_run_state_prefetch BEFORE taking
-# the fleet-wide presentation lock and then seals the memo; nothing here can
-# exec it while that lock is held.
+# the witness set the run-supersession rule needs, so it rides that one fold.
+# status_task_run_state_prefetch performs that single fold and commits it before
+# the lock, so by the time this runs the cursor is already current and this scan
+# re-folds nothing. Its one non-file input is an fm-crew-state read per LOCAL
+# SHIP task whose durable set is non-empty (never for a scout, secondmate, or
+# remote mate), and fm-crew-state is not a pure read, so the prefetch warms
+# every such verdict BEFORE taking the fleet-wide presentation lock and then
+# seals the memo; nothing here can exec it while that lock is held.
 # Bounded and silent: prints nothing when no decision is open, which is the
 # common case.
 print_open_decisions_section() {
