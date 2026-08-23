@@ -795,7 +795,9 @@ fm_lock_try_acquire() {
   # A failed owner-directory creation leaves no lock to reclaim.
   # Treat it as a failed attempt rather than recursively trying an unbounded
   # chain of nonexistent steal locks.
-  if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
+  steal="$lockdir.steal"
+  if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ] \
+    && [ ! -e "$steal" ] && [ ! -L "$steal" ]; then
     return 1
   fi
 
@@ -827,7 +829,6 @@ fm_lock_try_acquire() {
     return 1
   fi
 
-  steal="$lockdir.steal"
   if ! fm_lock_try_acquire "$steal"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=
