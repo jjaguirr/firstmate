@@ -322,10 +322,14 @@ SH
   pass "active run-step supersession needs a same-key progress witness, is shared by both folds, and never trusts pane text"
 }
 
-# A status re-read failure during reconciliation must keep every durable key
-# open in both folds and say so, never reconcile against an empty witness set.
+# The one-shot whole-file verdict re-reads the log to build its witness set, so
+# a read failure there must keep every durable key open and say so, never
+# reconcile against an empty witness set. The incremental verdict has no such
+# re-read - its witness set rides the same cursor as its durable set - so a
+# read failure there must instead leave BOTH carried sets untouched: the
+# verdict cannot flip, and new bytes stay unfolded until a read succeeds.
 test_reconcile_re_read_failure_keeps_every_key_open() {
-  local dir f reader span full incremental raw err
+  local dir f reader span full incremental raw err grown
   dir=$(case_dir run-step-read-failure)
   f="$dir/task.status"
   reader="$dir/fake-crew-state.sh"
@@ -344,10 +348,18 @@ test_reconcile_re_read_failure_keeps_every_key_open() {
   grep -F 'could not re-read' "$err" >/dev/null || fail "the whole verdict hid the re-read failure: $(cat "$err")"
   incremental=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_incremental_for_task task "$f")
   [ -z "$incremental" ] || fail "precondition: the incremental verdict did not supersede the witnessed key: '$incremental'"
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$f"
   incremental=$(FM_CREW_STATE_BIN="$reader" FM_STATUS_SPAN_READER="$span" status_open_decisions_incremental_for_task task "$f" 2>"$err")
-  [ "$incremental" = "$raw" ] || fail "a failed re-read dropped durable keys from the incremental verdict: '$incremental' vs '$raw'"
-  grep -F 'could not re-read' "$err" >/dev/null || fail "the incremental verdict hid the re-read failure: $(cat "$err")"
-  pass "a status re-read failure keeps every durable key open in both folds and is reported"
+  [ -z "$incremental" ] \
+    || fail "a failed read flipped the carried incremental verdict: '$incremental'"
+  [ ! -s "$err" ] || fail "the incremental verdict re-read the log instead of using carried state: $(cat "$err")"
+  grown=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_incremental_for_task task "$f")
+  assert_contains "$grown" $'creds\tblocked' \
+    "the append held back by the failed read never folded once the read recovered"
+  case "$grown" in
+    *$'rollout\t'*) fail "the witnessed key resurfaced after the read recovered: '$grown'" ;;
+  esac
+  pass "a re-read failure keeps every key open in the whole verdict and freezes the carried incremental one"
 }
 
 # A reserved key (bin/fm-pending-reply-lib.sh's pending-reply-<id>) may only be

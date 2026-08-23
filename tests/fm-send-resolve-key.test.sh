@@ -339,7 +339,7 @@ EOF
 # serves those honestly and fails only the reconciliation's re-read (the third
 # and last span read of a drain, the first of an fm-send); the surfaced warning
 # proves that read is the one that failed.
-test_send_and_drain_keep_a_key_open_when_the_reconcile_re_read_fails() {
+test_send_keeps_a_key_open_when_the_reconcile_re_read_fails() {
   local dir fb log home reader span calls out rc err
   dir="$TMP_ROOT/reconcile-read-failure"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
@@ -366,13 +366,14 @@ SH
   run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" flaky --resolve-key rollout "phase it"; rc=$?
   [ "$rc" -ne 0 ] || fail "precondition: fm-send answered a superseded key"
 
+  # The drain path answers this from state carried in its own cursor, so it has
+  # no re-read to fail; a read failure there preserves both folded sets instead
+  # (tests/fm-wake-drain-open-decisions.test.sh owns that leg). fm-send is a
+  # one-shot caller that folds the whole log for its durable set anyway, so it
+  # is the surface that still re-reads - and it must fail OPEN, keeping the key
+  # answerable and saying why.
   FM_STATUS_SPAN_READER="$span" FM_FAKE_SPAN_CALLS="$calls"
   export FM_STATUS_SPAN_READER FM_FAKE_SPAN_CALLS
-  out=$(FM_FAKE_SPAN_FAIL_CALL=3 FM_STATE_OVERRIDE="$home/state" FM_CREW_STATE_BIN="$reader" "$DRAIN" 2>"$err")
-  [ "$(cat "$calls")" = 3 ] || fail "the drain's reconciliation re-read was not the failing read: $(cat "$calls") span read(s)"
-  printf '%s' "$out" | grep -F 'flaky [key=rollout] needs-decision: choose the deployment path' >/dev/null \
-    || fail "drain dropped a durable key when its reconcile re-read failed: $out"
-  grep -F 'could not re-read' "$err" >/dev/null || fail "drain hid the re-read failure: $(cat "$err")"
   : > "$calls"
   run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" flaky --resolve-key rollout "phase it"; rc=$?
   expect_code 0 "$rc" "fm-send should keep a durable key answerable when its reconcile re-read fails"
@@ -381,7 +382,7 @@ SH
     || fail "fm-send did not append the supported closing event after the re-read failure"
   grep -F 'could not re-read' "$err" >/dev/null || fail "fm-send hid the re-read failure: $(cat "$err")"
   unset FM_STATUS_SPAN_READER FM_FAKE_SPAN_CALLS FM_FAKE_DECISION_CURRENT
-  pass "fm-send and OPEN DECISIONS both keep a key open when the reconcile re-read fails"
+  pass "fm-send keeps a key answerable and says why when its reconcile re-read fails"
 }
 
 # fm-send must agree with drain on a reserved key that a foreign same-key
@@ -832,7 +833,7 @@ test_flag_misuse_refuses() {
 
 test_answer_send_closes_open_decision
 test_send_and_drain_share_open_resolved_and_run_superseded_verdicts
-test_send_and_drain_keep_a_key_open_when_the_reconcile_re_read_fails
+test_send_keeps_a_key_open_when_the_reconcile_re_read_fails
 test_send_keeps_reserved_keys_answerable_and_skips_state_reads_for_empty_sets
 test_send_and_drain_preserve_transferred_captain_holds
 test_answer_close_is_self_announced

@@ -398,6 +398,84 @@ test_run_step_supersession_preserves_the_incremental_durable_set() {
   pass "run-step supersession leaves the cursor-backed durable decisions available and per key"
 }
 
+# The active-run supersession verdict must be delta-bounded like the durable
+# fold it rides on: the witness set lives in the same cursor, so a long-lived
+# task whose run is actively working must never re-read its whole status log to
+# decide that a key was witnessed. Each round appends a small increment to an
+# ever-growing log and asserts the read-probe recorded exactly that increment,
+# while the verdict stays correct throughout.
+test_run_supersession_reads_only_new_appends_across_drains() {
+  local dir state fakebin status out probe round increment_bytes probe_bytes total_size bootstrap_bytes
+  dir=$(make_case cursor-witness-boundedness)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  status="$state/task9.status"
+  out="$dir/drain.out"
+  probe="$dir/probe.tsv"
+  : > "$probe"
+  fm_write_meta "$state/task9.meta" "window=sess:fm-task9" "kind=ship"
+
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+  printf 'working [key=rollout]: resumed validation after the rollout answer\n' >> "$status"
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$status"
+  append_filler "$status" 400 >/dev/null
+
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "bootstrap drain over a large witnessed log failed"
+  grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "the unwitnessed blocker did not surface on the bootstrap drain: $(cat "$out")"
+  if grep -F '[key=rollout]' "$out" >/dev/null; then
+    fail "the witnessed key was not superseded on the bootstrap drain: $(cat "$out")"
+  fi
+  bootstrap_bytes=$(last_probe_bytes "$probe" "$status")
+  [ -n "$bootstrap_bytes" ] && [ "$bootstrap_bytes" -gt 0 ] \
+    || fail "the bootstrap drain recorded no read at all"
+
+  for round in 1 2 3 4 5; do
+    increment_bytes=$(append_filler "$status" 20)
+    FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+      FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" \
+      FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+      || fail "drain $round over a growing witnessed log failed"
+    grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+      || fail "the unwitnessed blocker was dropped on growth round $round: $(cat "$out")"
+    if grep -F '[key=rollout]' "$out" >/dev/null; then
+      fail "the witnessed key resurfaced on growth round $round: $(cat "$out")"
+    fi
+    probe_bytes=$(last_probe_bytes "$probe" "$status")
+    [ "$probe_bytes" = "$increment_bytes" ] \
+      || fail "round $round read $probe_bytes bytes, expected exactly this round's $increment_bytes-byte increment (the supersession verdict is not delta-bounded)"
+  done
+  total_size=$(LC_ALL=C wc -c < "$status" | tr -d '[:space:]')
+  [ "$total_size" -gt "$bootstrap_bytes" ] \
+    || fail "test setup error: the log never grew past its bootstrap size"
+
+  # A same-key progress line appended LATER must still witness the blocker,
+  # folded from the increment alone.
+  increment_bytes=$(printf 'working [key=creds]: retrying with the cached token\n' | tee -a "$status" | LC_ALL=C wc -c | tr -d '[:space:]')
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after the late same-key progress line failed"
+  [ ! -s "$out" ] || fail "a key witnessed by a late progress line stayed presented: $(cat "$out")"
+  probe_bytes=$(last_probe_bytes "$probe" "$status")
+  [ "$probe_bytes" = "$increment_bytes" ] \
+    || fail "the witnessing drain read $probe_bytes bytes instead of the $increment_bytes-byte append"
+
+  # And the durable records are intact: parking the run brings both back.
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting captain decision' \
+    FM_STATE_OVERRIDE="$state" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after the run parked failed"
+  grep -F 'task9 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "the durable decision did not return once the run parked: $(cat "$out")"
+  grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "the durable blocker did not return once the run parked: $(cat "$out")"
+  pass "run-step supersession folds only new appends across successive drains"
+}
+
 test_truncated_log_falls_back_to_a_full_refold_not_a_dropped_decision
 test_same_size_rewrite_is_detected_via_inode_identity
 test_read_failure_preserves_state_for_retry
@@ -406,3 +484,4 @@ test_pre_fix_cursor_refolds_corr_tagged_decision
 test_previous_fold_cache_is_refolded_under_current_semantics
 test_buried_decision_survives_many_growing_drains_and_resolution_clears_it
 test_run_step_supersession_preserves_the_incremental_durable_set
+test_run_supersession_reads_only_new_appends_across_drains

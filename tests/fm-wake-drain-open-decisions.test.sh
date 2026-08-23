@@ -228,30 +228,23 @@ SH
   pass "OPEN DECISIONS keeps a reserved key open against foreign progress and reads state only for non-empty sets"
 }
 
-# The drain's own presentation reads run before the OPEN DECISIONS fold, so
-# the fake span reader below serves those honestly and fails only the
-# reconciliation's re-read (the third and last span read of a drain); the
-# surfaced warning proves that read, not an earlier one, is what failed.
-test_reconcile_re_read_failure_keeps_the_decision_presented() {
-  local dir state out err fakebin span calls
+# The per-drain path carries its witness set in the same cursor as its durable
+# set, so the active-run verdict is answered from folded state instead of a
+# whole-log re-read. This pins the consequence: a span read that fails outright
+# advances neither set, so the verdict cannot flip in either direction, and the
+# unread delta is still folded once the read recovers.
+test_carried_witness_state_survives_a_read_failure() {
+  local dir state out fakebin reader cursor before after
   dir=$(make_case active-run-read-failure)
   state="$dir/state"
   fakebin="$dir/fakebin"
   out="$dir/drain.out"
-  err="$dir/drain.err"
-  span="$dir/flaky-span-reader"
-  calls="$dir/span-calls"
+  reader="$dir/fail-reader"
+  cursor="$state/.task10.open-decisions-cursor"
   fm_write_meta "$state/task10.meta" "window=sess:fm-task10" "kind=ship"
   printf 'needs-decision [key=rollout]: choose the deployment path\nworking [key=rollout]: resumed\n' > "$state/task10.status"
-  cat > "$span" <<'SH'
-#!/usr/bin/env bash
-set -u
-n=$(( $(cat "$FM_FAKE_SPAN_CALLS" 2>/dev/null || echo 0) + 1 ))
-printf '%s\n' "$n" > "$FM_FAKE_SPAN_CALLS"
-[ "$n" -ne "${FM_FAKE_SPAN_FAIL_CALL:-1}" ] || exit 1
-tail -c +$(( $2 + 1 )) "$1" | head -c "$3"
-SH
-  chmod +x "$span"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$reader"
+  chmod +x "$reader"
 
   FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
@@ -259,30 +252,45 @@ SH
   grep -F 'task10 [key=rollout]' "$out" >/dev/null || fail "precondition: the durable decision did not surface: $(cat "$out")"
 
   FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
-    FM_STATUS_SPAN_READER="$span" FM_FAKE_SPAN_CALLS="$calls" FM_FAKE_SPAN_FAIL_CALL=3 \
-    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" 2>"$err" \
-    || fail "drain failed instead of keeping the decision when its re-read failed"
-  [ "$(cat "$calls")" = 3 ] || fail "the reconciliation re-read was not the failing read: $(cat "$calls") span read(s)"
-  grep -F 'task10 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
-    || fail "a failed re-read dropped a durable decision under an active run: $(cat "$out")"
-  grep -F 'could not re-read' "$err" >/dev/null || fail "the re-read failure was not surfaced: $(cat "$err")"
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain under an active run failed"
+  [ ! -s "$out" ] || fail "precondition: the witnessed key was not superseded: $(cat "$out")"
+  before=$(LC_ALL=C cksum "$cursor")
+
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$state/task10.status"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATUS_SPAN_READER="$reader" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain failed instead of preserving carried fold state when its read failed"
+  [ ! -s "$out" ] || fail "a failed read emitted a partial presentation: $(cat "$out")"
+  after=$(LC_ALL=C cksum "$cursor")
+  [ "$after" = "$before" ] || fail "a failed read advanced or rewrote the carried fold state"
 
   FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
-    || fail "drain after the re-read recovered failed"
+    || fail "drain after the read recovered failed"
+  grep -F 'task10 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "the mid-run blocker held back by the failed read never surfaced: $(cat "$out")"
   if grep -F '[key=rollout]' "$out" >/dev/null; then
-    fail "a witnessed key stayed presented once the re-read recovered: $(cat "$out")"
+    fail "the witnessed key resurfaced once the read recovered: $(cat "$out")"
   fi
-  pass "a status re-read failure keeps the decision presented and reports itself"
+
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting captain decision' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after the run parked failed"
+  grep -F 'task10 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "the durable decision did not return once the run parked: $(cat "$out")"
+  pass "carried witness state survives a read failure and keeps the verdict stable"
 }
 
 # fm-crew-state.sh is NOT a pure read (a bounded no-mistakes call, git reads, a
 # pane capture), and $STATE/.status-presentation-lock is fleet-wide and acquired
 # by an unbounded spin, so running that reader under it would let one wedged
-# no-mistakes daemon stall every other drain in this home. The drain warms the
-# verdict before taking the lock for every task its last presentation left
-# holding an open decision, and reads it at most once per task per drain. The
-# stub below reports whether the lock symlink existed at the moment it ran.
+# no-mistakes daemon stall every other drain in this home. The drain warms every
+# verdict it can need before taking that lock and then seals the memo, so the
+# reader can never run under it - including on the FIRST drain that sees a newly
+# opened decision, which is exactly when the section matters. The stub below
+# reports whether the lock symlink existed at the moment it ran.
 test_current_state_read_is_hoisted_out_of_the_presentation_lock() {
   local dir state out reader log
   dir=$(make_case state-read-outside-lock)
@@ -303,18 +311,32 @@ SH
   fm_write_meta "$state/task20.meta" "window=sess:fm-task20" "kind=ship"
   printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$state/task20.status"
 
+  # First sighting: no cursor exists yet, so this is the case an
+  # already-persisted open set could not have warmed.
   FM_LOCK_PROBE_LOG="$log" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$reader" "$DRAIN" > "$out" \
     || fail "first-sighting drain failed"
   grep -F 'task20 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
     || fail "precondition: the open decision did not surface: $(cat "$out")"
-
-  : > "$log"
-  FM_LOCK_PROBE_LOG="$log" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$reader" "$DRAIN" > "$out" \
-    || fail "steady-state drain failed"
-  grep -F 'task20 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
-    || fail "the open decision stopped surfacing once its verdict was warmed: $(cat "$out")"
   [ "$(cat "$log")" = "$(printf 'task20\tfree')" ] \
-    || fail "the steady-state drain did not read the crew state exactly once, outside the presentation lock: $(cat "$log")"
+    || fail "the first-sighting drain read the crew state inside the presentation lock: $(cat "$log")"
+
+  # A decision opened AFTER a drain that saw nothing open: the persisted cursor
+  # says the set is empty, so only a gate that folds the new appends can warm it.
+  fm_write_meta "$state/task21.meta" "window=sess:fm-task21" "kind=ship"
+  printf 'working: nothing open yet\n' > "$state/task21.status"
+  FM_LOCK_PROBE_LOG="$log" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$reader" "$DRAIN" > "$out" \
+    || fail "drain over a task with no open decision failed"
+  : > "$log"
+  printf 'needs-decision [key=schema]: pick the schema\n' >> "$state/task21.status"
+  FM_LOCK_PROBE_LOG="$log" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$reader" "$DRAIN" > "$out" \
+    || fail "drain over a newly opened decision failed"
+  grep -F 'task21 [key=schema] needs-decision: pick the schema' "$out" >/dev/null \
+    || fail "the newly opened decision did not surface: $(cat "$out")"
+  if grep -F $'\theld' "$log" >/dev/null; then
+    fail "a newly opened decision read the crew state inside the presentation lock: $(cat "$log")"
+  fi
+  [ "$(grep -Fc 'task21' "$log")" = 1 ] \
+    || fail "the newly opened decision's verdict was not read exactly once: $(cat "$log")"
   pass "the drain reads a crew's current state once per drain and never inside the presentation lock"
 }
 
@@ -385,6 +407,6 @@ test_open_decision_surfaces_even_with_an_unrelated_queued_wake
 test_buried_decision_surfaces_on_the_empty_queue_fast_path
 test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past
 test_reserved_key_stays_presented_under_a_foreign_progress_line_and_empty_sets_skip_the_state_read
-test_reconcile_re_read_failure_keeps_the_decision_presented
+test_carried_witness_state_survives_a_read_failure
 test_status_symlink_is_not_followed
 test_current_state_read_is_hoisted_out_of_the_presentation_lock
