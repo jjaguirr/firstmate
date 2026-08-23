@@ -792,6 +792,13 @@ fm_lock_try_acquire() {
     return 0
   fi
 
+  # A failed owner-directory creation leaves no lock to reclaim.
+  # Treat it as a failed attempt rather than recursively trying an unbounded
+  # chain of nonexistent steal locks.
+  if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    return 1
+  fi
+
   # Compare against ${BASHPID:-$$} inline, never via a command substitution:
   # $() forks a subshell whose BASHPID is not this frame's pid.
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)

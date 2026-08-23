@@ -220,6 +220,26 @@ test_lock_single_winner_under_concurrency() {
   pass "concurrent fm_lock_try_acquire yields exactly one winner"
 }
 
+test_lock_creation_failure_does_not_recurse_through_steal_locks() {
+  local dir state fakebin lock rc
+  dir=$(make_case lock-create-failure)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  lock="$dir/unwritable.lock"
+  mkdir -p "$fakebin"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$fakebin/mktemp"
+  chmod 0755 "$fakebin/mktemp"
+  rc=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" timeout 2s bash -c '
+    . "$1"
+    if fm_lock_try_acquire "$2"; then exit 10; fi
+  ' _ "$LIB" "$lock" || rc=$?
+  [ "$rc" -eq 0 ] || fail "owner-directory creation failure did not return promptly (rc=$rc)"
+  [ ! -e "$lock" ] && [ ! -L "$lock" ] || fail "failed lock acquisition published a lock"
+  [ ! -e "$lock.steal" ] && [ ! -L "$lock.steal" ] || fail "failed lock acquisition entered the steal path"
+  pass "owner-directory creation failure returns without recursive steal locks"
+}
+
 test_lock_steals_dead_pid_lock() {
   local dir state lockdir dead rc newpid
   dir=$(make_case lock-dead-steal)
@@ -1107,6 +1127,7 @@ test_stale_watch_reclaim_publishes_before_clear
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
 test_lock_single_winner_under_concurrency
+test_lock_creation_failure_does_not_recurse_through_steal_locks
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
 test_lock_live_steal_mutex_is_not_reclaimed
