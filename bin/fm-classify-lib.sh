@@ -454,10 +454,11 @@ EOF
 }
 
 # Status verbs that record the crew moving on with its work. In the lifecycle
-# reconciliation below, one of these lines AFTER a key's opening record is the
-# durable ordering witness that the record predates the crew's later progress;
-# the line itself closes nothing, and the paused verb (a declared wait, not
-# progress) is deliberately not one of them.
+# reconciliation below, one of these lines stating the SAME key as an open
+# record, appended after it, is the durable per-key witness that the crew
+# moved past that decision; the line itself closes nothing, a keyless or
+# other-key progress line is never a witness for an untouched key, and the
+# paused verb (a declared wait, not progress) is deliberately not one of them.
 _fm_status_verb_is_progress() {  # <verb>
   case "$1" in
     working|done|failed) return 0 ;;
@@ -465,28 +466,43 @@ _fm_status_verb_is_progress() {  # <verb>
   esac
 }
 
-# The keyed decisions opened since the crew's latest progress line, folded with
-# the same rule as the durable set over the same bytes (optionally bounded by a
-# captured end offset so a snapshot-bounded fold compares like with like).
-# Every key open in the durable set but absent here was opened BEFORE the crew
-# last reported progress, which is the per-key evidence the active-run
-# reconciliation needs.
-_fm_open_decisions_since_last_progress() {  # <status-file> [<captured-end-offset>]
-  local f=$1 captured_end=${2:-} line resolve held open='' size
-  [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 0
+# The key a line explicitly states in either documented position, through the
+# one key parser; fails for a keyless line, which _fm_decision_key would fold
+# as "default" and which must never act as another record's witness.
+_fm_decision_stated_key() {  # <status-line> -> key slug
+  _fm_key_before_colon "$1" || _fm_key_at_note_head "$1" >/dev/null || return 1
+  _fm_decision_key "$1"
+}
+
+# The durable fold re-run over the same bytes (optionally bounded by a captured
+# end offset so a snapshot-bounded fold compares like with like) with one extra
+# transition: a progress line stating a key drops that key's record. Every key
+# open in the durable set but absent here was followed by its own progress
+# line, which is the per-key evidence the active-run reconciliation needs.
+# Fails (status 1, nothing printed) when the bytes cannot be re-read, so the
+# caller can keep the durable set rather than reconcile against nothing.
+_fm_open_decisions_with_keyed_progress() {  # <status-file> [<captured-end-offset>]
+  local f=$1 captured_end=${2:-} line resolve held open='' size span key verb
+  [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 1
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
   held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
   case "$captured_end" in
-    ''|*[!0-9]*) size='' ;;
+    ''|*[!0-9]*) size=$(_fm_status_file_size "$f") || return 1 ;;
     *) size=$captured_end ;;
   esac
+  size=${size//[[:space:]]/}
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
+  span=$(_fm_status_read_span "$f" 0 "$size" 2>/dev/null) || return 1
   while IFS= read -r line || [ -n "$line" ]; do
-    if _fm_status_verb_is_progress "$(status_line_verb "$line")"; then
-      open=''
+    verb=$(status_line_verb "$line")
+    if _fm_status_verb_is_progress "$verb" && key=$(_fm_decision_stated_key "$line"); then
+      open=$(_fm_decision_drop "$open" "$key")
       continue
     fi
     open=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held")
-  done < <(if [ -n "$size" ]; then _fm_status_read_span "$f" 0 "$size"; else cat "$f"; fi)
+  done <<EOF
+$span
+EOF
   printf '%s' "$open"
 }
 
@@ -510,26 +526,31 @@ status_task_run_state() {  # <task-id> <status-file>
 
 # Reconcile one durable open set with the task lifecycle, one key at a time. A
 # key is superseded only when BOTH hold: fm-crew-state proves this task is
-# working on an active no-mistakes run-step, and the status log itself shows
-# the crew reported progress (_fm_status_verb_is_progress) after that key's
-# opening record, so the record provably predates the resumed work. A key
-# raised mid-run - a blocked or needs-decision appended after the crew's last
-# progress line while the run is still working - has no such witness and stays
-# open and answerable. Do not use a pane verdict here: rendered terminal
-# activity can prove work is in progress for wake triage, but cannot close a
-# captain decision. A missing, unreadable, or malformed current-state line
-# fails open to the durable set.
+# working on an active no-mistakes run-step, and the status log itself shows a
+# later progress line stating that same key (_fm_status_verb_is_progress), so
+# the record provably predates the crew moving past it. A key raised mid-run,
+# or one followed only by keyless or other-key progress lines, has no such
+# witness and stays open and answerable. Do not use a pane verdict here:
+# rendered terminal activity can prove work is in progress for wake triage,
+# but cannot close a captain decision. A missing, unreadable, or malformed
+# current-state line fails open to the durable set, and so does a status
+# re-read failure, which is reported on stderr rather than letting an empty
+# witness set drop every key.
 _fm_open_decisions_reconcile_active_run() {  # <status-file> <open-set> <current-state-line> [<captured-end-offset>]
-  local f=$1 open=$2 current=$3 captured_end=${4:-} since line
+  local f=$1 open=$2 current=$3 captured_end=${4:-} witnessed line
   [ -n "$open" ] || return 0
   case "$current" in
     'state: working · source: run-step'*) ;;
     *) printf '%s' "$open"; return 0 ;;
   esac
-  since=$(_fm_open_decisions_since_last_progress "$f" "$captured_end")
+  if ! witnessed=$(_fm_open_decisions_with_keyed_progress "$f" "$captured_end"); then
+    echo "warning: could not re-read $f to reconcile its open decisions with the active run; keeping every durable key open" >&2
+    printf '%s' "$open"
+    return 0
+  fi
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    _fm_open_set_has "$since" "${line%%$'\t'*}" || continue
+    _fm_open_set_has "$witnessed" "${line%%$'\t'*}" || continue
     printf '%s\n' "$line"
   done <<EOF
 $open

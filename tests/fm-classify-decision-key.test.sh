@@ -274,9 +274,14 @@ test_active_run_step_reconciles_both_decision_folds_per_key_without_using_pane_t
   f="$dir/task.status"
   reader="$dir/fake-crew-state.sh"
   fm_write_meta "$dir/task.meta" "window=sess:fm-task" "kind=ship"
-  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$f"
-  printf 'working: resumed validation after the rollout answer\n' >> "$f"
-  printf 'blocked [key=creds]: need the staging secret\n' >> "$f"
+  {
+    printf 'needs-decision [key=rollout]: choose the deployment path\n'
+    printf 'needs-decision [key=schema]: pick the schema\n'
+    printf 'working [key=rollout]: resumed validation after the rollout answer\n'
+    printf 'working [key=tests]: adding coverage while waiting\n'
+    printf 'working: keyless routine note\n'
+    printf 'blocked [key=creds]: need the staging secret\n'
+  } > "$f"
   cat > "$reader" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${FM_FAKE_DECISION_CURRENT:-state: unknown · source: none}"
@@ -288,8 +293,8 @@ SH
   export FM_FAKE_DECISION_CURRENT FM_CREW_STATE_BIN
   full=$(status_open_decisions_for_task task "$f")
   incremental=$(status_open_decisions_incremental_for_task task "$f")
-  [ "$full" = "$(printf 'creds\tblocked\tneed the staging secret\n')" ] \
-    || fail "active run-step did not supersede exactly the pre-progress key in the whole verdict: '$full'"
+  [ "$full" = "$(printf 'schema\tneeds-decision\tpick the schema\ncreds\tblocked\tneed the staging secret\n')" ] \
+    || fail "active run-step did not supersede exactly the key with its own later progress line in the whole verdict: '$full'"
   [ "$incremental" = "$full" ] \
     || fail "incremental verdict diverged from the whole verdict under run supersession: '$incremental' vs '$full'"
 
@@ -314,7 +319,35 @@ SH
   [ "$incremental" = "$full" ] \
     || fail "pane-safe incremental verdict diverged from the whole verdict: '$incremental' vs '$full'"
   unset FM_FAKE_DECISION_CURRENT FM_CREW_STATE_BIN
-  pass "active run-step supersession is per key, shared by whole and incremental folds, and never trusts pane text"
+  pass "active run-step supersession needs a same-key progress witness, is shared by both folds, and never trusts pane text"
+}
+
+# A status re-read failure during reconciliation must keep every durable key
+# open in both folds and say so, never reconcile against an empty witness set.
+test_reconcile_re_read_failure_keeps_every_key_open() {
+  local dir f reader span full incremental raw err
+  dir=$(case_dir run-step-read-failure)
+  f="$dir/task.status"
+  reader="$dir/fake-crew-state.sh"
+  span="$dir/fail-span-reader"
+  err="$dir/stderr.log"
+  fm_write_meta "$dir/task.meta" "window=sess:fm-task" "kind=ship"
+  printf 'needs-decision [key=rollout]: choose the deployment path\nworking [key=rollout]: resumed\n' > "$f"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "state: working · source: run-step · ci running"\n' > "$reader"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$span"
+  chmod +x "$reader" "$span"
+  raw=$(status_open_decisions "$f")
+  full=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_for_task task "$f")
+  [ -z "$full" ] || fail "precondition: a readable log did not supersede the witnessed key: '$full'"
+  full=$(FM_CREW_STATE_BIN="$reader" FM_STATUS_SPAN_READER="$span" status_open_decisions_for_task task "$f" 2>"$err")
+  [ "$full" = "$raw" ] || fail "a failed re-read dropped durable keys from the whole verdict: '$full' vs '$raw'"
+  grep -F 'could not re-read' "$err" >/dev/null || fail "the whole verdict hid the re-read failure: $(cat "$err")"
+  incremental=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_incremental_for_task task "$f")
+  [ -z "$incremental" ] || fail "precondition: the incremental verdict did not supersede the witnessed key: '$incremental'"
+  incremental=$(FM_CREW_STATE_BIN="$reader" FM_STATUS_SPAN_READER="$span" status_open_decisions_incremental_for_task task "$f" 2>"$err")
+  [ "$incremental" = "$raw" ] || fail "a failed re-read dropped durable keys from the incremental verdict: '$incremental' vs '$raw'"
+  grep -F 'could not re-read' "$err" >/dev/null || fail "the incremental verdict hid the re-read failure: $(cat "$err")"
+  pass "a status re-read failure keeps every durable key open in both folds and is reported"
 }
 
 # A decision raised with no later progress line has no ordering witness, so an
@@ -325,7 +358,7 @@ test_mid_run_decision_without_later_progress_stays_open_under_active_run() {
   f="$dir/task.status"
   reader="$dir/fake-crew-state.sh"
   fm_write_meta "$dir/task.meta" "window=sess:fm-task" "kind=ship"
-  printf 'working: validating\nblocked [key=creds]: need the staging secret\n' > "$f"
+  printf 'working: validating\nblocked [key=creds]: need the staging secret\nworking [key=other]: unrelated phase\n' > "$f"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "state: working · source: run-step · ci running"\n' > "$reader"
   chmod +x "$reader"
   expected=$(printf 'creds\tblocked\tneed the staging secret\n')
@@ -333,7 +366,7 @@ test_mid_run_decision_without_later_progress_stays_open_under_active_run() {
   incremental=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_incremental_for_task task "$f")
   [ "$full" = "$expected" ] || fail "a mid-run blocker was superseded by the whole verdict: '$full'"
   [ "$incremental" = "$expected" ] || fail "a mid-run blocker was superseded by the incremental verdict: '$incremental'"
-  pass "a blocker raised after the crew's last progress line stays open under an active run"
+  pass "a blocker with no same-key progress line stays open under an active run"
 }
 
 # Only a local ship task can own an attributed run, so the current-state read
@@ -353,7 +386,7 @@ SH
   expected=$(printf 'rollout\tneeds-decision\tchoose the deployment path\n')
   for kind in scout secondmate remote absent; do
     f="$dir/$kind.status"
-    printf 'needs-decision [key=rollout]: choose the deployment path\nworking: resumed\n' > "$f"
+    printf 'needs-decision [key=rollout]: choose the deployment path\nworking [key=rollout]: resumed\n' > "$f"
     case "$kind" in
       remote) fm_write_meta "$dir/$kind.meta" "window=sess:fm-$kind" "kind=ship" "remote_host=mate.example" ;;
       absent) ;;
@@ -365,7 +398,7 @@ SH
   [ ! -s "$calls" ] || fail "the current-state reader ran for a task that can never own a run: $(cat "$calls")"
 
   f="$dir/ship.status"
-  printf 'needs-decision [key=rollout]: choose the deployment path\nworking: resumed\n' > "$f"
+  printf 'needs-decision [key=rollout]: choose the deployment path\nworking [key=rollout]: resumed\n' > "$f"
   fm_write_meta "$dir/ship.meta" "window=sess:fm-ship" "kind=ship"
   full=$(FM_FAKE_DECISION_CALLS="$calls" FM_CREW_STATE_BIN="$reader" status_open_decisions_for_task ship "$f")
   [ -z "$full" ] || fail "a local ship task with a later progress line kept a superseded key: '$full'"
@@ -451,4 +484,5 @@ test_closing_verb_separates_resolution_from_durable_transfer
 test_closing_verb_tracks_the_last_transition_in_both_positions
 test_active_run_step_reconciles_both_decision_folds_per_key_without_using_pane_text
 test_mid_run_decision_without_later_progress_stays_open_under_active_run
+test_reconcile_re_read_failure_keeps_every_key_open
 test_current_state_read_is_gated_to_local_ship_tasks

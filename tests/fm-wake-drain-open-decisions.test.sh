@@ -165,9 +165,14 @@ test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past() {
   fakebin="$dir/fakebin"
   out="$dir/drain.out"
   fm_write_meta "$state/task9.meta" "window=sess:fm-task9" "kind=ship"
-  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$state/task9.status"
-  printf 'working: resumed validation after the rollout answer\n' >> "$state/task9.status"
-  printf 'blocked [key=creds]: need the staging secret\n' >> "$state/task9.status"
+  {
+    printf 'needs-decision [key=rollout]: choose the deployment path\n'
+    printf 'needs-decision [key=schema]: pick the schema\n'
+    printf 'working [key=rollout]: resumed validation after the rollout answer\n'
+    printf 'working [key=tests]: adding coverage while waiting\n'
+    printf 'working: keyless routine note\n'
+    printf 'blocked [key=creds]: need the staging secret\n'
+  } > "$state/task9.status"
 
   FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
@@ -177,6 +182,8 @@ test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past() {
   fi
   grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
     || fail "a blocker raised mid-run was hidden by the active run-step: $(cat "$out")"
+  grep -F 'task9 [key=schema] needs-decision: pick the schema' "$out" >/dev/null \
+    || fail "unrelated or keyless progress lines superseded an untouched key: $(cat "$out")"
 
   FM_FAKE_CREW_STATE='state: working · source: pane · rendered activity only' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
@@ -186,6 +193,54 @@ test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past() {
   grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
     || fail "pane activity hid the mid-run blocker: $(cat "$out")"
   pass "OPEN DECISIONS hides only a key an authoritative active run-step superseded, never a mid-run blocker"
+}
+
+# The drain's own presentation reads run before the OPEN DECISIONS fold, so
+# the fake span reader below serves those honestly and fails only the
+# reconciliation's re-read (the third and last span read of a drain); the
+# surfaced warning proves that read, not an earlier one, is what failed.
+test_reconcile_re_read_failure_keeps_the_decision_presented() {
+  local dir state out err fakebin span calls
+  dir=$(make_case active-run-read-failure)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/drain.out"
+  err="$dir/drain.err"
+  span="$dir/flaky-span-reader"
+  calls="$dir/span-calls"
+  fm_write_meta "$state/task10.meta" "window=sess:fm-task10" "kind=ship"
+  printf 'needs-decision [key=rollout]: choose the deployment path\nworking [key=rollout]: resumed\n' > "$state/task10.status"
+  cat > "$span" <<'SH'
+#!/usr/bin/env bash
+set -u
+n=$(( $(cat "$FM_FAKE_SPAN_CALLS" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" > "$FM_FAKE_SPAN_CALLS"
+[ "$n" -ne "${FM_FAKE_SPAN_FAIL_CALL:-1}" ] || exit 1
+tail -c +$(( $2 + 1 )) "$1" | head -c "$3"
+SH
+  chmod +x "$span"
+
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "seeding drain failed"
+  grep -F 'task10 [key=rollout]' "$out" >/dev/null || fail "precondition: the durable decision did not surface: $(cat "$out")"
+
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATUS_SPAN_READER="$span" FM_FAKE_SPAN_CALLS="$calls" FM_FAKE_SPAN_FAIL_CALL=3 \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" 2>"$err" \
+    || fail "drain failed instead of keeping the decision when its re-read failed"
+  [ "$(cat "$calls")" = 3 ] || fail "the reconciliation re-read was not the failing read: $(cat "$calls") span read(s)"
+  grep -F 'task10 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "a failed re-read dropped a durable decision under an active run: $(cat "$out")"
+  grep -F 'could not re-read' "$err" >/dev/null || fail "the re-read failure was not surfaced: $(cat "$err")"
+
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after the re-read recovered failed"
+  if grep -F '[key=rollout]' "$out" >/dev/null; then
+    fail "a witnessed key stayed presented once the re-read recovered: $(cat "$out")"
+  fi
+  pass "a status re-read failure keeps the decision presented and reports itself"
 }
 
 test_status_symlink_is_not_followed() {
@@ -254,4 +309,5 @@ test_no_open_decisions_prints_nothing
 test_open_decision_surfaces_even_with_an_unrelated_queued_wake
 test_buried_decision_surfaces_on_the_empty_queue_fast_path
 test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past
+test_reconcile_re_read_failure_keeps_the_decision_presented
 test_status_symlink_is_not_followed

@@ -362,7 +362,7 @@ test_run_step_supersession_preserves_the_incremental_durable_set() {
   cursor="$state/.task8.open-decisions-cursor"
   fm_write_meta "$state/task8.meta" "window=sess:fm-task8" "kind=ship"
   printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
-  printf 'working: resumed validation after the rollout answer\n' >> "$status"
+  printf 'working [key=rollout]: resumed validation after the rollout answer\n' >> "$status"
 
   FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
     || fail "initial drain before run supersession failed"

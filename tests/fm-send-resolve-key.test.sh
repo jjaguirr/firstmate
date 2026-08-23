@@ -248,9 +248,14 @@ esac
 SH
   chmod +x "$fb/no-mistakes"
   fm_write_meta "$home/state/resumed.meta" "window=sess:fm-resumed" "kind=ship" "worktree=$worktree"
-  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$home/state/resumed.status"
-  printf 'working: resumed validation after the rollout answer\n' >> "$home/state/resumed.status"
-  printf 'blocked [key=creds]: need the staging secret\n' >> "$home/state/resumed.status"
+  {
+    printf 'needs-decision [key=rollout]: choose the deployment path\n'
+    printf 'needs-decision [key=schema]: pick the schema\n'
+    printf 'working [key=rollout]: resumed validation after the rollout answer\n'
+    printf 'working [key=tests]: adding coverage while waiting\n'
+    printf 'working: keyless routine note\n'
+    printf 'blocked [key=creds]: need the staging secret\n'
+  } > "$home/state/resumed.status"
   FM_FAKE_AXI_STATUS=$(cat <<EOF
 run:
   id: "01RUN"
@@ -271,6 +276,8 @@ EOF
   fi
   printf '%s' "$out" | grep -F 'resumed [key=creds] blocked: need the staging secret' >/dev/null \
     || fail "drain hid a blocker raised mid-run under an active run-step: $out"
+  printf '%s' "$out" | grep -F 'resumed [key=schema] needs-decision: pick the schema' >/dev/null \
+    || fail "drain let unrelated or keyless progress lines supersede an untouched key: $out"
 
   run_send_with_current_state_err "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" "$err" resumed --resolve-key rollout "phase it"; rc=$?
   [ "$rc" -ne 0 ] || fail "fm-send accepted a key superseded by an active run-step"
@@ -291,8 +298,12 @@ EOF
   grep -F 'use the vault secret' "$log" >/dev/null || fail "the mid-run blocker answer was not delivered: $(cat "$log")"
   grep -F 'resolved [key=creds]: answered: use the vault secret' "$home/state/resumed.status" >/dev/null \
     || fail "fm-send did not close the mid-run blocker it answered"
+  run_send_with_current_state "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" resumed --resolve-key schema "use the flat schema"; rc=$?
+  expect_code 0 "$rc" "a key followed only by unrelated progress lines should stay answerable under an active run-step"
+  grep -F 'resolved [key=schema]: answered: use the flat schema' "$home/state/resumed.status" >/dev/null \
+    || fail "fm-send did not close the untouched key it answered"
   out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
-  [ -z "$out" ] || fail "drain still presented a key after the mid-run answer under an active run: $out"
+  [ -z "$out" ] || fail "drain still presented a key after the mid-run answers under an active run: $out"
 
   FM_FAKE_AXI_STATUS=$(cat <<EOF
 run:
@@ -319,6 +330,58 @@ EOF
   [ -z "$out" ] || fail "drain still presented a key after every decision was resolved: $out"
   unset FM_FAKE_AXI_STATUS
   pass "fm-send and OPEN DECISIONS agree per key for durable open, resolved, run-superseded, mid-run, and re-parked states"
+}
+
+# When the status re-read behind the active-run reconciliation fails, both
+# public interfaces keep the durable key: drain still presents it and fm-send
+# still answers and closes it, with the failure reported rather than hidden.
+# The drain's own presentation reads precede the fold, so the fake span reader
+# serves those honestly and fails only the reconciliation's re-read (the third
+# and last span read of a drain, the first of an fm-send); the surfaced warning
+# proves that read is the one that failed.
+test_send_and_drain_keep_a_key_open_when_the_reconcile_re_read_fails() {
+  local dir fb log home reader span calls out rc err
+  dir="$TMP_ROOT/reconcile-read-failure"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
+  reader=$(make_decision_state_reader "$dir")
+  span="$dir/flaky-span-reader"
+  calls="$dir/span-calls"
+  cat > "$span" <<'SH'
+#!/usr/bin/env bash
+set -u
+n=$(( $(cat "$FM_FAKE_SPAN_CALLS" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" > "$FM_FAKE_SPAN_CALLS"
+[ "$n" -ne "${FM_FAKE_SPAN_FAIL_CALL:-1}" ] || exit 1
+tail -c +$(( $2 + 1 )) "$1" | head -c "$3"
+SH
+  chmod +x "$span"
+  home=$(setup_home reconcile-read-failure)
+  fm_write_meta "$home/state/flaky.meta" "window=sess:fm-flaky" "kind=ship"
+  printf 'needs-decision [key=rollout]: choose the deployment path\nworking [key=rollout]: resumed\n' > "$home/state/flaky.status"
+  FM_FAKE_DECISION_CURRENT='state: working · source: run-step · ci running'
+  export FM_FAKE_DECISION_CURRENT
+
+  out=$(drain_out_with_current_state "$home" "$reader")
+  [ -z "$out" ] || fail "precondition: a readable log did not supersede the witnessed key: $out"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" flaky --resolve-key rollout "phase it"; rc=$?
+  [ "$rc" -ne 0 ] || fail "precondition: fm-send answered a superseded key"
+
+  FM_STATUS_SPAN_READER="$span" FM_FAKE_SPAN_CALLS="$calls"
+  export FM_STATUS_SPAN_READER FM_FAKE_SPAN_CALLS
+  out=$(FM_FAKE_SPAN_FAIL_CALL=3 FM_STATE_OVERRIDE="$home/state" FM_CREW_STATE_BIN="$reader" "$DRAIN" 2>"$err")
+  [ "$(cat "$calls")" = 3 ] || fail "the drain's reconciliation re-read was not the failing read: $(cat "$calls") span read(s)"
+  printf '%s' "$out" | grep -F 'flaky [key=rollout] needs-decision: choose the deployment path' >/dev/null \
+    || fail "drain dropped a durable key when its reconcile re-read failed: $out"
+  grep -F 'could not re-read' "$err" >/dev/null || fail "drain hid the re-read failure: $(cat "$err")"
+  : > "$calls"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" flaky --resolve-key rollout "phase it"; rc=$?
+  expect_code 0 "$rc" "fm-send should keep a durable key answerable when its reconcile re-read fails"
+  grep -F 'phase it' "$log" >/dev/null || fail "the answer was not delivered: $(cat "$log")"
+  grep -F 'resolved [key=rollout]: answered: phase it' "$home/state/flaky.status" >/dev/null \
+    || fail "fm-send did not append the supported closing event after the re-read failure"
+  grep -F 'could not re-read' "$err" >/dev/null || fail "fm-send hid the re-read failure: $(cat "$err")"
+  unset FM_STATUS_SPAN_READER FM_FAKE_SPAN_CALLS FM_FAKE_DECISION_CURRENT
+  pass "fm-send and OPEN DECISIONS both keep a key open when the reconcile re-read fails"
 }
 
 # A transferred decision is deliberately absent from the status presentation:
@@ -722,6 +785,7 @@ test_flag_misuse_refuses() {
 
 test_answer_send_closes_open_decision
 test_send_and_drain_share_open_resolved_and_run_superseded_verdicts
+test_send_and_drain_keep_a_key_open_when_the_reconcile_re_read_fails
 test_send_and_drain_preserve_transferred_captain_holds
 test_answer_close_is_self_announced
 test_colon_first_key_position_is_answerable

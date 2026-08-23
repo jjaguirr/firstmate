@@ -454,7 +454,7 @@ if [ -n "$RESOLVE_KEYS" ]; then
     # is neither "closed" nor "mistyped", so name it and stop.
     case "$resolve_superseded_set" in
       "$k"$'\t'*|*$'\n'"$k"$'\t'*)
-        echo "error: --resolve-key '$k': that decision is still recorded as open in $RESOLVE_STATUS_FILE, but it is not answerable now: the crew reported progress after raising it and its task is working on an active run ($resolve_current_state), so the run superseded it. Wait for that run to park or finish and resend if the decision is still needed; nothing was sent." >&2
+        echo "error: --resolve-key '$k': that decision is still recorded as open in $RESOLVE_STATUS_FILE, but it is not answerable now: the crew later reported progress under that same key and its task is working on an active run ($resolve_current_state), so the run superseded it. Wait for that run to park or finish and resend if the decision is still needed; nothing was sent." >&2
         exit 1
         ;;
     esac
