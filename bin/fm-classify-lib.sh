@@ -474,16 +474,6 @@ _fm_decision_stated_key() {  # <status-line> -> key slug
   _fm_decision_key "$1"
 }
 
-# The durable fold re-run over the same bytes (optionally bounded by a captured
-# end offset so a snapshot-bounded fold compares like with like) with one extra
-# transition: a progress line stating a key drops that key's record. Every key
-# open in the durable set but absent here was followed by its own progress
-# line, which is the per-key evidence the active-run reconciliation needs.
-# The drop honors the reserved-namespace rule exactly as every other
-# transition does, so a reserved key is witnessed only by a line that speaks
-# its owner's vocabulary.
-# Fails (status 1, nothing printed) when the bytes cannot be re-read, so the
-# caller can keep the durable set rather than reconcile against nothing.
 # Fold ONE status line into a WITNESS set: the durable per-line rule
 # (_fm_decision_fold_line, still the only decision parser) plus the single
 # extra transition that a progress line stating a key drops that key. This is
@@ -504,15 +494,25 @@ _fm_decision_witness_fold_line() {  # <witness-set> <status-line> <resolve-verb>
   _fm_decision_fold_line "$witness" "$line" "$resolve" "$held"
 }
 
-_fm_open_decisions_with_keyed_progress() {  # <status-file> [<captured-end-offset>]
-  local f=$1 captured_end=${2:-} line resolve held open='' size span
+# The durable fold re-run over the whole current file with one extra
+# transition: a progress line stating a key drops that key's record. Every key
+# open in the durable set but absent here was followed by its own progress
+# line, which is the per-key evidence the active-run reconciliation needs.
+# The drop honors the reserved-namespace rule exactly as every other
+# transition does, so a reserved key is witnessed only by a line that speaks
+# its owner's vocabulary.
+# Whole-file on purpose: every caller is a one-shot surface that has already
+# folded the whole log for its durable set, so both folds see the same bytes.
+# The per-drain path never comes through here - it carries its witness set in
+# the cursor - so there is no snapshot endpoint to honor.
+# Fails (status 1, nothing printed) when the bytes cannot be re-read, so the
+# caller can keep the durable set rather than reconcile against nothing.
+_fm_open_decisions_with_keyed_progress() {  # <status-file>
+  local f=$1 line resolve held open='' size span
   [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 1
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
   held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
-  case "$captured_end" in
-    ''|*[!0-9]*) size=$(_fm_status_file_size "$f") || return 1 ;;
-    *) size=$captured_end ;;
-  esac
+  size=$(_fm_status_file_size "$f") || return 1
   size=${size//[[:space:]]/}
   case "$size" in ''|*[!0-9]*) return 1 ;; esac
   span=$(_fm_status_read_span "$f" 0 "$size" 2>/dev/null) || return 1
@@ -734,42 +734,25 @@ status_open_decisions_retired_by_completion() {  # <kind> <state-or-verb>
 # already-read current-state line ("state: <s> · source: <src> · <detail>") so
 # this makes no reader call of its own.
 #
-# Triage asks a DIFFERENT question from answerability - "is this crew still
-# waiting on me right now", not "can this key still be answered" - so it does
-# NOT share the per-key active-run reconciliation. It applies two wholesale
-# rules of its own instead, and this is the one place they are stated:
-#   - the completion rule above retires a finished single-owner task's records;
-#     and
-#   - a live ACTIVITY read (an authoritative run-step, or a busy pane) that is
-#     neither parked nor blocked retires the whole non-secondmate set, so a crew
-#     that resumed past a gate is not still triaged as parked.
-# Between them those two rules already cover every state in which the
-# answerability verdict would supersede anything (it fires only on
-# `working · run-step`, which bin/fm-crew-state.sh emits for a ship task only,
-# and the activity rule has retired that whole set first), so anything reaching
-# the end of this function keeps its durable set verbatim.
-# The activity rule is wholesale and pane-trusting where the answerability
-# verdict is per-key and refuses pane evidence outright, so the two can still
-# disagree for a busy-pane crew. That gap is deliberate and separately tested
-# (a stale decision under a busy pane must not keep triage noisy); narrowing
-# triage to the answerability verdict is a product decision, not a refactor.
+# Triage asks a narrower question than answerability - "is this crew still
+# waiting on me right now" rather than "can this key still be answered" - but it
+# must never answer it with a DIFFERENT lifecycle rule, or the captain gets a
+# fleet view that contradicts what bin/fm-send.sh --resolve-key will accept. So
+# the supersession decision is the shared per-key one
+# (_fm_open_decisions_reconcile_active_run) verbatim: only an active run-step
+# plus a same-key progress witness retires a key, and rendered pane activity
+# never retires anything. Triage adds exactly ONE rule of its own on top, the
+# completion rule above, because a finished single-owner task has delivered its
+# report or PR and its stale records belong on the report pointer rather than in
+# a pending-decision list.
 status_open_decisions_for_triage() {  # <task-id> <status-file> <kind> <current-state-line>
-  local f=$2 kind=$3 current=$4 open state source
+  local f=$2 kind=$3 current=$4 open state
   open=$(status_open_decisions "$f")
   [ -n "$open" ] || return 0
   state=${current#state: }
   state=${state%% *}
-  source=none
-  case "$current" in
-    *'source: '*) source=${current#*source: }; source=${source%% *} ;;
-  esac
   status_open_decisions_retired_by_completion "$kind" "$state" && return 0
-  if [ "${kind:-ship}" != secondmate ] \
-    && { [ "$source" = run-step ] || [ "$source" = pane ]; } \
-    && [ "$state" != parked ] && [ "$state" != blocked ]; then
-    return 0
-  fi
-  printf '%s' "$open"
+  _fm_open_decisions_reconcile_active_run "$f" "$open" "$current"
 }
 
 # Fleet-wide wrapper around status_open_decisions: scans every task's status
@@ -1648,8 +1631,13 @@ signal_reason_is_actionable() {  # <file> ...
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crew
 # that appended paused: but then STARTED a run reports working, never paused.
-# NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
-# run it only on no-verb signal and first-sighting stale paths, never every wake.
+# NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so a
+# caller must have a reason to pay for it. This absorb path runs it only on
+# no-verb signal and first-sighting stale paths. The one sanctioned every-wake
+# caller is status_task_run_state_prefetch, which the open-decisions
+# answerability verdict needs and which pays that cost once per drain, only for
+# a local ship task that actually holds an open keyed decision, and only outside
+# the fleet-wide presentation lock.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_absorb_class() {  # <id>
   local id=$1 line state src

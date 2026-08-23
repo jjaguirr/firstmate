@@ -477,10 +477,10 @@ task_json_lines() {
     # status stream is folded so a later unrelated event can never mask a
     # still-open captain decision, the set is derived purely from the keyed fold
     # (never from report bodies or decision-like prose), and only a lifecycle
-    # signal the crew has provably moved past clears it. This surface deliberately
-    # keeps no rule of its own; see that function for the triage policy, which is
-    # wholesale rather than per-key, and for exactly where it parts company with
-    # the answerability verdict fm-send's --resolve-key and the wake drain share.
+    # signal the crew has provably moved past clears it. This surface keeps no
+    # rule of its own, and the supersession decision it gets is the SAME per-key
+    # verdict bin/fm-send.sh --resolve-key and the wake drain use, so this view
+    # cannot report a key as settled that those two still treat as answerable.
     current_line=$(printf '%s' "$current_json" | jq -r '.raw // ""')
     open_decisions_tsv=$(status_open_decisions_for_triage "$id" "$status_log" "$kind" "$current_line")
     open_decisions_json=$(printf '%s' "$open_decisions_tsv" | jq -R -s '

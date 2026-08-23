@@ -167,9 +167,9 @@ test_fixture_snapshot_json() {
       and .current_state.source == "pane"
       and .pr.url == "https://github.com/kunchenguid/firstmate/pull/9"
       and .backlog.body_excerpt == "Preserve this detail for bearings."
-      and .hints.pending_decision == false
+      and .hints.pending_decision == true
       and .paths.status_log.kind == "event_history"
-  ' >/dev/null || fail "ship task state, PR, body, and stale event hints wrong"
+  ' >/dev/null || fail "ship task state, PR, body, and event hints wrong"
   printf '%s' "$out" | jq -e '
     .tasks[] | select(.id == "scout-task")
     | .paths.report.present == true
@@ -355,6 +355,58 @@ EOF
   pass "backlog normalization preserves strict roles and resolves every blocker compatibly"
 }
 
+# The fleet snapshot, the wake drain's OPEN DECISIONS fold and fm-send's
+# --resolve-key must answer ONE question the same way: is this key open. A busy
+# PANE is the case where they used to part company - rendered terminal activity
+# retired the snapshot's whole set while the other two kept the key answerable -
+# so a captain reading the fleet view saw nothing waiting for a decision
+# fm-send would have accepted. All three surfaces run against one fixture here.
+test_busy_pane_keeps_a_decision_open_on_every_surface() {
+  local home fakebin out drain_out send_err rc hint_gen
+  home=$(make_home busy-pane-agreement)
+  mkdir -p "$home/projects/pane-task"
+  fm_write_meta "$home/state/pane-task.meta" \
+    "window=firstmate:fm-pane-task" \
+    "worktree=$home/projects/pane-task" \
+    "project=alpha" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=ship"
+  hint_gen=$("$ROOT/bin/fm-busy-event.sh" arm "$home/state" pane-task)
+  "$ROOT/bin/fm-busy-event.sh" apply "$home/state" pane-task busy --gen "$hint_gen" \
+    --source claude-hook --event user-prompt-submit
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$home/state/pane-task.status"
+  fakebin=$(make_fakebin "$home")
+
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "pane-task")
+    | .current_state.state == "working"
+      and .current_state.source == "pane"
+      and .hints.pending_decision == true
+      and (.hints.open_decisions | length) == 1
+      and .hints.open_decisions[0].key == "rollout"
+  ' >/dev/null || fail "a busy pane retired a key the other surfaces still hold open: $out"
+
+  drain_out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    "$ROOT/bin/fm-wake-drain.sh" 2>/dev/null)
+  printf '%s' "$drain_out" | grep -F 'pane-task [key=rollout] needs-decision: choose the deployment path' >/dev/null \
+    || fail "OPEN DECISIONS disagreed with the snapshot under a busy pane: $drain_out"
+
+  send_err="$home/send.err"
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    "$ROOT/bin/fm-send.sh" pane-task --resolve-key rollout "go with the blue path" >/dev/null 2>"$send_err"
+  rc=$?
+  set -e
+  case "$rc" in
+    0) : ;;
+    *) grep -F 'superseded' "$send_err" >/dev/null \
+         && fail "--resolve-key refused a key both other surfaces present as open: $(cat "$send_err")" ;;
+  esac
+  pass "a busy pane leaves a keyed decision open on the snapshot, the drain and --resolve-key alike"
+}
+
 test_event_hints_follow_reconciled_current_state() {
   local home fakebin out hint_gen
   home=$(make_home event-hints)
@@ -412,11 +464,11 @@ test_event_hints_follow_reconciled_current_state() {
       and task("active-blocked").current_state.state == "blocked"
       and task("active-blocked").hints.blocked_event == true
       and task("stale-decision").current_state.state == "working"
-      and task("stale-decision").hints.pending_decision == false
+      and task("stale-decision").hints.pending_decision == true
       and task("stale-blocked").current_state.state == "working"
-      and task("stale-blocked").hints.blocked_event == false
-  ' >/dev/null || fail "event hints must follow reconciled current state"
-  pass "snapshot event hints follow reconciled current state"
+      and task("stale-blocked").hints.blocked_event == true
+  ' >/dev/null || fail "event hints must follow the shared answerability verdict: $out"
+  pass "snapshot event hints follow the shared answerability verdict, not pane activity"
 }
 
 test_scout_reports_include_teardown_reports() {
@@ -814,3 +866,4 @@ test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
+test_busy_pane_keeps_a_decision_open_on_every_surface
