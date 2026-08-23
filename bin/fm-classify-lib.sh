@@ -496,6 +496,13 @@ _fm_open_decisions_with_keyed_progress() {  # <status-file> [<captured-end-offse
   size=${size//[[:space:]]/}
   case "$size" in ''|*[!0-9]*) return 1 ;; esac
   span=$(_fm_status_read_span "$f" 0 "$size" 2>/dev/null) || return 1
+  # Same test-only observability seam the incremental fold records through, so
+  # a boundedness assertion covers the WHOLE section it appears to cover: this
+  # witness fold re-reads bytes 0..size, not just the increment, and a probe
+  # that could not see it would stay green while an unbounded read happened
+  # beside it.
+  [ -n "${FM_OPEN_DECISIONS_READ_PROBE:-}" ] \
+    && printf '%s\t%s\n' "$f" "$size" >> "$FM_OPEN_DECISIONS_READ_PROBE"
   while IFS= read -r line || [ -n "$line" ]; do
     verb=$(status_line_verb "$line")
     if _fm_status_verb_is_progress "$verb" && key=$(_fm_decision_stated_key "$line"); then
@@ -520,13 +527,71 @@ EOF
 # every drain for a task that can never produce a run-step verdict. An
 # unreadable result is reported as nothing, which fails open to the durable set.
 status_task_run_state() {  # <task-id> <status-file>
-  local task=$1 meta="${2%.status}.meta" kind remote
-  [ -f "$meta" ] && [ -r "$meta" ] || return 0
-  remote=$(grep '^remote_host=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
-  [ -z "$remote" ] || return 0
-  kind=$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
-  [ "${kind:-ship}" = ship ] || return 0
-  "$FM_CREW_STATE_BIN" "$task" 2>/dev/null || return 0
+  local task=$1 meta="${2%.status}.meta" kind remote line=''
+  if [ "$_FM_RUN_STATE_MEMO_ENABLED" = 1 ] && line=$(_fm_run_state_memo_get "$task"); then
+    printf '%s' "$line"
+    return 0
+  fi
+  line=''
+  if [ -f "$meta" ] && [ -r "$meta" ]; then
+    remote=$(grep '^remote_host=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
+    kind=$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
+    if [ -z "$remote" ] && [ "${kind:-ship}" = ship ]; then
+      line=$("$FM_CREW_STATE_BIN" "$task" 2>/dev/null) || line=''
+      line=${line%%$'\n'*}
+    fi
+  fi
+  if [ "$_FM_RUN_STATE_MEMO_ENABLED" = 1 ]; then
+    _FM_RUN_STATE_MEMO="${_FM_RUN_STATE_MEMO}${task}"$'\t'"${line}"$'\n'
+  fi
+  printf '%s' "$line"
+}
+
+# Per-process memo for status_task_run_state, off by default so an ordinary
+# one-shot caller keeps reading live state. fm-crew-state.sh is NOT a pure read
+# (it may make a bounded no-mistakes call, plus git and pane reads), so a
+# surface that presents the whole fleet turns it on for the length of one
+# presentation: the verdict is then read at most once per task, and - because
+# status_task_run_state_prefetch below warms it - never while a fleet-wide
+# presentation lock is held. Records are "<task>\t<line>\n"; a task whose
+# verdict is deliberately nothing (missing meta, scout, secondmate, remote
+# mate, unreadable reader) memoizes an empty line so its gate is not re-walked
+# either. Portable: no associative arrays, so this runs on bash 3.2 too.
+_FM_RUN_STATE_MEMO=''
+_FM_RUN_STATE_MEMO_ENABLED=0
+
+_fm_run_state_memo_get() {  # <task-id> -> memoized line, status 1 when absent
+  local task=$1 rest=$_FM_RUN_STATE_MEMO
+  case "$rest" in
+    "$task"$'\t'*) rest=${rest#"$task"$'\t'} ;;
+    *$'\n'"$task"$'\t'*) rest=${rest#*$'\n'"$task"$'\t'} ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "${rest%%$'\n'*}"
+}
+
+# Turn the memo on and warm it for every task whose LAST presentation left a
+# keyed decision open, BEFORE the caller takes its presentation lock. Only such
+# a task can reach the active-run reconciliation, and the persisted cursor
+# already records that set, so the candidate test is one small file read with
+# no fold, no cursor write, and no dependence on a captured snapshot endpoint.
+# The gate is deliberately one presentation behind: a decision opened since the
+# last presentation is simply not warmed, and its verdict is read on the spot
+# the way it always was (correct, just not hoisted, and warmed from the next
+# presentation on). A key resolved since then costs one hoisted read that the
+# reconciliation no longer needs. Callers that never enable the memo are
+# unaffected.
+status_task_run_state_prefetch() {  # <state>
+  local state=$1 f task
+  _FM_RUN_STATE_MEMO=''
+  _FM_RUN_STATE_MEMO_ENABLED=1
+  for f in "$state"/*.status; do
+    [ -e "$f" ] || continue
+    _fm_open_decisions_cursor_open_nonempty "$f" || continue
+    task=$(basename "$f"); task="${task%.status}"
+    status_task_run_state "$task" "$f" >/dev/null
+  done
+  return 0
 }
 
 # Reconcile one durable open set with the task lifecycle, one key at a time. A
@@ -590,6 +655,67 @@ status_open_decisions_for_task() {  # <task-id> <status-file> [<current-state-li
   if [ $# -ge 4 ]; then open=$4; else open=$(status_open_decisions "$f"); fi
   [ -n "$open" ] || return 0
   if [ $# -ge 3 ]; then current=$3; else current=$(status_task_run_state "$task" "$f"); fi
+  _fm_open_decisions_reconcile_active_run "$f" "$open" "$current"
+}
+
+# 0 when a COMPLETED single-owner task's keyed records are retired for the
+# surfaces that ask "what is still pending", rather than "which key can still
+# be answered". A scout or ship task delivers one deliverable - its report or
+# its PR - so once it is done/failed its stale, never-keyed-resolved records
+# surface as a report POINTER, not as a reopened pending decision. A secondmate
+# is persistent and multiplexes many concerns onto one stream, so a terminal
+# event on one concern must never retire another concern's key. This is the ONE
+# statement of that rule: bin/fm-fleet-snapshot.sh reaches it through
+# status_open_decisions_for_triage below with the crew's CURRENT state, and
+# bin/fm-captain-hold.sh reaches it directly with the status log's LAST event
+# verb, which is the only lifecycle signal that surface reads.
+# Deliberately NOT part of the answerability verdict: fm-send's --resolve-key
+# and the fleet-wide OPEN DECISIONS fold must keep a durably open key
+# answerable after its task finishes, so only active-run supersession removes a
+# key there.
+status_open_decisions_retired_by_completion() {  # <kind> <state-or-verb>
+  case "${1:-ship}" in secondmate) return 1 ;; esac
+  case "$2" in
+    done|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Open-decision set for a fleet TRIAGE surface (bin/fm-fleet-snapshot.sh's
+# hints.open_decisions), over the same durable fold and the same shared per-key
+# reconciliation the answerability verdict uses. Callers pass the crew's
+# already-read current-state line ("state: <s> · source: <src> · <detail>") so
+# this makes no reader call of its own.
+#
+# Triage asks a DIFFERENT question from answerability - "is this crew still
+# waiting on me right now", not "can this key still be answered" - so it adds
+# two rules of its own, and this is the one place they are stated:
+#   - the completion rule above retires a finished single-owner task's records;
+#     and
+#   - a live ACTIVITY read (an authoritative run-step, or a busy pane) that is
+#     neither parked nor blocked retires the whole non-secondmate set, so a crew
+#     that resumed past a gate is not still triaged as parked.
+# The activity rule is wholesale and pane-trusting where the answerability
+# verdict is per-key and refuses pane evidence outright, so the two can still
+# disagree for a busy-pane crew. That gap is deliberate and separately tested
+# (a stale decision under a busy pane must not keep triage noisy); narrowing
+# triage to the answerability verdict is a product decision, not a refactor.
+status_open_decisions_for_triage() {  # <task-id> <status-file> <kind> <current-state-line>
+  local f=$2 kind=$3 current=$4 open state source
+  open=$(status_open_decisions "$f")
+  [ -n "$open" ] || return 0
+  state=${current#state: }
+  state=${state%% *}
+  source=none
+  case "$current" in
+    *'source: '*) source=${current#*source: }; source=${source%% *} ;;
+  esac
+  status_open_decisions_retired_by_completion "$kind" "$state" && return 0
+  if [ "${kind:-ship}" != secondmate ] \
+    && { [ "$source" = run-step ] || [ "$source" = pane ]; } \
+    && [ "$state" != parked ] && [ "$state" != blocked ]; then
+    return 0
+  fi
   _fm_open_decisions_reconcile_active_run "$f" "$open" "$current"
 }
 
@@ -680,6 +806,32 @@ _fm_open_decisions_cursor_path() {  # <status-file>
 }
 
 FM_OPEN_DECISIONS_FOLD_VERSION=4
+
+# 0 when the persisted cursor for <status-file> already records a non-empty
+# folded open set under the CURRENT fold version. A pure read of one small
+# file: no fold, no status read, no cursor write, and no identity or size
+# check, because the only caller (status_task_run_state_prefetch) uses it as a
+# cheap "was anything open last time" candidate test whose false answers are
+# both harmless. Anything malformed, stale-versioned, or missing reads as
+# empty.
+_fm_open_decisions_cursor_open_nonempty() {  # <status-file>
+  local cf data rest
+  [ -f "$1" ] && [ -r "$1" ] && [ ! -L "$1" ] || return 1
+  cf=$(_fm_open_decisions_cursor_path "$1")
+  [ -f "$cf" ] && [ -r "$cf" ] && [ ! -L "$cf" ] || return 1
+  data=$(LC_ALL=C command cat "$cf" 2>/dev/null) || return 1
+  case "$data" in
+    "version=$FM_OPEN_DECISIONS_FOLD_VERSION"$'\n'*) rest=${data#*$'\n'} ;;
+    *) return 1 ;;
+  esac
+  case "$rest" in *$'\n'*) rest=${rest#*$'\n'} ;; *) return 1 ;; esac
+  case "$rest" in
+    ident=*) ;;
+    *) return 1 ;;
+  esac
+  case "$rest" in *$'\n'*) rest=${rest#*$'\n'} ;; *) return 1 ;; esac
+  [ -n "$rest" ]
+}
 
 # Portable device:inode identity for the rotation/recreation check below.
 _fm_open_decisions_file_ident() {  # <file> -> "dev:inode", empty on I/O failure

@@ -130,9 +130,12 @@ EOF
 # fm-classify-lib.sh's "incremental (cursor-backed) open-decisions fold"). The
 # answerability verdict then adds one fm-crew-state read per LOCAL SHIP task
 # whose durable set is non-empty (never for a scout, secondmate, or remote
-# mate), and one bounded re-read of that task's log only when the read proves
-# an active run-step, so a parked fleet with no open decision pays nothing
-# beyond the fold.
+# mate), and a WHOLE-LOG re-fold of that task's status file - not a delta - only
+# when the read proves an active run-step, so a parked fleet with no open
+# decision pays nothing beyond the incremental fold. fm-crew-state is not a pure
+# read, so print_status_presentation warms those verdicts through
+# status_task_run_state_prefetch BEFORE taking the fleet-wide presentation lock;
+# nothing here execs it while that lock is held.
 # Bounded and silent: prints nothing when no decision is open, which is the
 # common case.
 print_open_decisions_section() {
@@ -255,6 +258,15 @@ print_status_sections() {
 
 print_status_presentation() {  # [<deduped-raw-rows>]
   local rows=${1:-} lock="$STATE/.status-presentation-lock" snapshot annotation_manifest fully_presented='' rc=0
+  # The open-decisions answerability verdict needs fm-crew-state, which is NOT a
+  # pure read (a bounded no-mistakes call, git reads, a pane capture). The
+  # presentation lock below is fleet-wide and acquired by an unbounded spin, so
+  # running that reader under it would let one wedged no-mistakes daemon stall
+  # every other drain in this home. Warm it here instead, outside the lock, for
+  # the tasks the last presentation left holding an open decision; the scan then
+  # reads the memo. This runs in the subshell each drain calls it from, so the
+  # memo never outlives one presentation.
+  status_task_run_state_prefetch "$STATE"
   fm_lock_acquire_wait "$lock" || return 1
   snapshot=$(status_presentation_snapshot "$STATE") || rc=1
   if [ "$rc" -eq 0 ] && [ -n "$rows" ]; then

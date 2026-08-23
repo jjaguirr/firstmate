@@ -56,6 +56,11 @@ preserve_evidence() {  # <destination>
   grep '^evidence'"$(printf '\t')" "$GATE" >> "$destination" 2>/dev/null || true
 }
 
+# The catch-up list is what the captain is told is waiting for them, so it must
+# name exactly the blockers bin/fm-send.sh --resolve-key will still accept: it
+# reads the shared answerability verdict (status_open_decisions_for_task in
+# bin/fm-classify-lib.sh), never the raw durable fold, so a key an active run
+# superseded is not presented as actionable and then refused on the answer.
 scan_open_blockers() {  # -> tab-separated blocker rows
   local meta id status key verb summary clean_summary
   for meta in "$STATE"/*.meta; do
@@ -69,7 +74,7 @@ scan_open_blockers() {  # -> tab-separated blocker rows
       clean_summary=$(printf '%s' "$summary" | clean_field)
       printf 'blocker\t%s\t%s\t%s\n' "$id" "$key" "$clean_summary"
     done <<EOF
-$(status_open_decisions "$status")
+$(status_open_decisions_for_task "$id" "$status")
 EOF
   done
 }

@@ -195,10 +195,6 @@ test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past() {
   pass "OPEN DECISIONS hides only a key an authoritative active run-step superseded, never a mid-run blocker"
 }
 
-# The drain's own presentation reads run before the OPEN DECISIONS fold, so
-# the fake span reader below serves those honestly and fails only the
-# reconciliation's re-read (the third and last span read of a drain); the
-# surfaced warning proves that read, not an earlier one, is what failed.
 test_reserved_key_stays_presented_under_a_foreign_progress_line_and_empty_sets_skip_the_state_read() {
   local dir state out reader calls
   dir=$(make_case active-run-reserved-key)
@@ -232,6 +228,10 @@ SH
   pass "OPEN DECISIONS keeps a reserved key open against foreign progress and reads state only for non-empty sets"
 }
 
+# The drain's own presentation reads run before the OPEN DECISIONS fold, so
+# the fake span reader below serves those honestly and fails only the
+# reconciliation's re-read (the third and last span read of a drain); the
+# surfaced warning proves that read, not an earlier one, is what failed.
 test_reconcile_re_read_failure_keeps_the_decision_presented() {
   local dir state out err fakebin span calls
   dir=$(make_case active-run-read-failure)
@@ -274,6 +274,48 @@ SH
     fail "a witnessed key stayed presented once the re-read recovered: $(cat "$out")"
   fi
   pass "a status re-read failure keeps the decision presented and reports itself"
+}
+
+# fm-crew-state.sh is NOT a pure read (a bounded no-mistakes call, git reads, a
+# pane capture), and $STATE/.status-presentation-lock is fleet-wide and acquired
+# by an unbounded spin, so running that reader under it would let one wedged
+# no-mistakes daemon stall every other drain in this home. The drain warms the
+# verdict before taking the lock for every task its last presentation left
+# holding an open decision, and reads it at most once per task per drain. The
+# stub below reports whether the lock symlink existed at the moment it ran.
+test_current_state_read_is_hoisted_out_of_the_presentation_lock() {
+  local dir state out reader log
+  dir=$(make_case state-read-outside-lock)
+  state="$dir/state"
+  out="$dir/drain.out"
+  reader="$dir/lock-probing-crew-state.sh"
+  log="$dir/lock-held.log"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+if [ -L "$FM_STATE_OVERRIDE/.status-presentation-lock" ]; then
+  printf '%s\theld\n' "$1" >> "$FM_LOCK_PROBE_LOG"
+else
+  printf '%s\tfree\n' "$1" >> "$FM_LOCK_PROBE_LOG"
+fi
+printf 'state: working · source: run-step · ci running\n'
+SH
+  chmod +x "$reader"
+  fm_write_meta "$state/task20.meta" "window=sess:fm-task20" "kind=ship"
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$state/task20.status"
+
+  FM_LOCK_PROBE_LOG="$log" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$reader" "$DRAIN" > "$out" \
+    || fail "first-sighting drain failed"
+  grep -F 'task20 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "precondition: the open decision did not surface: $(cat "$out")"
+
+  : > "$log"
+  FM_LOCK_PROBE_LOG="$log" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$reader" "$DRAIN" > "$out" \
+    || fail "steady-state drain failed"
+  grep -F 'task20 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "the open decision stopped surfacing once its verdict was warmed: $(cat "$out")"
+  [ "$(cat "$log")" = "$(printf 'task20\tfree')" ] \
+    || fail "the steady-state drain did not read the crew state exactly once, outside the presentation lock: $(cat "$log")"
+  pass "the drain reads a crew's current state once per drain and never inside the presentation lock"
 }
 
 test_status_symlink_is_not_followed() {
@@ -345,3 +387,4 @@ test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past
 test_reserved_key_stays_presented_under_a_foreign_progress_line_and_empty_sets_skip_the_state_read
 test_reconcile_re_read_failure_keeps_the_decision_presented
 test_status_symlink_is_not_followed
+test_current_state_read_is_hoisted_out_of_the_presentation_lock

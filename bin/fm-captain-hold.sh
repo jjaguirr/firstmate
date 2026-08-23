@@ -282,6 +282,14 @@ meta_value() {  # <meta> <key>
   grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true
 }
 
+# RECORD DIVERGENCE compares the backlog against what the STATUS LEDGER still
+# records, so this deliberately reads the DURABLE fold, not the answerability
+# verdict bin/fm-send.sh and the wake drain share: an active run superseding a
+# key must not read as the status side having gone quiet on it. The one
+# lifecycle rule it does apply - a completed single-owner task's records are
+# retired - is fm-classify-lib.sh's status_open_decisions_retired_by_completion,
+# fed here by the status log's last event verb, which is the only lifecycle
+# signal this surface reads.
 origin_open_decisions() {  # <origin-id>
   local origin=$1 meta="$STATE/$1.meta" status_file="$STATE/$1.status" open kind last verb
   open=$(status_open_decisions "$status_file")
@@ -289,13 +297,9 @@ origin_open_decisions() {  # <origin-id>
   [ -f "$meta" ] || { printf '%s' "$open"; return 0; }
   kind=$(meta_value "$meta" kind)
   [ -n "$kind" ] || kind=ship
-  if [ "$kind" != secondmate ]; then
-    last=$(last_status_line "$status_file")
-    verb=$(status_line_verb "$last")
-    case "$verb" in
-      done|failed) return 0 ;;
-    esac
-  fi
+  last=$(last_status_line "$status_file")
+  verb=$(status_line_verb "$last")
+  status_open_decisions_retired_by_completion "$kind" "$verb" && return 0
   printf '%s' "$open"
 }
 

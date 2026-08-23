@@ -275,9 +275,60 @@ test_check_retries_recorded_terminal_teardown() {
   pass "check retries recorded terminal teardown and keeps catch-up gated until success"
 }
 
+# The catch-up blocker list and bin/fm-send.sh --resolve-key must answer the
+# same question: is this key still answerable right now. Both read
+# fm-classify-lib.sh's status_open_decisions_for_task, so a blocker the crew's
+# ACTIVE run has provably moved past (a later progress line under the SAME key)
+# is not presented as waiting for the captain and then refused on the answer -
+# and the durable record is untouched, so it returns the moment that run parks.
+test_run_superseded_blocker_is_not_presented_as_waiting() {
+  local dir out rc reader
+  dir="$TMP_ROOT/run-superseded-blocker"
+  install_runner "$dir"
+  seed_live_blocker "$dir" herdr creds
+  printf 'working [key=creds]: retrying with the cached token\n' >> "$dir/home/state/repair-task.status"
+  reader="$dir/bin/fake-crew-state.sh"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$FM_FAKE_CREW_STATE"
+SH
+  chmod +x "$reader"
+  date +%s > "$dir/home/state/.afk"
+  printf '1784074271\t3\tsignal\trepair-task.status\tsignal: synthetic status\n' > "$dir/home/state/.fake-drain"
+
+  set +e
+  out=$(FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_CREW_STATE_BIN="$reader" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+    "$dir/bin/fm-afk-return.sh" begin 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "a run-superseded blocker still gated the return (rc=$rc): $out"
+  case "$out" in
+    *'firstmate-actionable blocker: repair-task'*)
+      fail "a blocker --resolve-key would refuse as superseded was presented as waiting: $out" ;;
+  esac
+  [ ! -e "$dir/home/state/.afk-return-catchup" ] || fail "a run-superseded blocker left a catch-up gate behind"
+
+  # Same durable bytes, run no longer active: the blocker is answerable again
+  # and must be back on the captain's list.
+  date +%s > "$dir/home/state/.afk"
+  printf '1784074271\t4\tsignal\trepair-task.status\tsignal: synthetic status\n' > "$dir/home/state/.fake-drain"
+  set +e
+  out=$(FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting captain decision' \
+    FM_CREW_STATE_BIN="$reader" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+    "$dir/bin/fm-afk-return.sh" begin 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -eq 3 ] || fail "the durable blocker did not gate the return once its run parked (rc=$rc): $out"
+  assert_contains "$out" 'firstmate-actionable blocker: repair-task [key=creds]' \
+    "the durable blocker did not return to the catch-up list once its run parked"
+  pass "the catch-up blocker list follows the same answerability verdict as --resolve-key"
+}
+
 test_return_gate_orders_catchup_before_bearings
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
 test_evidence_publication_failure_preserves_wake_for_redrain
 test_away_reentry_refuses_pending_return_gate
 test_check_retries_recorded_terminal_teardown
+test_run_superseded_blocker_is_not_presented_as_waiting
