@@ -124,10 +124,15 @@ EOF
 # decisions; print_unread_status_section owns their one-shot surface. Runs on
 # every drain - including the empty-queue fast path - because the decision can
 # still be open even when nothing new is queued for
-# its task this turn. The incremental wrapper bounds this scan's cost to bytes
-# appended to each task's status log since the LAST drain, not that log's whole
-# lifetime, while still never dropping an old buried decision (see
-# fm-classify-lib.sh's "incremental (cursor-backed) open-decisions fold").
+# its task this turn. The incremental wrapper bounds the durable fold's cost to
+# bytes appended to each task's status log since the LAST drain, not that log's
+# whole lifetime, while still never dropping an old buried decision (see
+# fm-classify-lib.sh's "incremental (cursor-backed) open-decisions fold"). The
+# answerability verdict then adds one fm-crew-state read per LOCAL SHIP task
+# whose durable set is non-empty (never for a scout, secondmate, or remote
+# mate), and one bounded re-read of that task's log only when the read proves
+# an active run-step, so a parked fleet with no open decision pays nothing
+# beyond the fold.
 # Bounded and silent: prints nothing when no decision is open, which is the
 # common case.
 print_open_decisions_section() {

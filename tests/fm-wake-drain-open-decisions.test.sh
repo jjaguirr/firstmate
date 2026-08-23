@@ -158,27 +158,34 @@ test_buried_decision_surfaces_on_the_empty_queue_fast_path() {
   pass "a buried open decision surfaces even when the wake queue itself is empty"
 }
 
-test_active_run_step_suppresses_a_superseded_decision_without_trusting_a_pane() {
+test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past() {
   local dir state out fakebin
   dir=$(make_case active-run-supersession)
   state="$dir/state"
   fakebin="$dir/fakebin"
   out="$dir/drain.out"
+  fm_write_meta "$state/task9.meta" "window=sess:fm-task9" "kind=ship"
   printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$state/task9.status"
+  printf 'working: resumed validation after the rollout answer\n' >> "$state/task9.status"
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$state/task9.status"
 
-  FM_FAKE_CREW_STATE='state: working · source: run-step · validating' \
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
     || fail "drain failed while reconciling an active run-step"
-  if grep -F 'OPEN DECISIONS' "$out" >/dev/null; then
-    fail "a run-step-superseded decision still surfaced: $(cat "$out")"
+  if grep -F '[key=rollout]' "$out" >/dev/null; then
+    fail "a decision the crew progressed past still surfaced under an active run-step: $(cat "$out")"
   fi
+  grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "a blocker raised mid-run was hidden by the active run-step: $(cat "$out")"
 
   FM_FAKE_CREW_STATE='state: working · source: pane · rendered activity only' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
     || fail "drain failed while checking pane-only activity"
   grep -F 'task9 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
     || fail "pane activity incorrectly closed a decision: $(cat "$out")"
-  pass "OPEN DECISIONS suppresses only authoritative active run-step supersession"
+  grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "pane activity hid the mid-run blocker: $(cat "$out")"
+  pass "OPEN DECISIONS hides only a key an authoritative active run-step superseded, never a mid-run blocker"
 }
 
 test_status_symlink_is_not_followed() {
@@ -246,5 +253,5 @@ test_reserved_key_namespace_is_owned_by_its_library
 test_no_open_decisions_prints_nothing
 test_open_decision_surfaces_even_with_an_unrelated_queued_wake
 test_buried_decision_surfaces_on_the_empty_queue_fast_path
-test_active_run_step_suppresses_a_superseded_decision_without_trusting_a_pane
+test_active_run_step_suppresses_only_a_decision_the_crew_progressed_past
 test_status_symlink_is_not_followed

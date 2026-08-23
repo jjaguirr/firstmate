@@ -435,12 +435,27 @@ if [ -n "$RESOLVE_KEYS" ]; then
   fi
   RESOLVE_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
   RESOLVE_STATUS_FILE="$STATE/$RESOLVE_TASK_ID.status"
-  resolve_open_set=$(status_open_decisions_for_task "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE")
+  # One current-state read feeds both the verdict and, on refusal, the
+  # explanation, so the refusal can never describe a different run than the
+  # one that produced the verdict.
+  resolve_durable_set=$(status_open_decisions "$RESOLVE_STATUS_FILE")
+  resolve_current_state=$(status_task_run_state "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE")
+  resolve_open_set=$(status_open_decisions_for_task "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE" "$resolve_current_state")
+  resolve_superseded_set=$(status_open_decisions_superseded "$resolve_durable_set" "$resolve_open_set")
   for k in $RESOLVE_KEYS; do
     case "$resolve_open_set" in
       "$k"$'\t'*|*$'\n'"$k"$'\t'*)
         RESOLVE_STATUS_KEYS="${RESOLVE_STATUS_KEYS}${RESOLVE_STATUS_KEYS:+ }$k"
         continue
+        ;;
+    esac
+    # Durably recorded as open, yet removed by the shared answerability
+    # verdict: the only rule that does that is active-run supersession, which
+    # is neither "closed" nor "mistyped", so name it and stop.
+    case "$resolve_superseded_set" in
+      "$k"$'\t'*|*$'\n'"$k"$'\t'*)
+        echo "error: --resolve-key '$k': that decision is still recorded as open in $RESOLVE_STATUS_FILE, but it is not answerable now: the crew reported progress after raising it and its task is working on an active run ($resolve_current_state), so the run superseded it. Wait for that run to park or finish and resend if the decision is still needed; nothing was sent." >&2
+        exit 1
         ;;
     esac
     # Not open in the status log. A decision already transferred to its durable

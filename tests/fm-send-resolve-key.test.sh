@@ -129,6 +129,18 @@ run_send_with_current_state() {  # <fakebin> <home> <send-log> <reader> <fm-send
     "$SEND" "$@" 2>/dev/null
 }
 
+# Same as run_send_with_current_state but keeps fm-send's stderr in <err-file>,
+# for the legs that assert WHY a key was refused.
+run_send_with_current_state_err() {  # <fakebin> <home> <send-log> <reader> <err-file> <fm-send args...>
+  local fb=$1 home=$2 log=$3 reader=$4 err=$5
+  shift 5
+  : > "$log"
+  env PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_CREW_STATE_BIN="$reader" \
+    "$SEND" "$@" 2>"$err"
+}
+
 drain_out_with_current_state() {  # <home> <reader> [<fakebin>]
   local home=$1 reader=$2 fakebin=${3:-}
   if [ -n "$fakebin" ]; then
@@ -188,13 +200,16 @@ test_answer_send_closes_open_decision() {
 }
 
 # The real public interfaces must agree on the same fixture at each state:
-# durable open, explicit resolution, and a stale event superseded by an active
-# run-step. A status line remains the durable record in the latter case, but it
-# is not answerable and must not be presented while the run is active.
+# durable open, explicit resolution, and per-key active-run supersession. With
+# a real fm-crew-state over a fake no-mistakes run, a decision the crew
+# progressed past is neither presented nor answerable while the run works (and
+# the refusal names the run, not a typo), a blocker raised mid-run stays both
+# presented and answerable, and the superseded key returns through both
+# surfaces once the same run parks.
 test_send_and_drain_share_open_resolved_and_run_superseded_verdicts() {
-  local dir fb log home reader out rc worktree head
+  local dir fb log home reader out rc worktree head err
   dir="$TMP_ROOT/shared-verdicts"; mkdir -p "$dir"
-  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
   reader=$(make_decision_state_reader "$dir")
   home=$(setup_home shared-verdicts)
   fm_write_meta "$home/state/open.meta" "window=sess:fm-open" "kind=ship"
@@ -212,9 +227,12 @@ test_send_and_drain_share_open_resolved_and_run_superseded_verdicts() {
 
   out=$(drain_out_with_current_state "$home" "$reader")
   [ -z "$out" ] || fail "an explicitly resolved key still surfaced in drain: $out"
-  run_send_with_current_state "$fb" "$home" "$log" "$reader" open --resolve-key api-shape "duplicate"; rc=$?
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" open --resolve-key api-shape "duplicate"; rc=$?
   [ "$rc" -ne 0 ] || fail "fm-send accepted a key after its durable resolution"
   [ ! -s "$log" ] || fail "fm-send typed a duplicate answer for a resolved key: $(cat "$log")"
+  grep -F 'already closed or mistyped' "$err" >/dev/null \
+    || fail "a durably closed key was not refused as closed or mistyped: $(cat "$err")"
+  unset FM_FAKE_DECISION_CURRENT
 
   worktree="$dir/resumed-worktree"
   fm_git_identity fmtest fmtest@example.invalid
@@ -231,30 +249,76 @@ SH
   chmod +x "$fb/no-mistakes"
   fm_write_meta "$home/state/resumed.meta" "window=sess:fm-resumed" "kind=ship" "worktree=$worktree"
   printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$home/state/resumed.status"
+  printf 'working: resumed validation after the rollout answer\n' >> "$home/state/resumed.status"
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$home/state/resumed.status"
   FM_FAKE_AXI_STATUS=$(cat <<EOF
 run:
   id: "01RUN"
   branch: fm/resumed
-  status: running
+  status: ci
   head: "$head"
-  pr: ""
+  pr: "https://github.com/o/r/pull/2"
   findings: none
   steps[2]{step,status,findings,duration_ms}:
     intent,completed,0,0
-    review,running,0,0
+    ci,running,0,0
 EOF
 )
   export FM_FAKE_AXI_STATUS
   out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
-  [ -z "$out" ] || fail "drain presented a decision superseded by an active run-step: $out"
-  run_send_with_current_state "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" resumed --resolve-key rollout "phase it"; rc=$?
+  if printf '%s' "$out" | grep -F '[key=rollout]' >/dev/null; then
+    fail "drain presented a decision superseded by an active run-step: $out"
+  fi
+  printf '%s' "$out" | grep -F 'resumed [key=creds] blocked: need the staging secret' >/dev/null \
+    || fail "drain hid a blocker raised mid-run under an active run-step: $out"
+
+  run_send_with_current_state_err "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" "$err" resumed --resolve-key rollout "phase it"; rc=$?
   [ "$rc" -ne 0 ] || fail "fm-send accepted a key superseded by an active run-step"
   [ ! -s "$log" ] || fail "fm-send typed a superseded answer: $(cat "$log")"
   if grep -F 'resolved [key=rollout]' "$home/state/resumed.status" >/dev/null; then
     fail "fm-send wrote a resolution for a non-answerable superseded key: $(cat "$home/state/resumed.status")"
   fi
+  grep -F 'still recorded as open' "$err" >/dev/null \
+    || fail "the superseded refusal did not say the key is durably open: $(cat "$err")"
+  grep -F 'state: working · source: run-step' "$err" >/dev/null \
+    || fail "the superseded refusal did not name the active run as the cause: $(cat "$err")"
+  if grep -F 'already closed or mistyped' "$err" >/dev/null; then
+    fail "a superseded key was mislabeled as closed or mistyped: $(cat "$err")"
+  fi
+
+  run_send_with_current_state "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" resumed --resolve-key creds "use the vault secret"; rc=$?
+  expect_code 0 "$rc" "a blocker raised mid-run should stay answerable under an active run-step"
+  grep -F 'use the vault secret' "$log" >/dev/null || fail "the mid-run blocker answer was not delivered: $(cat "$log")"
+  grep -F 'resolved [key=creds]: answered: use the vault secret' "$home/state/resumed.status" >/dev/null \
+    || fail "fm-send did not close the mid-run blocker it answered"
+  out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
+  [ -z "$out" ] || fail "drain still presented a key after the mid-run answer under an active run: $out"
+
+  FM_FAKE_AXI_STATUS=$(cat <<EOF
+run:
+  id: "01RUN"
+  branch: fm/resumed
+  status: awaiting_approval
+  head: "$head"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    review,awaiting_approval,1,0
+EOF
+)
+  export FM_FAKE_AXI_STATUS
+  out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
+  printf '%s' "$out" | grep -F 'resumed [key=rollout] needs-decision: choose the deployment path' >/dev/null \
+    || fail "the durable decision did not return through drain once the run parked: $out"
+  run_send_with_current_state "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" resumed --resolve-key rollout "phase it"; rc=$?
+  expect_code 0 "$rc" "the durable decision should be answerable again once the run parked"
+  grep -F 'resolved [key=rollout]: answered: phase it' "$home/state/resumed.status" >/dev/null \
+    || fail "fm-send did not append the supported closing event for the durably open key"
+  out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
+  [ -z "$out" ] || fail "drain still presented a key after every decision was resolved: $out"
   unset FM_FAKE_AXI_STATUS
-  pass "fm-send and OPEN DECISIONS agree for durable open, resolved, and active-run-superseded keys"
+  pass "fm-send and OPEN DECISIONS agree per key for durable open, resolved, run-superseded, mid-run, and re-parked states"
 }
 
 # A transferred decision is deliberately absent from the status presentation:
@@ -263,7 +327,7 @@ EOF
 # copy as an OPEN DECISION.
 test_send_and_drain_preserve_transferred_captain_holds() {
   local dir fb log home reader out rc show
-  command -v tasks-axi >/dev/null 2>&1 || { pass "fm-send and OPEN DECISIONS transferred-hold agreement (tasks-axi unavailable)"; return; }
+  command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found (transferred-hold agreement not verified)"; return; }
   dir="$TMP_ROOT/transferred-hold"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); log="$dir/send.log"
   reader=$(make_decision_state_reader "$dir")

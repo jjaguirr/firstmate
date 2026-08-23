@@ -262,44 +262,115 @@ test_incremental_agrees_with_full_fold_across_appends() {
   pass "the incremental fold matches the full fold across appends in both key positions"
 }
 
-# A resumed no-mistakes run supersedes a stale task-local decision, but a busy
-# pane does not. The current answerability wrappers must agree in their whole
-# and cursor-backed forms while retaining the durable key so it can reappear if
-# the run later parks.
-test_active_run_step_reconciles_both_decision_folds_without_using_pane_text() {
+# An active no-mistakes run supersedes a task-local decision only per key: the
+# key must be followed in the log by the crew's own progress line, so a blocker
+# raised mid-run (after that progress, while the run is still working) stays
+# open. A busy pane supersedes nothing. The current answerability wrappers must
+# agree in their whole and cursor-backed forms while retaining every durable
+# key so a superseded one can reappear if the run later parks.
+test_active_run_step_reconciles_both_decision_folds_per_key_without_using_pane_text() {
   local dir f reader full incremental raw
   dir=$(case_dir run-step-supersession)
   f="$dir/task.status"
   reader="$dir/fake-crew-state.sh"
+  fm_write_meta "$dir/task.meta" "window=sess:fm-task" "kind=ship"
   printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$f"
+  printf 'working: resumed validation after the rollout answer\n' >> "$f"
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$f"
   cat > "$reader" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${FM_FAKE_DECISION_CURRENT:-state: unknown · source: none}"
 SH
   chmod +x "$reader"
 
-  FM_FAKE_DECISION_CURRENT='state: working · source: run-step · validating'
+  FM_FAKE_DECISION_CURRENT='state: working · source: run-step · ci running'
   FM_CREW_STATE_BIN="$reader"
   export FM_FAKE_DECISION_CURRENT FM_CREW_STATE_BIN
   full=$(status_open_decisions_for_task task "$f")
   incremental=$(status_open_decisions_incremental_for_task task "$f")
-  [ -z "$full" ] && [ -z "$incremental" ] \
-    || fail "an active run-step did not suppress both current decision folds: full='$full' incremental='$incremental'"
+  [ "$full" = "$(printf 'creds\tblocked\tneed the staging secret\n')" ] \
+    || fail "active run-step did not supersede exactly the pre-progress key in the whole verdict: '$full'"
+  [ "$incremental" = "$full" ] \
+    || fail "incremental verdict diverged from the whole verdict under run supersession: '$incremental' vs '$full'"
 
   raw=$(status_open_decisions "$f")
   assert_contains "$raw" $'rollout\tneeds-decision' \
     "run supersession rewrote the durable decision instead of reconciling it"
+  assert_contains "$(status_open_decisions_superseded "$raw" "$full")" $'rollout\tneeds-decision' \
+    "the superseded explanation did not name the key the verdict removed"
+
+  FM_FAKE_DECISION_CURRENT='state: parked · source: run-step · parked at review'
+  export FM_FAKE_DECISION_CURRENT
+  full=$(status_open_decisions_for_task task "$f")
+  [ "$full" = "$raw" ] \
+    || fail "a parked run did not restore the whole durable set: '$full' vs '$raw'"
 
   FM_FAKE_DECISION_CURRENT='state: working · source: pane · rendered activity only'
   export FM_FAKE_DECISION_CURRENT
   full=$(status_open_decisions_for_task task "$f")
   incremental=$(status_open_decisions_incremental_for_task task "$f")
-  assert_contains "$full" $'rollout\tneeds-decision' \
-    "pane text incorrectly suppressed the whole decision verdict"
+  [ "$full" = "$raw" ] \
+    || fail "pane text incorrectly suppressed part of the decision verdict: '$full' vs '$raw'"
   [ "$incremental" = "$full" ] \
     || fail "pane-safe incremental verdict diverged from the whole verdict: '$incremental' vs '$full'"
   unset FM_FAKE_DECISION_CURRENT FM_CREW_STATE_BIN
-  pass "active run-step supersession is shared by whole and incremental decision folds without trusting pane text"
+  pass "active run-step supersession is per key, shared by whole and incremental folds, and never trusts pane text"
+}
+
+# A decision raised with no later progress line has no ordering witness, so an
+# active run-step leaves it open in both folds even when it is the only line.
+test_mid_run_decision_without_later_progress_stays_open_under_active_run() {
+  local dir f reader full incremental expected
+  dir=$(case_dir run-step-mid-run)
+  f="$dir/task.status"
+  reader="$dir/fake-crew-state.sh"
+  fm_write_meta "$dir/task.meta" "window=sess:fm-task" "kind=ship"
+  printf 'working: validating\nblocked [key=creds]: need the staging secret\n' > "$f"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "state: working · source: run-step · ci running"\n' > "$reader"
+  chmod +x "$reader"
+  expected=$(printf 'creds\tblocked\tneed the staging secret\n')
+  full=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_for_task task "$f")
+  incremental=$(FM_CREW_STATE_BIN="$reader" status_open_decisions_incremental_for_task task "$f")
+  [ "$full" = "$expected" ] || fail "a mid-run blocker was superseded by the whole verdict: '$full'"
+  [ "$incremental" = "$expected" ] || fail "a mid-run blocker was superseded by the incremental verdict: '$incremental'"
+  pass "a blocker raised after the crew's last progress line stays open under an active run"
+}
+
+# Only a local ship task can own an attributed run, so the current-state read
+# is skipped for every other task kind and for a remote mate; the durable set
+# is the verdict there and the reader is never executed.
+test_current_state_read_is_gated_to_local_ship_tasks() {
+  local dir reader calls kind f full expected
+  dir=$(case_dir run-step-gating)
+  reader="$dir/fake-crew-state.sh"
+  calls="$dir/calls.log"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$FM_FAKE_DECISION_CALLS"
+printf 'state: working · source: run-step · validating\n'
+SH
+  chmod +x "$reader"
+  expected=$(printf 'rollout\tneeds-decision\tchoose the deployment path\n')
+  for kind in scout secondmate remote absent; do
+    f="$dir/$kind.status"
+    printf 'needs-decision [key=rollout]: choose the deployment path\nworking: resumed\n' > "$f"
+    case "$kind" in
+      remote) fm_write_meta "$dir/$kind.meta" "window=sess:fm-$kind" "kind=ship" "remote_host=mate.example" ;;
+      absent) ;;
+      *) fm_write_meta "$dir/$kind.meta" "window=sess:fm-$kind" "kind=$kind" ;;
+    esac
+    full=$(FM_FAKE_DECISION_CALLS="$calls" FM_CREW_STATE_BIN="$reader" status_open_decisions_for_task "$kind" "$f")
+    [ "$full" = "$expected" ] || fail "$kind task verdict diverged from its durable set: '$full'"
+  done
+  [ ! -s "$calls" ] || fail "the current-state reader ran for a task that can never own a run: $(cat "$calls")"
+
+  f="$dir/ship.status"
+  printf 'needs-decision [key=rollout]: choose the deployment path\nworking: resumed\n' > "$f"
+  fm_write_meta "$dir/ship.meta" "window=sess:fm-ship" "kind=ship"
+  full=$(FM_FAKE_DECISION_CALLS="$calls" FM_CREW_STATE_BIN="$reader" status_open_decisions_for_task ship "$f")
+  [ -z "$full" ] || fail "a local ship task with a later progress line kept a superseded key: '$full'"
+  [ "$(cat "$calls")" = ship ] || fail "the current-state reader was not consulted exactly once for the ship task: $(cat "$calls")"
+  pass "the current-state read runs only for a local ship task and fails open elsewhere"
 }
 
 test_stated_key_is_honored_in_both_positions
@@ -378,4 +449,6 @@ EOF
 
 test_closing_verb_separates_resolution_from_durable_transfer
 test_closing_verb_tracks_the_last_transition_in_both_positions
-test_active_run_step_reconciles_both_decision_folds_without_using_pane_text
+test_active_run_step_reconciles_both_decision_folds_per_key_without_using_pane_text
+test_mid_run_decision_without_later_progress_stays_open_under_active_run
+test_current_state_read_is_gated_to_local_ship_tasks

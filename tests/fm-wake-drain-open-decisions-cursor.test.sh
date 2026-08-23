@@ -348,9 +348,10 @@ test_previous_fold_cache_is_refolded_under_current_semantics() {
 }
 
 # A lifecycle reconciliation must not mutate the durable cursor's open set.
-# When an active run starts, the recurring surface disappears immediately even
-# without a new status byte; when it parks again, the old durable decision
-# returns through the same cursor without a synthetic resolved/reopen event.
+# When an active run starts, a decision the crew progressed past disappears
+# immediately even without a new status byte, a blocker appended mid-run still
+# surfaces through the same cursor, and when the run parks again the old
+# durable decision returns without a synthetic resolved/reopen event.
 test_run_step_supersession_preserves_the_incremental_durable_set() {
   local dir state fakebin status out cursor before after
   dir=$(make_case cursor-run-step-supersession)
@@ -359,7 +360,9 @@ test_run_step_supersession_preserves_the_incremental_durable_set() {
   status="$state/task8.status"
   out="$dir/drain.out"
   cursor="$state/.task8.open-decisions-cursor"
+  fm_write_meta "$state/task8.meta" "window=sess:fm-task8" "kind=ship"
   printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+  printf 'working: resumed validation after the rollout answer\n' >> "$status"
 
   FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
     || fail "initial drain before run supersession failed"
@@ -375,12 +378,24 @@ test_run_step_supersession_preserves_the_incremental_durable_set() {
   [ "$after" = "$before" ] \
     || fail "run supersession rewrote the durable cursor instead of only reconciling its presentation"
 
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$status"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after a mid-run blocker append failed"
+  grep -F 'task8 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "a blocker appended mid-run did not surface through the cursor: $(cat "$out")"
+  if grep -F '[key=rollout]' "$out" >/dev/null; then
+    fail "the superseded decision resurfaced alongside the mid-run blocker: $(cat "$out")"
+  fi
+
   FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting captain decision' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
     || fail "drain after the run parked failed"
   grep -F 'task8 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
     || fail "the durable decision did not re-surface after the run parked: $(cat "$out")"
-  pass "run-step supersession leaves the cursor-backed durable decision available for a later parked run"
+  grep -F 'task8 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "the mid-run blocker vanished once the run parked: $(cat "$out")"
+  pass "run-step supersession leaves the cursor-backed durable decisions available and per key"
 }
 
 test_truncated_log_falls_back_to_a_full_refold_not_a_dropped_decision
