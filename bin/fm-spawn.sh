@@ -34,8 +34,10 @@
 #   agent-free on a backend with a recovery-grade agent-state classifier (tmux
 #   or herdr). A dead endpoint must have its shell in the recorded worktree;
 #   a missing one must have a matching live Treehouse lease and is recreated in
-#   that worktree. It clears the previous harness's per-task wiring before
-#   arming the new incarnation.
+#   that worktree, inside the recorded tmux session or this home's flat Herdr
+#   workspace only; a record bound to a projected Herdr presentation workspace
+#   refuses before any replacement is created. It clears the previous
+#   harness's per-task wiring before arming the new incarnation.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
@@ -1987,6 +1989,17 @@ if [ "$RELAUNCH" -eq 1 ]; then
           echo "error: Herdr is currently scoped to a different session than task $ID's recorded endpoint; refusing to create a replacement elsewhere" >&2
           exit 1
         }
+        # A projected presentation workspace is a disposable single-task
+        # container bound to its own journal. Reattach only recreates inside
+        # this home's flat workspace, so a projected record refuses before any
+        # replacement exists rather than silently relocating the task and
+        # stranding its journal.
+        RELAUNCH_HERDR_WORKSPACE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_workspace_id)
+        HERDR_PRESENTATION_JOURNAL=$(fm_backend_herdr_projection_journal_path "$STATE" "$ID")
+        if [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; then
+          echo "error: task $ID's recorded Herdr endpoint lives in projected presentation workspace ${RELAUNCH_HERDR_WORKSPACE_ID:-unknown}; missing-endpoint reattach into a projected presentation workspace is not supported. Its work is preserved at $WT: land it from there and retire the task with bin/fm-teardown.sh $ID, then spawn a new task" >&2
+          exit 1
+        fi
         HERDR_LABEL_HOME=$FM_HOME
         HERDR_LAUNCHER_RELATIONSHIP=launcher-home
         HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$WT" "$HERDR_LAUNCHER_RELATIONSHIP") || exit 1
@@ -1996,6 +2009,10 @@ if [ "$RELAUNCH" -eq 1 ]; then
         HERDR_WORKSPACE_ID=${CONTAINER#*:}
         [ "$HERDR_SES" = "$(fm_meta_get "$RELAUNCH_META" herdr_session)" ] || {
           echo "error: Herdr selected a different session while recreating task $ID's endpoint; refusing to launch" >&2
+          exit 1
+        }
+        [ "$HERDR_WORKSPACE_ID" = "$RELAUNCH_HERDR_WORKSPACE_ID" ] || {
+          echo "error: task $ID's recorded Herdr endpoint lives in workspace ${RELAUNCH_HERDR_WORKSPACE_ID:-unknown}, not this home's flat workspace $HERDR_WORKSPACE_ID; missing-endpoint reattach recreates only inside the recorded flat workspace and a projected presentation workspace is not supported. Its work is preserved at $WT: land it from there and retire the task with bin/fm-teardown.sh $ID, then spawn a new task" >&2
           exit 1
         }
         HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$WT" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
@@ -2080,7 +2097,7 @@ case "$BACKEND" in
           FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_projection_reclaim_task \
             "$HERDR_SES" "$HERDR_PRESENTATION_JOURNAL" "$ID" "$HERDR_LABEL_HOME" \
             "$HERDR_RECOVERY_WORKSPACE_ID" "$HERDR_RECOVERY_TAB_ID" "$HERDR_RECOVERY_PANE_ID" \
-            "$HERDR_PARENT_LABEL" "$W" "$PROJ_ABS"
+            "$HERDR_PARENT_LABEL" "$W" "$ENDPOINT_CWD"
           HERDR_RECLAIM_STATUS=$?
           set -e
           case "$HERDR_RECLAIM_STATUS" in

@@ -22,6 +22,11 @@
 # A gh lookup error falls back to the content check; if that is also inconclusive,
 # teardown refuses rather than risk discarding unlanded work.
 # Uncommitted changes are never landed.
+# An ordinary task whose record carries worktree_lease_* and whose worktree still
+# exists REFUSES unless that durable Treehouse lease verifies live against the
+# pool (exact lease id and holder for this home and task); the return then
+# carries matching --if-lease-* guards. A worktree that is already gone has
+# nothing to return and is not gated.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge after configured approval) as a fallback
 # for the common case where there is no remote at all.
@@ -56,8 +61,12 @@
 # leased home and state in place instead of hiding a still-held lease.
 # Usage: fm-teardown.sh <task-id> [--force]
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
-#   checks, and discards secondmate child work for kind=secondmate. Only use it
-#   when the captain has explicitly said to discard the work.
+#   checks, and discards secondmate child work for kind=secondmate. It bypasses
+#   the lease refusal only when Treehouse's inventory positively shows the slot
+#   absent or not leased (then the worktree is treated as nothing to return and
+#   only the task's own hook files are removed); a lease held elsewhere, or an
+#   ambiguous or unreadable inventory, still refuses. Only use it when the
+#   captain has explicitly said to discard the work.
 #
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crew process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a

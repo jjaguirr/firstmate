@@ -90,7 +90,10 @@
 #   - Missing-endpoint reattach refuses when the worktree or its exact durable
 #     lease is absent, foreign, ambiguous, or unreadable, when any live process
 #     remains rooted in the worktree, or when the recorded backend/session
-#     cannot safely create and bind one replacement endpoint. zellij, orca, and cmux remain unsupported
+#     cannot safely create and bind one replacement endpoint. A Herdr record
+#     bound to a projected presentation workspace refuses before any
+#     replacement is created; reattach recreates only inside the recorded
+#     flat per-home workspace. zellij, orca, and cmux remain unsupported
 #     because their adapters cannot prove a vanished endpoint agent-free.
 #
 # Environment knobs (all bounded waits, seconds):
@@ -784,7 +787,7 @@ record_note() {
 }
 
 do_relaunch() {
-  local exit_result state note_line missing_endpoint=0
+  local exit_result state note_line missing_endpoint=0 herdr_journal
   local -a spawn_args
 
   require_state_verified_backend relaunch
@@ -832,6 +835,13 @@ do_relaunch() {
           1) die "task $ID's endpoint is missing but process(es) ${FM_WORKTREE_LEASE_LIVE_PIDS:-unknown} still run from its recorded worktree; refusing to create a second agent" ;;
           *) die "task $ID's endpoint is missing but the host cannot safely prove its recorded worktree has no live process; refusing to create a second agent" ;;
         esac
+      fi
+      if [ "$BACKEND" = herdr ]; then
+        fm_backend_source herdr || die "task $ID's Herdr adapter could not be loaded"
+        herdr_journal=$(fm_backend_herdr_projection_journal_path "$STATE" "$ID")
+        if [ -e "$herdr_journal" ] || [ -L "$herdr_journal" ]; then
+          die "task $ID's recorded Herdr endpoint lives in projected presentation workspace $(fm_meta_get "$META" herdr_workspace_id); missing-endpoint reattach into a projected presentation workspace is not supported. Its work is preserved at $WT: land it from there and retire the task with bin/fm-teardown.sh $ID, then spawn a new task"
+        fi
       fi
       missing_endpoint=1
       RELAUNCH_MISSING_ENDPOINT=1

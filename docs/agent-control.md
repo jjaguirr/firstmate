@@ -116,7 +116,7 @@ Backend capability comes from each adapter's real surface, not from a policy cho
 | Backend | Escape | Enter | Ctrl+C | Ctrl+U | Recovery-grade agent state | Missing-endpoint reattach |
 | --- | --- | --- | --- | --- | --- | --- |
 | tmux | yes | yes | yes | yes | yes | supported - creates one window in the recorded live session at the leased worktree |
-| herdr | yes | yes | yes | yes | yes | supported - creates one tab/pane in the recorded named session at the leased worktree |
+| herdr | yes | yes | yes | yes | yes | supported - creates one tab/pane in the recorded named session's flat per-home workspace at the leased worktree; a record bound to a projected presentation workspace refuses before any replacement is created |
 | zellij | yes | yes | yes | yes | no | unsupported - no recovery-grade state proves a vanished pane has no live agent |
 | cmux | yes | yes | yes | yes | no | unsupported - no recovery-grade state proves a vanished surface has no live agent |
 | orca | no | yes | yes | no | no | unsupported - no recovery-grade state proves the terminal and Orca owns worktree lifecycle |

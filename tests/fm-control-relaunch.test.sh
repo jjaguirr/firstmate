@@ -1690,8 +1690,8 @@ SH
   : > "$dir/fake/herdr-tabs"
 }
 
-add_herdr_missing_pane_task() {  # <case-dir> <id>
-  local dir=$1 id=$2
+add_herdr_missing_pane_task() {  # <case-dir> <id> [workspace-id]
+  local dir=$1 id=$2 wsid=${3:-ws-1}
   add_ship_task "$dir" "$id" claude
   add_treehouse_lease "$dir" "$id"
   sed -i.bak -e "s/^window=.*/window=labses:pane-old/" "$dir/home/state/$id.meta"
@@ -1699,10 +1699,15 @@ add_herdr_missing_pane_task() {  # <case-dir> <id>
   {
     echo "backend=herdr"
     echo "herdr_session=labses"
-    echo "herdr_workspace_id=ws-1"
+    echo "herdr_workspace_id=$wsid"
     echo "herdr_tab_id=tab-old"
     echo "herdr_pane_id=pane-old"
   } >> "$dir/home/state/$id.meta"
+}
+
+add_herdr_presentation_journal() {  # <case-dir> <id>
+  printf 'version=1\ntask_id=%s\nprojection_id=%s\n' "$2" "proj-$2-token" \
+    > "$1/home/state/$2.herdr-presentation"
 }
 
 run_herdr_spawn() {  # <case-dir> <args...>
@@ -1754,6 +1759,71 @@ test_herdr_unconfirmed_abort_close_warns_loudly() {
   assert_contains "$out" "could not close the unpublished replacement endpoint labses:pane-1" \
     "a close that Herdr did not confirm must surface as a warning, never silently"
   pass "fm-spawn --relaunch: an unconfirmed Herdr pane close after an aborted reattach warns loudly"
+}
+
+test_herdr_reattach_refuses_a_projected_presentation_workspace() {
+  local dir out rc
+  dir=$(new_case herdr-projected-refuse rl53)
+  make_herdr_statefake_bin "$dir"
+  add_herdr_missing_pane_task "$dir" rl53 ws-proj-9
+  add_herdr_presentation_journal "$dir" rl53
+  cp "$dir/home/state/rl53.meta" "$dir/meta.before"
+  cp "$dir/home/state/rl53.herdr-presentation" "$dir/journal.before"
+
+  out=$(run_herdr_spawn "$dir" rl53 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "a record bound to a projected presentation workspace must refuse reattach"
+  assert_contains "$out" "projected presentation workspace ws-proj-9" \
+    "the refusal should name the recorded projected workspace"
+  assert_contains "$out" "not supported" "the refusal should state the unsupported axis plainly"
+  assert_contains "$out" "bin/fm-teardown.sh rl53" "the refusal should point at the supported alternative"
+  ! grep -q 'tab create' "$dir/fake/herdr-calls" \
+    || fail "a projected-workspace refusal must not create a replacement tab/pane"
+  cmp -s "$dir/home/state/rl53.meta" "$dir/meta.before" \
+    || fail "a projected-workspace refusal must leave the durable record unchanged"
+  cmp -s "$dir/home/state/rl53.herdr-presentation" "$dir/journal.before" \
+    || fail "a projected-workspace refusal must leave the presentation journal unchanged"
+  pass "fm-spawn --relaunch: a Herdr record in a projected presentation workspace refuses before creating anything"
+}
+
+test_herdr_reattach_refuses_a_recorded_workspace_that_is_not_the_flat_one() {
+  local dir out rc
+  dir=$(new_case herdr-foreign-workspace rl54)
+  make_herdr_statefake_bin "$dir"
+  add_herdr_missing_pane_task "$dir" rl54 ws-2
+  cp "$dir/home/state/rl54.meta" "$dir/meta.before"
+
+  out=$(run_herdr_spawn "$dir" rl54 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "a recorded workspace other than the flat per-home one must refuse reattach"
+  assert_contains "$out" "workspace ws-2, not this home's flat workspace ws-1" \
+    "the refusal should name both the recorded and the flat workspace"
+  ! grep -q 'tab create' "$dir/fake/herdr-calls" \
+    || fail "a workspace mismatch must not create a replacement tab/pane"
+  cmp -s "$dir/home/state/rl54.meta" "$dir/meta.before" \
+    || fail "a workspace mismatch must leave the durable record unchanged"
+  pass "fm-spawn --relaunch: a Herdr record outside the flat per-home workspace refuses before creating anything"
+}
+
+test_control_herdr_projected_record_refuses_before_any_mutation() {
+  local dir out rc
+  dir=$(make_herdr_reattach_case herdr-projected-control rl55)
+  add_herdr_presentation_journal "$dir" rl55
+  cp "$dir/home/state/rl55.meta" "$dir/meta.before"
+  cp "$dir/home/data/rl55/brief.md" "$dir/brief.before"
+
+  out=$(HERDR_SESSION=labses env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" \
+    FM_SPAWN_NO_GUARD=1 FM_CONTROL_POLL=0.01 FM_CONTROL_EXIT_WAIT=0.05 FM_CONTROL_LAUNCH_WAIT=0.2 \
+    "$dir/bin/fm-control.sh" rl55 relaunch --note "pane vanished" 2>&1); rc=$?
+  expect_code 1 "$rc" "the control plane must refuse a projected record before touching anything"
+  assert_contains "$out" "projected presentation workspace ws-1" \
+    "the control-plane refusal should name the recorded projected workspace"
+  [ ! -e "$dir/fake/spawn-args" ] || fail "a projected-record refusal must not delegate a launch"
+  cmp -s "$dir/home/state/rl55.meta" "$dir/meta.before" \
+    || fail "a projected-record refusal must leave the durable record unchanged"
+  cmp -s "$dir/home/data/rl55/brief.md" "$dir/brief.before" \
+    || fail "a projected-record refusal must not append a progress note"
+  [ ! -e "$dir/home/state/rl55.control-relaunch" ] \
+    || fail "a projected-record refusal must happen before the transaction journal opens"
+  pass "fm-control relaunch: a projected Herdr record refuses before checkpoint, note, or launch"
 }
 
 test_missing_endpoint_refuses_a_live_process_in_the_recorded_worktree() {
@@ -1851,4 +1921,7 @@ test_dead_relaunch_carries_validated_lease_metadata
 test_herdr_missing_endpoint_reattach_waits_on_the_published_pane
 test_herdr_post_create_failure_closes_the_replacement_pane
 test_herdr_unconfirmed_abort_close_warns_loudly
+test_herdr_reattach_refuses_a_projected_presentation_workspace
+test_herdr_reattach_refuses_a_recorded_workspace_that_is_not_the_flat_one
+test_control_herdr_projected_record_refuses_before_any_mutation
 test_spawn_relaunch_reattaches_a_missing_endpoint_from_the_record
