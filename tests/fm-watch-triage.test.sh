@@ -1112,6 +1112,156 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once"
 }
 
+# --- finished-but-unlanded crew: ONE declaration, not one bare stale per pane
+#     redraw ------------------------------------------------------------------
+# The live 2026-08-23 case: a crew that finished its work and declared
+# `paused: awaiting captain merge of PR <url>` idles with its agent still alive.
+# Authoritative crew state reports such a crew done - its run reached a terminal
+# step - never paused, so the declared wait can only be recovered from the
+# declaration itself. Before the fix every redraw of the idle pane changed the
+# pane hash, dropped the pause bookkeeping, and let the next stable hash surface
+# ANOTHER bare `stale: <window>`; each one costs a supervision turn that ends in
+# nothing to do, and the finished-but-unlanded state can last hours. The
+# declaration is surfaced once and then owned by the bounded PAUSE_RESURFACE_SECS
+# cadence however often the pane redraws - while a crew that declared nothing
+# keeps surfacing on every fresh stale hash (the undeclared-wedge control below).
+test_finished_unlanded_pause_survives_pane_churn() {
+  local dir state fakebin out capture_file statusf window key sig pid round cycles wakes bare back
+  dir=$(make_case finished-unlanded-pause); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/merge.status"
+  window="test:fm-merge"
+  printf 'idle, work finished (redraw 0)\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/merge.meta"
+  printf 'paused: awaiting captain merge of PR https://example.test/o/r/pull/7\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-merge_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "idle, work finished (redraw 0)")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # Phase A: first sight of a live crew's declared wait surfaces exactly once, as
+  # today. The pause bookkeeping this arms is what the churn below must keep.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a finished-but-unlanded declared pause did not surface on first sight"; }
+  [ -e "$state/.paused-$key" ] || fail "first sight of a finished-but-unlanded declared pause did not arm the pause cadence"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional first-sight stop"
+
+  # Phase B: the idle pane redraws (a token counter, a clock, a footer). Each
+  # redraw is a NEW pane hash for the SAME declared wait, and must stay on the
+  # bounded cadence - which, with the re-surface threshold far out of reach, means
+  # no wake at all.
+  round=1
+  while [ "$round" -le 3 ]; do
+    printf 'idle, work finished (redraw %s)\n' "$round" > "$capture_file"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+      FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    cycles=0
+    while [ "$cycles" -lt 3 ]; do
+      wait_poll_cycle "$state" "$pid" || break
+      cycles=$((cycles + 1))
+    done
+    reap "$pid"
+    round=$((round + 1))
+  done
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null)
+  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null)
+  [ "$bare" -eq 0 ] || fail "a redrawing idle pane under a valid declared pause surfaced $bare bare stale wakes"
+  [ "$wakes" -eq 0 ] || fail "a redrawing idle pane under a valid declared pause surfaced $wakes wakes before its re-surface cadence was due"
+  [ -e "$state/.paused-$key" ] || fail "pane redraws cleared the declared pause's bounded cadence bookkeeping"
+  [ ! -e "$state/.stale-since-$key" ] || fail "a declared pause started the wedge timer across pane redraws"
+
+  # A watcher reaped mid-cycle leaves a recovery announcement for its successor.
+  # Deliver and acknowledge that once, so the bounded re-surface below is the only
+  # reason the next arm can exit.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  if wait_for_exit "$pid" 100; then
+    ack_stopped_cycle "$state" || fail "could not acknowledge the watcher recovery announcement"
+  else
+    reap "$pid"
+  fi
+
+  # Phase C: absorbed is not silenced. Age the declaration and its re-surface
+  # throttle past a reachable threshold and the same wait comes back once, as the
+  # paused recheck that names what it is waiting on - never a bare stale and never
+  # a wedge.
+  back=$(( $(date +%s) - 500 ))
+  set_mtime "$back" "$statusf"
+  set_mtime "$back" "$state/.paused-resurfaced-$key"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-merge_status"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a declared pause past its threshold never re-surfaced for a recheck"; }
+  grep -F "awaiting external" "$state/.wake-queue" >/dev/null \
+    || fail "the bounded re-surface did not name the external wait: $(cat "$state/.wake-queue")"
+  grep -F "possible wedge" "$state/.wake-queue" >/dev/null \
+    && fail "a declared pause past its threshold was mislabeled a possible wedge"
+  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null)
+  [ "$bare" -eq 0 ] || fail "the bounded re-surface came back as $bare bare stale wakes"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional re-surface stop"
+
+  # Control: the SAME churn with no declaration on the log is an undeclared wedge
+  # and must keep surfacing, so the fix above cannot have been bought by
+  # weakening wedge detection.
+  dir=$(make_case undeclared-churn); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/wedge.status"
+  window="test:fm-wedge"
+  printf 'idle, no declaration (redraw 0)\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/wedge.meta"
+  printf 'working: editing the fix\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-wedge_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "idle, no declaration (redraw 0)")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  bare=0
+  round=0
+  while [ "$round" -le 2 ]; do
+    printf 'idle, no declaration (redraw %s)\n' "$round" > "$capture_file"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+      FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available' \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    cycles=0
+    while [ "$cycles" -lt 3 ]; do
+      wait_poll_cycle "$state" "$pid" || break
+      cycles=$((cycles + 1))
+    done
+    reap "$pid"
+    # Count and acknowledge each round's wake exactly as firstmate would, so the
+    # next redraw is judged on its own merits rather than on an unhandled queue.
+    bare=$(( bare + $(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null) ))
+    if [ -s "$state/.wake-queue" ]; then
+      ack_stopped_cycle "$state" || fail "could not acknowledge the undeclared control round $round"
+    fi
+    round=$((round + 1))
+  done
+  [ "$bare" -ge 2 ] || fail "an undeclared idle pane stopped surfacing across redraws (only $bare bare stale wakes)"
+  pass "a finished-but-unlanded declared pause keeps its bounded cadence across pane redraws while an undeclared wedge still surfaces"
+}
+
 test_secondmate_paused_resurfaces_in_normal_mode() {
   local dir state fakebin out capture_file statusf window key pane_hash sig pid back
   dir=$(make_case secondmate-paused-resurface); state="$dir/state"; fakebin="$dir/fakebin"
@@ -2636,6 +2786,7 @@ test_busy_declared_pause_is_rechecked_not_wedge_escalated
 test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
+test_finished_unlanded_pause_survives_pane_churn
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_captain_held_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed

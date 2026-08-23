@@ -177,7 +177,9 @@ BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
 # A crew that declared a pause is idling on a known external wait, so its stale
 # pane is absorbed rather than wedge-escalated.
 # A captain-held or paused crew whose agent has confidently exited uses the same
-# bounded cadence, while a live or ambiguously read agent still surfaces once; a
+# bounded cadence; a live or ambiguously read agent surfaces its declaration once
+# and then joins that same cadence, however often its idle pane redraws, because a
+# new pane hash under a standing declaration is the same wait, not a new event; a
 # secondmate earns the cadence on its declaration alone, because its endpoint
 # liveness is deliberately never read (pause_state_class owns that split).
 # These cases re-surface once for a recheck every PAUSE_RESURFACE_SECS - far
@@ -1232,7 +1234,9 @@ EOF
           #     Surface immediately so firstmate inspects the inconclusive state
           #     (it may be done via an interactive menu that wrote no done: status,
           #     waiting on a decision, or wedged) instead of leaving the finish to
-          #     wait out the timer.
+          #     wait out the timer - UNLESS this key already surfaced the very
+          #     declaration still on the log, in which case a new hash is the same
+          #     wait redrawn, not a new event (see the pf case below).
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
             case "$(pause_state_class "$w" "$task")" in
@@ -1246,7 +1250,23 @@ EOF
                 handle_paused_stale "$w" "$task" "$h"
                 ;;
               *)
-                surface_nonterminal_stale "$w" "$h"
+                # A live agent's first-sighted declaration still surfaces once, so
+                # an external-decision gate is never hidden behind the cadence. But
+                # once this key HAS surfaced it (pf), every later hash under the same
+                # standing declaration is the same wait: an idle pane redraw - a token
+                # counter, a clock, a footer - changes the hash without changing
+                # anything the captain can act on. A crew that finished and declared
+                # `paused: awaiting captain merge` reads `none` for as long as it waits
+                # (its run is authoritatively done, never paused, and its agent is
+                # alive), so without this every redraw would cost a full supervision
+                # turn that ends in nothing to do. Undeclared stale is untouched: with
+                # no declaration on the log the top of this loop has already dropped
+                # pf, so a genuine wedge still surfaces on every fresh hash.
+                if [ -e "$pf" ] && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
+                  handle_paused_stale "$w" "$task" "$h"
+                else
+                  surface_nonterminal_stale "$w" "$h"
+                fi
                 ;;
             esac
           else
@@ -1270,41 +1290,43 @@ EOF
         # unless a genuinely busy pane has gone too long with no completed turn -
         # then route it through busy_turn_bound_check, which hands the crossed
         # bound to the same wedge timer unless the crew declared the wait itself.
-        paused_bound=1
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
-          busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf" && paused_bound=0
+          busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf" || true
         else
           rm -f "$ssf" "$ewf"
           clear_write_tracking "$key"
         fi
-        # A busy pane normally means real work resumed, so stale pause bookkeeping
-        # is cleared - but not in the same poll the declared-pause cadence just
-        # recorded it, or the re-surface throttle it depends on would be erased and
-        # the pause would re-surface every poll instead of once per long cadence.
-        if [ "$paused_bound" -ne 0 ] && [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused_or_captain_held "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
-          clear_pause_tracking "$key"
-        fi
+        # Pause bookkeeping is NOT dropped here. A busy reading is one poll's
+        # rendered verdict, while the declaration on the log is the crew's own
+        # standing statement of why it is idle; dropping the cadence (and with it
+        # the re-surface throttle) on a busy flap is what let a declared wait
+        # re-surface as a bare stale minutes later. A declaration that ends drops
+        # it at the top of this loop, and an authoritative working verdict drops it
+        # on the stale path - the two places that actually know.
       fi
     else
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
-      paused_bound=1
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
-        busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf" && paused_bound=0
+        busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf" || true
       else
         rm -f "$ssf" "$ewf"
         clear_write_tracking "$key"
       fi
       task=$(window_to_task "$w" "$STATE")
-      if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then
+      # A new hash under a standing declaration is reclassified, never cleared on
+      # the busy reading alone: an idle pane that merely redrew is the same
+      # declared wait, and only an authoritative working verdict proves the crew
+      # left it. The reclassification itself stays behind the idle reading so a
+      # busy pane never pays a crew-state read every poll; a busy pane's own
+      # declaration is reclassified on the stale path once it goes quiet.
+      if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" \
+        && [ "$busy_now" -ne 0 ]; then
         case "$(pause_state_class "$w" "$task")" in
-          paused) handle_paused_stale "$w" "$task" "$h" ;;
-          *)      clear_pause_tracking "$key" ;;
+          paused)  handle_paused_stale "$w" "$task" "$h" ;;
+          working) clear_pause_tracking "$key" ;;
+          *)       : ;;
         esac
-      elif [ "$paused_bound" -ne 0 ] && [ -e "$pf" ]; then
-        # Same rule as the stable-hash branch: never clear pause bookkeeping the
-        # declared-pause cadence recorded on this very poll.
-        clear_pause_tracking "$key"
       fi
     fi
   done < <(recorded_windows)
