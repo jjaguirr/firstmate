@@ -1387,11 +1387,28 @@ test_lease_mismatch_with_present_worktree_refuses_even_under_force() {
   pass "teardown: a present worktree whose lease no longer proves ownership refuses, --force included"
 }
 
+add_task_hook_files() {  # <case-dir>
+  local wt="$1/wt"
+  mkdir -p "$wt/.claude" "$wt/.opencode/plugins"
+  printf '{}\n' > "$wt/.claude/settings.local.json"
+  printf '// hook\n' > "$wt/.opencode/plugins/fm-turn-end.js"
+  : > "$wt/.fm-grok-turnend"
+  : > "$wt/.fm-kimi-turnend"
+}
+
+assert_task_hook_files_removed() {  # <case-dir> <label>
+  local wt="$1/wt" f
+  for f in .claude/settings.local.json .opencode/plugins/fm-turn-end.js .fm-grok-turnend .fm-kimi-turnend; do
+    [ ! -e "$wt/$f" ] || fail "$2: task hook artifact $f was left behind"
+  done
+}
+
 test_lease_pool_entry_absent_under_force_is_nothing_to_return() {
   local case_dir rc
   case_dir=$(make_case lease-pool-absent)
   write_meta "$case_dir" local-only ship
   add_lease_meta "$case_dir"
+  add_task_hook_files "$case_dir"
   add_logging_treehouse "$case_dir" '[]'
 
   set +e
@@ -1413,7 +1430,66 @@ test_lease_pool_entry_absent_under_force_is_nothing_to_return() {
   ! grep -q '^return ' "$case_dir/treehouse.log" 2>/dev/null \
     || fail "lease-pool-absent: teardown must not return a worktree the pool no longer lists"
   [ -d "$case_dir/wt" ] || fail "lease-pool-absent: a worktree the pool does not own must be left in place"
+  assert_task_hook_files_removed "$case_dir" lease-pool-absent
   pass "teardown: --force treats a positively unlisted pool entry as nothing to return"
+}
+
+test_lease_listed_but_unleased_under_force_is_nothing_to_return() {
+  local case_dir rc wt_real
+  case_dir=$(make_case lease-listed-free)
+  write_meta "$case_dir" local-only ship
+  add_lease_meta "$case_dir"
+  add_task_hook_files "$case_dir"
+  wt_real=$(cd "$case_dir/wt" && pwd -P)
+  add_logging_treehouse "$case_dir" "[{\"path\":\"$wt_real\",\"status\":\"available\"}]"
+
+  set +e
+  run_lease_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "lease-listed-free: without --force a returned slot must still refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "lease-listed-free: refusal missing without --force"
+  [ -f "$case_dir/state/task-x1.meta" ] || fail "lease-listed-free: refusal must retain the task record"
+  [ -f "$case_dir/wt/.claude/settings.local.json" ] || fail "lease-listed-free: refusal must not touch the worktree"
+
+  set +e
+  run_lease_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "lease-listed-free: --force treats a listed but unleased slot as nothing to return"$'\n'"$(cat "$case_dir/stderr")"
+  grep -q 'nothing to return' "$case_dir/stderr" \
+    || fail "lease-listed-free: --force should say the worktree was treated as nothing to return"
+  assert_absent "$case_dir/state/task-x1.meta" "lease-listed-free: teardown left the task record"
+  ! grep -q '^return ' "$case_dir/treehouse.log" 2>/dev/null \
+    || fail "lease-listed-free: teardown must not return a slot the pool already holds as free"
+  [ -d "$case_dir/wt" ] || fail "lease-listed-free: a slot the pool holds as free must be left in place"
+  assert_task_hook_files_removed "$case_dir" lease-listed-free
+  pass "teardown: --force treats a listed but positively unleased pool slot as nothing to return"
+}
+
+test_lease_unreadable_inventory_refuses_under_force() {
+  local case_dir rc wt_real
+  case_dir=$(make_case lease-unreadable)
+  write_meta "$case_dir" local-only ship
+  add_lease_meta "$case_dir"
+  add_task_hook_files "$case_dir"
+  wt_real=$(cd "$case_dir/wt" && pwd -P)
+
+  for status in 'not json at all' "{\"path\":\"$wt_real\"}" "[{\"path\":\"$wt_real\"}]" \
+      "[{\"path\":\"$wt_real\",\"status\":\"available\"},{\"path\":\"$wt_real\",\"status\":\"leased\"}]"; do
+    add_logging_treehouse "$case_dir" "$status"
+    set +e
+    run_lease_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "lease-unreadable: --force must not infer a free slot from inventory '$status'"
+    grep -q REFUSED "$case_dir/stderr" || fail "lease-unreadable: refusal missing for inventory '$status'"
+    [ -f "$case_dir/state/task-x1.meta" ] || fail "lease-unreadable: refusal must retain the task record"
+    [ -f "$case_dir/wt/.claude/settings.local.json" ] || fail "lease-unreadable: refusal must not touch the worktree"
+    ! grep -q '^return ' "$case_dir/treehouse.log" 2>/dev/null \
+      || fail "lease-unreadable: refusal must not return the worktree"
+  done
+  pass "teardown: an unreadable, unparseable, statusless, or ambiguous pool inventory refuses even under --force"
 }
 
 test_lease_verified_worktree_returns_with_exact_lease_guards() {
@@ -2736,6 +2812,8 @@ test_teardown_missing_busy_sidecar_completes
 test_lease_absent_worktree_is_torn_down_under_force
 test_lease_mismatch_with_present_worktree_refuses_even_under_force
 test_lease_pool_entry_absent_under_force_is_nothing_to_return
+test_lease_listed_but_unleased_under_force_is_nothing_to_return
+test_lease_unreadable_inventory_refuses_under_force
 test_lease_verified_worktree_returns_with_exact_lease_guards
 test_herdr_teardown_clears_escalation_marker
 test_herdr_flat_teardown_refuses_orphaning_records_then_retry_completes

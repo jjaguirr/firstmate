@@ -1610,6 +1610,152 @@ test_herdr_missing_endpoint_reattach_waits_on_the_published_pane() {
   pass "fm-control relaunch: a Herdr reattach polls the pane the published record names"
 }
 
+# A stateful canned Herdr CLI for driving the REAL fm-spawn through a
+# missing-endpoint reattach: tabs/panes live in $FM_FAKE_DIR/herdr-tabs, the
+# workspace inventory in $FM_FAKE_DIR/herdr-workspaces. `pane get` reports the
+# creation cwd as foreground_cwd unless FM_FAKE_HERDR_FOREGROUND_CWD overrides
+# it, and FM_FAKE_HERDR_CLOSE_NOOP=1 makes `pane close` leave the pane present.
+make_herdr_statefake_bin() {  # <case-dir>
+  local dir=$1
+  cat > "$dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+D=$FM_FAKE_DIR
+TABS="$D/herdr-tabs"
+WS="$D/herdr-workspaces"
+[ -f "$TABS" ] || : > "$TABS"
+[ -f "$WS" ] || : > "$WS"
+printf '%s\n' "$*" >> "$D/herdr-calls"
+cmd=${1:-}; sub=${2:-}; arg3=${3:-}
+ws=; cwd=; label=; session=
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --workspace) ws=${args[$((i+1))]:-} ;;
+    --cwd) cwd=${args[$((i+1))]:-} ;;
+    --label) label=${args[$((i+1))]:-} ;;
+    --session) session=${args[$((i+1))]:-} ;;
+  esac
+done
+tabs_json() {  # <workspace> -> {"result":{"tabs":[...]}}
+  awk -F'\t' -v w="$1" 'BEGIN { printf "{\"result\":{\"tabs\":[" } $4 == w { printf "%s{\"tab_id\":\"%s\",\"label\":\"%s\",\"workspace_id\":\"%s\"}", (n++ ? "," : ""), $1, $3, $4 } END { print "]}}" }' "$TABS"
+}
+panes_json() {  # <workspace>
+  awk -F'\t' -v w="$1" 'BEGIN { printf "{\"result\":{\"panes\":[" } $4 == w { printf "%s{\"pane_id\":\"%s\",\"tab_id\":\"%s\"}", (n++ ? "," : ""), $2, $1 } END { print "]}}" }' "$TABS"
+}
+case "$cmd $sub" in
+  "status --json")
+    printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n' ;;
+  "session list")
+    printf '{"sessions":[{"name":"%s","running":true,"socket_path":"%s/herdr.sock"}]}\n' "$session" "$D" ;;
+  "workspace list")
+    awk -F'\t' 'BEGIN { printf "{\"result\":{\"workspaces\":[" } { printf "%s{\"workspace_id\":\"%s\",\"label\":\"%s\"}", (n++ ? "," : ""), $1, $2 } END { print "]}}" }' "$WS" ;;
+  "workspace create")
+    n=$(wc -l < "$WS"); n=$((n + 1))
+    printf '%s\t%s\n' "ws-$n" "$label" >> "$WS"
+    printf '%s\t%s\t%s\t%s\t%s\n' "tab-seed-$n" "pane-seed-$n" 1 "ws-$n" "$cwd" >> "$TABS"
+    printf '{"result":{"workspace":{"workspace_id":"ws-%s"},"tab":{"tab_id":"tab-seed-%s"},"root_pane":{"pane_id":"pane-seed-%s"}}}\n' "$n" "$n" "$n" ;;
+  "tab list") tabs_json "$ws" ;;
+  "pane list") panes_json "$ws" ;;
+  "tab create")
+    n=$(wc -l < "$TABS"); n=$((n + 1))
+    printf '%s\t%s\t%s\t%s\t%s\n' "tab-$n" "pane-$n" "$label" "$ws" "$cwd" >> "$TABS"
+    printf '{"result":{"tab":{"tab_id":"tab-%s"},"root_pane":{"pane_id":"pane-%s"}}}\n' "$n" "$n" ;;
+  "pane get")
+    line=$(awk -F'\t' -v p="$arg3" '$2 == p' "$TABS")
+    if [ -n "$line" ]; then
+      IFS=$'\t' read -r tab pane _ wsid pcwd <<EOF
+$line
+EOF
+      printf '{"result":{"pane":{"pane_id":"%s","tab_id":"%s","workspace_id":"%s","foreground_cwd":"%s"}}}\n' \
+        "$pane" "$tab" "$wsid" "${FM_FAKE_HERDR_FOREGROUND_CWD:-$pcwd}"
+    else
+      printf '{"error":{"code":"pane_not_found","message":"pane %s not found"}}\n' "$arg3"
+    fi ;;
+  "agent get")
+    printf '{"error":{"code":"agent_not_found","message":"agent target %s not found"}}\n' "$arg3" ;;
+  "pane close")
+    if [ "${FM_FAKE_HERDR_CLOSE_NOOP:-0}" != 1 ]; then
+      awk -F'\t' -v p="$arg3" '$2 != p' "$TABS" > "$TABS.new" && mv "$TABS.new" "$TABS"
+    fi ;;
+  "tab close")
+    awk -F'\t' -v t="$arg3" '$1 != t' "$TABS" > "$TABS.new" && mv "$TABS.new" "$TABS" ;;
+  *) printf '{}\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$dir/fakebin/herdr"
+  : > "$dir/fake/herdr-calls"
+  printf 'ws-1\tfirstmate\n' > "$dir/fake/herdr-workspaces"
+  : > "$dir/fake/herdr-tabs"
+}
+
+add_herdr_missing_pane_task() {  # <case-dir> <id>
+  local dir=$1 id=$2
+  add_ship_task "$dir" "$id" claude
+  add_treehouse_lease "$dir" "$id"
+  sed -i.bak -e "s/^window=.*/window=labses:pane-old/" "$dir/home/state/$id.meta"
+  rm -f "$dir/home/state/$id.meta.bak"
+  {
+    echo "backend=herdr"
+    echo "herdr_session=labses"
+    echo "herdr_workspace_id=ws-1"
+    echo "herdr_tab_id=tab-old"
+    echo "herdr_pane_id=pane-old"
+  } >> "$dir/home/state/$id.meta"
+}
+
+run_herdr_spawn() {  # <case-dir> <args...>
+  local dir=$1; shift
+  env -u HERDR_PANE_ID -u HERDR_ENV -u HERDR_SOCKET_PATH HERDR_SESSION=labses \
+    PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" \
+    FM_SPAWN_NO_GUARD=1 GROK_HOME="$dir/grokhome" \
+    FM_FAKE_HERDR_FOREGROUND_CWD="${FM_FAKE_HERDR_FOREGROUND_CWD:-}" \
+    FM_FAKE_HERDR_CLOSE_NOOP="${FM_FAKE_HERDR_CLOSE_NOOP:-}" \
+    "$SPAWN" "$@" 2>&1
+}
+
+herdr_pane_listed() {  # <case-dir> <pane-id>
+  awk -F'\t' -v p="$2" '$2 == p { found = 1 } END { exit !found }' "$1/fake/herdr-tabs"
+}
+
+test_herdr_post_create_failure_closes_the_replacement_pane() {
+  local dir out rc
+  dir=$(new_case herdr-abort-close rl51)
+  make_herdr_statefake_bin "$dir"
+  add_herdr_missing_pane_task "$dir" rl51
+  cp "$dir/home/state/rl51.meta" "$dir/meta.before"
+
+  out=$(FM_FAKE_HERDR_FOREGROUND_CWD="$dir/proj" run_herdr_spawn "$dir" rl51 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "a replacement pane whose shell is outside the worktree must abort"$'\n'"$out"
+  assert_contains "$out" "not its recorded worktree" "the abort should name the binding failure"
+  assert_grep 'pane close pane-1' "$dir/fake/herdr-calls" \
+    "the aborted reattach must close the replacement pane it created"
+  herdr_pane_listed "$dir" pane-1 && fail "a confirmed close must leave no replacement pane behind"
+  [[ "$out" != *"could not close the unpublished replacement endpoint"* ]] \
+    || fail "a confirmed close must not warn about an orphan"
+  cmp -s "$dir/home/state/rl51.meta" "$dir/meta.before" \
+    || fail "a failed post-create reattach must retain the prior durable record"
+  pass "fm-spawn --relaunch: a Herdr post-create failure closes its replacement pane and confirms it gone"
+}
+
+test_herdr_unconfirmed_abort_close_warns_loudly() {
+  local dir out rc
+  dir=$(new_case herdr-abort-close-fails rl52)
+  make_herdr_statefake_bin "$dir"
+  add_herdr_missing_pane_task "$dir" rl52
+
+  out=$(FM_FAKE_HERDR_FOREGROUND_CWD="$dir/proj" FM_FAKE_HERDR_CLOSE_NOOP=1 \
+    run_herdr_spawn "$dir" rl52 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "the aborted reattach must still fail"$'\n'"$out"
+  assert_grep 'pane close pane-1' "$dir/fake/herdr-calls" \
+    "the aborted reattach must attempt to close the replacement pane"
+  herdr_pane_listed "$dir" pane-1 || fail "fixture error: the no-op close should leave the pane present"
+  assert_contains "$out" "could not close the unpublished replacement endpoint labses:pane-1" \
+    "a close that Herdr did not confirm must surface as a warning, never silently"
+  pass "fm-spawn --relaunch: an unconfirmed Herdr pane close after an aborted reattach warns loudly"
+}
+
 test_missing_endpoint_refuses_a_live_process_in_the_recorded_worktree() {
   local dir out rc live_pid
   dir=$(new_case live-worktree-process rl45)
@@ -1703,4 +1849,6 @@ test_missing_endpoint_success_does_not_close_the_published_endpoint
 test_dead_relaunch_refuses_unvalidatable_lease_metadata
 test_dead_relaunch_carries_validated_lease_metadata
 test_herdr_missing_endpoint_reattach_waits_on_the_published_pane
+test_herdr_post_create_failure_closes_the_replacement_pane
+test_herdr_unconfirmed_abort_close_warns_loudly
 test_spawn_relaunch_reattaches_a_missing_endpoint_from_the_record

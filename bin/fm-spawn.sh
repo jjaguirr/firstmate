@@ -713,7 +713,11 @@ relaunch_replacement_endpoint_close() {  # <backend> <exact-target>
   [ -n "$target" ] || return 1
   case "$backend" in
     tmux) fm_backend_tmux_kill_window_id "$target" ;;
-    herdr) fm_backend_kill herdr "$target" 2>/dev/null ;;
+    herdr)
+      fm_backend_source herdr || return 1
+      fm_backend_kill herdr "$target"
+      fm_backend_herdr_endpoint_confirmed_gone "$target"
+      ;;
     *) return 1 ;;
   esac
 }
