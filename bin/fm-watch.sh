@@ -488,6 +488,18 @@ pause_declaration_digest() {  # <status-line>
   printf '%s' "$1" | hash_pane
 }
 
+# 0 iff <declaration> is a declared wait AND is the exact declaration this window's
+# one surface was already spent on. The single predicate every stale-triage `none`
+# reading asks, so the two branches that ask it - a first-sighted hash and a hash
+# already classified - cannot drift into answering it differently. Never true for a
+# cadence armed without surfacing (busy_turn_bound_check), which is what keeps that
+# declaration's own surface owed.
+pause_declaration_surfaced() {  # <window-key> <declaration>
+  local key=$1 decl=$2
+  status_is_paused_or_captain_held "$decl" || return 1
+  [ "$(cat "$STATE/.paused-surfaced-$key" 2>/dev/null || true)" = "$(pause_declaration_digest "$decl")" ]
+}
+
 clear_pause_state() {  # <window-key>
   local key=$1
   rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" \
@@ -1182,7 +1194,6 @@ EOF
     ssf="$STATE/.stale-since-$key"
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
-    psf="$STATE/.paused-surfaced-$key"   # digest of the declaration a surface was spent on
     prev=$(cat "$hf" 2>/dev/null || true)
     # Busy match: a backend's native semantic state when available (herdr), else
     # the last 6 non-blank lines only (the TUI footer area, where every verified
@@ -1298,9 +1309,7 @@ EOF
                 # Undeclared stale is untouched: with no declaration on the log the top
                 # of this loop has already dropped every pause marker, so a genuine
                 # wedge still surfaces on every fresh hash.
-                decl=$(last_status_line "$STATE/$task.status")
-                if status_is_paused_or_captain_held "$decl" \
-                  && [ "$(cat "$psf" 2>/dev/null || true)" = "$(pause_declaration_digest "$decl")" ]; then
+                if pause_declaration_surfaced "$key" "$(last_status_line "$STATE/$task.status")"; then
                   handle_paused_stale "$w" "$task" "$h"
                 else
                   surface_nonterminal_stale "$w" "$h"
@@ -1316,7 +1325,17 @@ EOF
                          printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" "$task"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
-                *)       handle_paused_stale "$w" "$task" "$h" ;;
+                *)       # A pane whose text never changed across the busy-to-idle
+                         # flip reaches its declaration's FIRST idle classification
+                         # here, not above: the busy-turn bound already advanced the
+                         # stale suppressor to this same hash. The surface is owed to
+                         # the declaration, not to a hash the pane happened to change,
+                         # so this asks the same question the first-sight branch does.
+                         if pause_declaration_surfaced "$key" "$(last_status_line "$STATE/$task.status")"; then
+                           handle_paused_stale "$w" "$task" "$h"
+                         else
+                           surface_nonterminal_stale "$w" "$h"
+                         fi ;;
               esac
             else
               wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf" "$task"

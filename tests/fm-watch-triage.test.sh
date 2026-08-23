@@ -1354,6 +1354,83 @@ test_busy_armed_declaration_still_surfaces_when_pane_goes_idle() {
   pass "a declaration armed unsurfaced on a busy pane still surfaces once when that pane goes idle"
 }
 
+# --- the same owed surface, on a pane whose TEXT never changes ----------------
+# window_is_busy reads an out-of-band semantic verdict for every harness but Grok,
+# so busy can flip to idle with the pane rendering byte-identical text. The
+# busy-turn bound has already advanced the stale suppressor to that one hash, so
+# the declaration's first idle classification lands on the already-classified-hash
+# branch rather than the first-sight branch - and an owed surface must not be lost
+# just because the pane happened not to repaint. Same crew, same declaration, same
+# owed surface as the churny case above; only the pane text is static.
+test_busy_armed_declaration_surfaces_on_a_static_pane() {
+  local dir state fakebin out capture_file statusf window key sig pid cycles bare
+  dir=$(make_case busy-armed-static-pane); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/static-scout.status"
+  window="test:fm-static-scout"
+  # Written once and never rewritten for the whole test: every hash below is this
+  # one hash, which is the entire point of the case.
+  printf 'lavish-axi poll, awaiting the captain\n' > "$capture_file"
+  printf 'window=%s\nkind=scout\nharness=pi\n' "$window" > "$state/static-scout.meta"
+  record_pi_busy "$state" static-scout
+  printf 'paused: awaiting a captain decision on the rollout plan\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-static-scout_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  touch -t 200001010000 "$state/static-scout.meta"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=pi \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=999 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  # Two cycles busy and over-age: the bound arms the cadence and advances the
+  # stale suppressor to this hash, without surfacing anything.
+  cycles=0
+  while [ "$cycles" -lt 2 ]; do
+    wait_poll_cycle "$state" "$pid" || { reap "$pid"; fail "a declared pause on a busy static pane exited the watcher: $(cat "$out")"; }
+    cycles=$((cycles + 1))
+  done
+  [ -e "$state/.paused-$key" ] || fail "the busy-turn bound did not arm the declared-pause cadence on a static pane"
+  [ ! -e "$state/.paused-surfaced-$key" ] || fail "the busy-turn bound recorded a surface it never made"
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$(hash_text "$(cat "$capture_file")")" ] \
+    || fail "the busy-turn bound did not advance the stale suppressor to the static hash"
+  [ ! -s "$state/.wake-queue" ] || fail "the busy-armed declaration surfaced a wake while still busy: $(cat "$state/.wake-queue")"
+
+  # The agent goes quiet with the pane rendering exactly the same text.
+  "$ROOT/bin/fm-busy-event.sh" apply "$state" static-scout idle --current-gen \
+    --source pi-ext --event agent-idle >/dev/null \
+    || { reap "$pid"; fail "could not take the busy static pane idle"; }
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "an owed surface was lost because the pane text never changed"; }
+  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null)
+  [ "$bare" -eq 1 ] || fail "an unsurfaced declaration on a newly idle static pane produced $bare bare stale wakes, expected 1"
+  [ -e "$state/.paused-surfaced-$key" ] || fail "the surface did not record the declaration it was spent on"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional static-pane stop"
+
+  # That one surface is spent: the same standing declaration on the same static
+  # hash is back on the bounded cadence, so nothing further is owed.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=pi \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=999 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  cycles=0
+  while [ "$cycles" -lt 4 ]; do
+    wait_poll_cycle "$state" "$pid" \
+      || fail "an already-surfaced declaration on a static pane surfaced again: $(cat "$out")"
+    cycles=$((cycles + 1))
+  done
+  reap "$pid"
+  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null)
+  [ "$bare" -eq 0 ] || fail "polls after the static-pane declaration was surfaced produced $bare more bare stale wakes"
+  [ ! -e "$state/.stale-since-$key" ] || fail "an absorbed declared pause on a static pane started the wedge timer"
+  pass "a declaration armed unsurfaced on a busy pane still surfaces once when the pane text never changes"
+}
+
 test_secondmate_paused_resurfaces_in_normal_mode() {
   local dir state fakebin out capture_file statusf window key pane_hash sig pid back
   dir=$(make_case secondmate-paused-resurface); state="$dir/state"; fakebin="$dir/fakebin"
@@ -2880,6 +2957,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_finished_unlanded_pause_survives_pane_churn
 test_busy_armed_declaration_still_surfaces_when_pane_goes_idle
+test_busy_armed_declaration_surfaces_on_a_static_pane
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_captain_held_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
