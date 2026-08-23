@@ -1,0 +1,42 @@
+### BEFORE FIX (base 4408507): crew status log says:
+    paused: awaiting captain merge of PR https://github.com/acme/widget/pull/7
+### fm-crew-state.sh verdict for this crew: state: done · source: run-step · checks-passed
+### PAUSE_RESURFACE_SECS = 3600 (the declared wait is fresh, so nothing is due for a recheck)
+
+--- first sight of the declaration (both versions surface it once, by design) ---
+    firstmate woken once and acknowledged; queue now: 0 entries
+
+--- the idle pane now repaints 4 times under the SAME standing declaration ---
+    pane repaint 1 -> 1 supervision wake(s) queued
+        WAKE: stale: test:fm-merge
+    pane repaint 2 -> 1 supervision wake(s) queued
+        WAKE: stale: test:fm-merge
+    pane repaint 3 -> 1 supervision wake(s) queued
+        WAKE: stale: test:fm-merge
+    pane repaint 4 -> 1 supervision wake(s) queued
+        WAKE: stale: test:fm-merge
+
+=== result (BEFORE FIX (base 4408507)) ===
+    bare 'stale: test:fm-merge' wakes across the 4 repaints: 4
+    pause cadence marker .paused-test_fm-merge: present
+    wedge timer .stale-since-test_fm-merge: not started
+
+
+### AFTER FIX (8bf25a7): crew status log says:
+    paused: awaiting captain merge of PR https://github.com/acme/widget/pull/7
+### fm-crew-state.sh verdict for this crew: state: done · source: run-step · checks-passed
+### PAUSE_RESURFACE_SECS = 3600 (the declared wait is fresh, so nothing is due for a recheck)
+
+--- first sight of the declaration (both versions surface it once, by design) ---
+    firstmate woken once and acknowledged; queue now: 0 entries
+
+--- the idle pane now repaints 4 times under the SAME standing declaration ---
+    pane repaint 1 -> 0 supervision wake(s) queued
+    pane repaint 2 -> 0 supervision wake(s) queued
+    pane repaint 3 -> 0 supervision wake(s) queued
+    pane repaint 4 -> 0 supervision wake(s) queued
+
+=== result (AFTER FIX (8bf25a7)) ===
+    bare 'stale: test:fm-merge' wakes across the 4 repaints: 0
+    pause cadence marker .paused-test_fm-merge: present
+    wedge timer .stale-since-test_fm-merge: not started

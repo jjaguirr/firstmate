@@ -1,0 +1,22 @@
+Each new test in tests/fm-watch-triage.test.sh was run against the bin/fm-watch.sh
+of the commit immediately BEFORE its own fix, and against the target commit.
+Only bin/fm-watch.sh was swapped; the test file is the target commit's in every run.
+
+--- against base 4408507 (no fix at all) ---
+$ bash tests/only-test_finished_unlanded_pause_survives_pane_churn.test.sh
+not ok - a redrawing idle pane under a valid declared pause surfaced 1 bare stale wakes   (exit 1)
+$ bash tests/only-test_busy_armed_declaration_still_surfaces_when_pane_goes_idle.test.sh
+not ok - the surface did not record the declaration it was spent on                        (exit 1)
+$ bash tests/only-test_busy_armed_declaration_surfaces_on_a_static_pane.test.sh
+not ok - an owed surface was lost because the pane text never changed                      (exit 1)
+
+--- each review-round test against its own immediate predecessor ---
+bin/fm-watch.sh from e33bde8 (fix 1 only):
+not ok - a declaration armed on a busy pane never surfaced once its pane went idle         (exit 1)
+bin/fm-watch.sh from 14483e0 (fixes 1+2):
+not ok - an owed surface was lost because the pane text never changed                      (exit 1)
+
+--- against the target commit 8bf25a7 ---
+ok - a finished-but-unlanded declared pause keeps its bounded cadence across pane redraws while an undeclared wedge still surfaces
+ok - a declaration armed unsurfaced on a busy pane still surfaces once when that pane goes idle
+ok - a declaration armed unsurfaced on a busy pane still surfaces once when the pane text never changes

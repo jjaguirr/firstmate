@@ -1,0 +1,17 @@
+=== B) undeclared idle pane - last status line: working: editing the fix ===
+    crew state: unknown (no current-state source) - nothing declares this wait
+    pane repaint 0 -> 1 wake(s):
+        WAKE: stale: test:fm-wedge
+    pane repaint 1 -> 1 wake(s):
+        WAKE: stale: test:fm-wedge
+    pane repaint 2 -> 1 wake(s):
+        WAKE: stale: test:fm-wedge
+    total bare stale wakes for the undeclared pane: 3 (wedge detection intact)
+
+=== C) the same declared wait, now aged past FM_PAUSE_RESURFACE_SECS=240 ===
+    declaration and its re-surface throttle aged 500s (> 240s cadence)
+    wake queue now:
+        WAKE: stale: test:fm-merge (paused 501s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)
+    bare stale wakes: 0
+    the recheck names the external wait: yes
+    mislabeled a possible wedge: no
