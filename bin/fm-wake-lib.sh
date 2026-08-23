@@ -1445,7 +1445,11 @@ fm_wake_print_annotations() {  # <deduped-raw-rows> [<presentation-snapshot>]
     if [ "$mode" = historical ] && fm_wake_signal_seen_current "$STATE" "$path"; then
       continue
     fi
-    offset=$(fm_wake_status_cursor_offset "$path") || return 1
+    # The snapshot is this presentation's bound, so resolve it BEFORE reading a
+    # cursor. A status file the snapshot skipped - gone, rotated, or replaced by
+    # a symlink since it was taken - has no endpoint here, and asking for its
+    # cursor first would fail the whole annotation pass and silently drop every
+    # other status file's annotation with it.
     endpoint=
     if [ -n "$snapshot" ]; then
       task=${status_key%.status}
@@ -1456,6 +1460,7 @@ $snapshot
 EOF
       [ -n "$endpoint" ] || continue
     fi
+    offset=$(fm_wake_status_cursor_offset "$path") || return 1
     if [ -n "$endpoint" ] && [ "$offset" -ge "$endpoint" ]; then continue; fi
     if ! fm_wake_unread_events "$path" 0 "$offset" "$endpoint"; then
       # Annotation enrichment is supplemental to the already-printed durable
