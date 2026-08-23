@@ -1,0 +1,144 @@
+################ BEFORE ################
+repo root: /tmp/fm-base-src
+
+durable status log for task "resumed" (identical for every check below):
+  | needs-decision [key=rollout]: choose the deployment path
+  | needs-decision [key=schema]: pick the schema
+  | working [key=rollout]: resumed validation after the rollout answer
+  | working: keyless routine note
+  | blocked [key=creds]: need the staging secret
+
+===== 1. task resumed: its no-mistakes run is ACTIVELY WORKING (state: working - source: run-step) =====
+
+--- captain surface A - bin/fm-wake-drain.sh OPEN DECISIONS
+  OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):
+  pane-task [key=rollout] needs-decision: choose the deployment path
+  resumed [key=rollout] needs-decision: choose the deployment path
+  resumed [key=schema] needs-decision: pick the schema
+  resumed [key=creds] blocked: need the staging secret
+  OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
+
+--- captain surface B - bin/fm-send.sh --resolve-key rollout (the key whose SAME-key progress line the run wrote)
+  $ bin/fm-send.sh resumed --resolve-key rollout "phase it"
+  exit=0
+  delivered to worker: phase it
+  closing line appended: resolved [key=rollout]: answered: phase it
+
+--- captain surface B - bin/fm-send.sh --resolve-key creds (a blocker raised mid-run: must stay answerable)
+  $ bin/fm-send.sh resumed --resolve-key creds "use the vault secret"
+  exit=0
+  delivered to worker: use the vault secret
+  closing line appended: resolved [key=creds]: answered: use the vault secret
+
+--- captain surface A again - OPEN DECISIONS after the mid-run answer
+  OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):
+  pane-task [key=rollout] needs-decision: choose the deployment path
+  resumed [key=schema] needs-decision: pick the schema
+  OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
+
+===== 2. same bytes, run PARKED (state: parked - source: run-step) =====
+
+--- captain surface A - OPEN DECISIONS
+  OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):
+  pane-task [key=rollout] needs-decision: choose the deployment path
+  resumed [key=schema] needs-decision: pick the schema
+  OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
+
+--- captain surface B - --resolve-key rollout is answerable again
+  $ bin/fm-send.sh resumed --resolve-key rollout "phase it"
+  exit=1
+  stderr: error: --resolve-key 'rollout': no open decision or blocker with that key in /tmp/fm-ev-before/home/state/resumed.status, and no captain-held task 'rollout' or 'resumed-decision-rollout' still open (already closed or mistyped). Re-check the OPEN DECISIONS listing, then resend without that key or with the right one; nothing was sent.
+  delivered to worker: (nothing)
+  closing line appended: resolved [key=rollout]: answered: phase it
+
+--- captain surface A - OPEN DECISIONS after the answer
+  OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):
+  pane-task [key=rollout] needs-decision: choose the deployment path
+  resumed [key=schema] needs-decision: pick the schema
+  OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
+
+--- captain surface B - answering the same key twice
+  $ bin/fm-send.sh resumed --resolve-key rollout "phase it again"
+  exit=1
+  stderr: error: --resolve-key 'rollout': no open decision or blocker with that key in /tmp/fm-ev-before/home/state/resumed.status, and no captain-held task 'rollout' or 'resumed-decision-rollout' still open (already closed or mistyped). Re-check the OPEN DECISIONS listing, then resend without that key or with the right one; nothing was sent.
+  delivered to worker: (nothing)
+  closing line appended: resolved [key=rollout]: answered: phase it
+
+--- resulting durable status log
+  | needs-decision [key=rollout]: choose the deployment path
+  | needs-decision [key=schema]: pick the schema
+  | working [key=rollout]: resumed validation after the rollout answer
+  | working: keyless routine note
+  | blocked [key=creds]: need the staging secret
+  | resolved [key=rollout]: answered: phase it
+  | resolved [key=creds]: answered: use the vault secret
+
+===== 3. task pane-task: ONE keyed decision, pane rendering live activity =====
+
+--- captain surface C - bin/fm-fleet-snapshot.sh --json (triage hints)
+  {
+    "id": "pane-task",
+    "current_state": {
+      "state": "working",
+      "source": "pane",
+      "detail": "harness busy (claude-hook)",
+      "raw": "state: working · source: pane · harness busy (claude-hook)",
+      "observed_at": "2026-08-23T07:42:20Z",
+      "freshness": "fresh"
+    },
+    "pending_decision": false,
+    "open_decisions": []
+  }
+
+--- captain surface A - OPEN DECISIONS for the same task
+  OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):
+  pane-task [key=rollout] needs-decision: choose the deployment path
+  resumed [key=schema] needs-decision: pick the schema
+  OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
+
+--- captain surface B - --resolve-key rollout on the same task
+  $ bin/fm-send.sh pane-task --resolve-key rollout "go with the blue path"
+  exit=0
+  delivered to worker: go with the blue path
+  closing line appended: resolved [key=rollout]: answered: go with the blue path
+
+===== 4. bin/fm-afk-return.sh catch-up list vs --resolve-key, one durable blocker =====
+
+durable status log for task "repair-task" (identical for both checks below):
+  | blocked [key=creds]: firstmate can refresh the synthetic token
+  | working [key=creds]: retrying with the cached token
+
+--- run ACTIVELY WORKING - catch-up list
+  fm-afk-return: catch-up must finish before the captain request
+  catch-up wake: 1784074271 25781 signal repair-task.status signal: synthetic status
+  firstmate-actionable blocker: repair-task [key=creds] firstmate can refresh the synthetic token
+  fm-afk-return: handle each blocker now, or close it with resolved [key=...] and append a durable reclassification reason, then run bin/fm-afk-return.sh check
+  exit=3
+
+--- run ACTIVELY WORKING - --resolve-key creds
+  $ bin/fm-send.sh repair-task --resolve-key creds "use the vault secret"
+  exit=0
+  stderr: ●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  stderr: ●  WATCHER DOWN - SUPERVISION IS OFF
+  stderr: ●  1 task(s) in flight, but no watcher has a fresh beacon (last beat: never, grace 300s).
+  stderr: ●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.
+  stderr: ●  This is a supervision warning only; the requested message WILL still be sent.
+  stderr: ●  watcher supervision needs Stop-owned automatic recovery; inspect the hook registration and startup status before ending the turn.
+  stderr: ●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+--- same bytes, run PARKED - catch-up list
+  catch-up wake: 1784074271 25801 signal repair-task.status signal: synthetic status
+  fm-afk-return: catch-up clear; ordinary captain work may proceed
+  exit=0
+
+--- same bytes, run PARKED - --resolve-key creds
+  $ bin/fm-send.sh repair-task --resolve-key creds "use the vault secret"
+  exit=1
+  stderr: error: --resolve-key 'creds': no open decision or blocker with that key in /tmp/fm-ev-before/afk/home/state/repair-task.status, and no captain-held task 'creds' or 'repair-task-decision-creds' still open (already closed or mistyped). Re-check the OPEN DECISIONS listing, then resend without that key or with the right one; nothing was sent.
+
+--- resulting durable status log
+  | blocked [key=creds]: firstmate can refresh the synthetic token
+  | working [key=creds]: retrying with the cached token
+  | resolved [key=creds]: answered: use the vault secret
+
+################ end BEFORE ################
