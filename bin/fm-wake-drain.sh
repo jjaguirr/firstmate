@@ -131,12 +131,16 @@ EOF
 # answerability verdict adds no status re-read at all: the same cursor carries
 # the witness set the run-supersession rule needs, so it rides that one fold.
 # status_task_run_state_prefetch performs that single fold and commits it before
-# the lock, so by the time this runs the cursor is already current and this scan
-# re-folds nothing. Its one non-file input is an fm-crew-state read per LOCAL
-# SHIP task whose durable set is non-empty (never for a scout, secondmate, or
-# remote mate), and fm-crew-state is not a pure read, so the prefetch warms
-# every such verdict BEFORE taking the fleet-wide presentation lock and then
-# seals the memo; nothing here can exec it while that lock is held.
+# the lock, so in the common case the cursor is already current by the time this
+# runs and this scan re-folds nothing. That is best-effort, not a guarantee: the
+# cursor is shared with every other drain in this home, so when it has been
+# advanced past the endpoint this drain captured, the scan re-folds its own
+# window rather than presenting bytes it did not capture.
+# Its one non-file input is an fm-crew-state read per LOCAL SHIP task whose
+# durable set is non-empty (never for a scout, secondmate, or remote mate), and
+# fm-crew-state is not a pure read, so the prefetch warms every such verdict
+# BEFORE taking the fleet-wide presentation lock and then seals the memo;
+# nothing here can exec it while that lock is held.
 # Bounded and silent: prints nothing when no decision is open, which is the
 # common case.
 print_open_decisions_section() {

@@ -528,6 +528,50 @@ test_each_delta_is_folded_once_per_drain() {
   pass "each task's delta is folded exactly once per drain and unread status still surfaces"
 }
 
+# The open-decisions cursor is SHARED, and drains in one home are not serialized
+# against each other: the prefetch commits it before taking the presentation
+# lock, so a second drain (the supervise daemon plus a manual drain, say) can
+# advance it past the endpoint a first drain already captured. The carried sets
+# then describe more bytes than that first drain may present, and a resolution
+# among them would silently drop a key that is still open at its endpoint - the
+# blocker-hiding failure class this whole change exists to remove. Two separate
+# processes here, mirroring the two drains.
+test_a_cursor_ahead_of_this_snapshot_refolds_to_the_captured_endpoint() {
+  local dir state status cursor s1 out before after
+  dir=$(make_case cursor-ahead-of-snapshot)
+  state="$dir/state"
+  status="$state/task11.status"
+  cursor="$state/.task11.open-decisions-cursor"
+
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+  s1=$(LC_ALL=C wc -c < "$status" | tr -d '[:space:]')
+  # Everything below is appended AFTER the first drain captured its endpoint at
+  # s1, so none of it belongs in that drain's presentation.
+  printf 'resolved [key=rollout]: went with REST\n' >> "$status"
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$status"
+
+  bash -c '. "$1/bin/fm-classify-lib.sh"; status_open_decisions_incremental "$2" >/dev/null' \
+    _ "$ROOT" "$status" || fail "the concurrent drain's fold failed"
+  grep -Fxq "offset=$(LC_ALL=C wc -c < "$status" | tr -d '[:space:]')" "$cursor" \
+    || fail "precondition: the concurrent drain did not commit the cursor at end of file: $(cat "$cursor")"
+  before=$(LC_ALL=C cksum "$cursor")
+
+  out=$(bash -c '. "$1/bin/fm-classify-lib.sh"; status_open_decisions_incremental "$2" "$3"' \
+    _ "$ROOT" "$status" "$s1") || fail "the snapshot-bounded fold failed"
+  case "$out" in
+    *"$(printf 'rollout\tneeds-decision')"*) : ;;
+    *) fail "a cursor advanced past this drain's captured endpoint hid a decision still open at it: '$out'" ;;
+  esac
+  case "$out" in
+    *"$(printf 'creds\t')"*)
+      fail "the snapshot-bounded fold presented a key from bytes past its captured endpoint: '$out'" ;;
+  esac
+  after=$(LC_ALL=C cksum "$cursor")
+  [ "$after" = "$before" ] \
+    || fail "the snapshot-bounded re-fold rewound the shared cursor and discarded the other drain's progress: $(cat "$cursor")"
+  pass "a cursor ahead of this drain's captured endpoint re-folds to that endpoint without rewinding it"
+}
+
 test_truncated_log_falls_back_to_a_full_refold_not_a_dropped_decision
 test_same_size_rewrite_is_detected_via_inode_identity
 test_read_failure_preserves_state_for_retry
@@ -538,3 +582,4 @@ test_buried_decision_survives_many_growing_drains_and_resolution_clears_it
 test_run_step_supersession_preserves_the_incremental_durable_set
 test_run_supersession_reads_only_new_appends_across_drains
 test_each_delta_is_folded_once_per_drain
+test_a_cursor_ahead_of_this_snapshot_refolds_to_the_captured_endpoint

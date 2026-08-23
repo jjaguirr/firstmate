@@ -1026,6 +1026,23 @@ status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>] [
     cursor_dirty=1
   fi
 
+  # The cursor is SHARED, and drains in one home are not serialized against each
+  # other while a presentation is in flight: another drain can commit this
+  # cursor past the endpoint this caller captured. The carried sets then
+  # describe MORE bytes than this caller is entitled to present, which is
+  # exactly what captured_end exists to prevent - a resolution beyond the
+  # endpoint would silently drop a key that is still open at it. Re-fold this
+  # caller's own window from byte 0 instead, and leave the cursor alone: the
+  # other drain's progress is real and rewinding it would only make it re-fold.
+  # Keep the carried sets as the read-failure fallback, which still names every
+  # key open as of the further offset rather than nothing.
+  if [ "$offset" -gt "$size" ]; then
+    offset=0
+    open=''
+    witness=''
+    mode=peek
+  fi
+
   if [ "$offset" -lt "$size" ]; then
     chunk_file="$cf.read.$$"
     _fm_status_read_span "$f" "$offset" "$((size - offset))" > "$chunk_file" 2>/dev/null \

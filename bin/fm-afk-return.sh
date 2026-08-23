@@ -8,9 +8,13 @@
 #   fm-afk-return.sh guard    Read-only refusal while away or catch-up is pending.
 #
 # `blocked:` is the crewmate protocol's firstmate-actionable verb. A live task's
-# open blocked event must be remediated and closed with `resolved [key=...]`, or
-# explicitly reclassified in the status stream with a durable reason, before an
-# ordinary captain request may proceed. `needs-decision:` belongs to the
+# open blocked event must be remediated and closed with `resolved [key=...]`,
+# explicitly reclassified in the status stream with a durable reason, or
+# superseded by the crew's own later same-key progress while its no-mistakes run
+# is actively working, before an ordinary captain request may proceed.
+# This gate never decides that itself: it lists exactly the blockers
+# bin/fm-send.sh --resolve-key would still accept, and bin/fm-classify-lib.sh is
+# the one owner of when a key is open. `needs-decision:` belongs to the
 # configured approval authority and is deliberately not part of this blocker
 # gate; normal reporting routes it through the AGENTS.md section 7 contract.
 #
