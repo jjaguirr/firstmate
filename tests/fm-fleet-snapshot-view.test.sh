@@ -362,7 +362,7 @@ EOF
 # so a captain reading the fleet view saw nothing waiting for a decision
 # fm-send would have accepted. All three surfaces run against one fixture here.
 test_busy_pane_keeps_a_decision_open_on_every_surface() {
-  local home fakebin out drain_out send_err rc hint_gen
+  local home fakebin out drain_out send_err verdict hint_gen
   home=$(make_home busy-pane-agreement)
   mkdir -p "$home/projects/pane-task"
   fm_write_meta "$home/state/pane-task.meta" \
@@ -393,17 +393,29 @@ test_busy_pane_keeps_a_decision_open_on_every_surface() {
   printf '%s' "$drain_out" | grep -F 'pane-task [key=rollout] needs-decision: choose the deployment path' >/dev/null \
     || fail "OPEN DECISIONS disagreed with the snapshot under a busy pane: $drain_out"
 
+  # fm-send can exit nonzero here for reasons that have nothing to do with
+  # answerability (this fixture has no live watcher and nothing to deliver to),
+  # so the exit code proves nothing either way. Assert the two things that do:
+  # neither answerability refusal was emitted, and the shared verdict fm-send
+  # consults names the same single key the other two surfaces just showed.
   send_err="$home/send.err"
   set +e
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     "$ROOT/bin/fm-send.sh" pane-task --resolve-key rollout "go with the blue path" >/dev/null 2>"$send_err"
-  rc=$?
   set -e
-  case "$rc" in
-    0) : ;;
-    *) grep -F 'superseded' "$send_err" >/dev/null \
-         && fail "--resolve-key refused a key both other surfaces present as open: $(cat "$send_err")" ;;
-  esac
+  grep -F 'superseded' "$send_err" >/dev/null \
+    && fail "--resolve-key refused a key both other surfaces present as open: $(cat "$send_err")"
+  grep -F 'no open decision or blocker with that key' "$send_err" >/dev/null \
+    && fail "--resolve-key reported a key both other surfaces present as open as already closed or mistyped: $(cat "$send_err")"
+
+  verdict=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    bash -c '. "$1"; status_open_decisions_for_task "$2" "$3"' _ \
+    "$ROOT/bin/fm-classify-lib.sh" pane-task "$home/state/pane-task.status") \
+    || fail "the shared answerability verdict failed for a key the other surfaces hold open"
+  [ "$(printf '%s\n' "$verdict" | grep -c .)" -eq 1 ] \
+    || fail "the answerability verdict and the snapshot disagree on how many keys are open: $verdict"
+  printf '%s' "$verdict" | grep -qE '(^|[[:space:]])rollout([[:space:]]|$)' \
+    || fail "the answerability verdict names a different key than the snapshot and the drain: $verdict"
   pass "a busy pane leaves a keyed decision open on the snapshot, the drain and --resolve-key alike"
 }
 
