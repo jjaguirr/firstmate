@@ -84,10 +84,11 @@
 # the status ledger alone can no longer close.
 #
 # Each named key must therefore currently be open in ONE of the two ledgers: open
-# in this home's status log per status_open_decisions (bin/fm-classify-lib.sh), or
-# a still-open captain-held task resolved as above. A key in neither is refused
-# before sending, so a mistyped key cannot deliver an answer while silently
-# orphaning the decision. A failed or unconfirmed send never closes a key (a remote
+# in this home's status log per status_open_decisions_for_task
+# (bin/fm-classify-lib.sh), or a still-open captain-held task resolved as above.
+# A key in neither is refused before sending, so a mistyped key cannot deliver an
+# answer while silently orphaning the decision. A failed or unconfirmed send never
+# closes a key (a remote
 # delivered-with-pending-confirmation outcome counts as delivered - see the
 # remote paragraph above); a
 # delivered answer whose closing append fails exits nonzero with the exact
@@ -384,7 +385,8 @@ fi
 # Validate the answerer-closes request before any durable mutation or send: the
 # target must have a task ledger in THIS home, the send must carry an answer
 # message, and every named key must be open right now in that ledger per the
-# ONE authoritative fold (status_open_decisions). Refusing here, before the
+# ONE authoritative answerability verdict (status_open_decisions_for_task).
+# Refusing here, before the
 # send, is what keeps a mistyped key loud instead of delivering an answer that
 # silently leaves its decision open.
 RESOLVE_STATUS_FILE=
@@ -433,12 +435,33 @@ if [ -n "$RESOLVE_KEYS" ]; then
   fi
   RESOLVE_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
   RESOLVE_STATUS_FILE="$STATE/$RESOLVE_TASK_ID.status"
-  resolve_open_set=$(status_open_decisions "$RESOLVE_STATUS_FILE")
+  # The durable set is folded once and reused by the verdict. The current
+  # state is read once, only when that set is non-empty (the reconcile is a
+  # no-op otherwise), and feeds both the verdict and, on refusal, the
+  # explanation, so the refusal can never describe a different run than the
+  # one that produced the verdict.
+  resolve_durable_set=$(status_open_decisions "$RESOLVE_STATUS_FILE")
+  resolve_current_state=''
+  resolve_open_set=''
+  if [ -n "$resolve_durable_set" ]; then
+    resolve_current_state=$(status_task_run_state "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE")
+    resolve_open_set=$(status_open_decisions_for_task "$RESOLVE_TASK_ID" "$RESOLVE_STATUS_FILE" "$resolve_current_state" "$resolve_durable_set")
+  fi
+  resolve_superseded_set=$(status_open_decisions_superseded "$resolve_durable_set" "$resolve_open_set")
   for k in $RESOLVE_KEYS; do
     case "$resolve_open_set" in
       "$k"$'\t'*|*$'\n'"$k"$'\t'*)
         RESOLVE_STATUS_KEYS="${RESOLVE_STATUS_KEYS}${RESOLVE_STATUS_KEYS:+ }$k"
         continue
+        ;;
+    esac
+    # Durably recorded as open, yet removed by the shared answerability
+    # verdict: the only rule that does that is active-run supersession, which
+    # is neither "closed" nor "mistyped", so name it and stop.
+    case "$resolve_superseded_set" in
+      "$k"$'\t'*|*$'\n'"$k"$'\t'*)
+        echo "error: --resolve-key '$k': that decision is still recorded as open in $RESOLVE_STATUS_FILE, but it is not answerable now: the crew later reported progress under that same key and its task is working on an active run ($resolve_current_state), so the run superseded it. Wait for that run to park or finish and resend if the decision is still needed; nothing was sent." >&2
+        exit 1
         ;;
     esac
     # Not open in the status log. A decision already transferred to its durable

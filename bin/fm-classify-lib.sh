@@ -32,7 +32,8 @@
 # bin/ script (which sets its own SCRIPT_DIR) or directly by a test.
 _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)" || _FM_CLASSIFY_LIB_DIR="."
 
-# The crew current-state reader used for the "provably working" decision.
+# The crew current-state reader used for lifecycle reconciliation and the
+# "provably working" decision.
 # Overridable so tests can stub the run-step/pane verdict without a real worktree
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
@@ -177,10 +178,15 @@ status_is_paused_or_captain_held() {  # <status-line>
 # (last_status_line above) cannot represent "an earlier decision is still open
 # after a later, unrelated event": a subsequent done/paused/working line silently
 # masks a still-open needs-decision. status_open_decisions is the ONE authoritative
-# statement of the status-fold contract that fixes this - a needs-decision/blocked
-# line OPENS a keyed decision, and only an explicit resolution or a verified
-# captain-held backlog transfer referencing that key CLOSES it; a later unrelated
-# terminal line never clears an open captain decision.
+# statement of the durable status-fold contract that fixes this - a
+# needs-decision/blocked line OPENS a keyed decision, and only an explicit
+# resolution or a verified captain-held backlog transfer referencing that key
+# CLOSES it. status_open_decisions_for_task is the corresponding current
+# answerability verdict: it preserves that durable fold, then removes only the
+# keys an active run-step has provably superseded, one key at a time (see
+# _fm_open_decisions_reconcile_active_run). A pane read never closes a decision,
+# and a later unrelated terminal line never clears an open captain decision on
+# its own.
 # Who WRITES the closing line is owned elsewhere: the answering firstmate closes
 # at answer time through fm-send's --resolve-key (bin/fm-send.sh header), and a
 # worker self-closes only a blocker that cleared without an answer (bin/fm-brief.sh
@@ -447,6 +453,308 @@ EOF
   printf '%s' "$verb"
 }
 
+# Status verbs that record the crew moving on with its work. In the lifecycle
+# reconciliation below, one of these lines stating the SAME key as an open
+# record, appended after it, is the durable per-key witness that the crew
+# moved past that decision; the line itself closes nothing, a keyless or
+# other-key progress line is never a witness for an untouched key, and the
+# paused verb (a declared wait, not progress) is deliberately not one of them.
+_fm_status_verb_is_progress() {  # <verb>
+  case "$1" in
+    working|done|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The key a line explicitly states in either documented position, through the
+# one key parser; fails for a keyless line, which _fm_decision_key would fold
+# as "default" and which must never act as another record's witness.
+_fm_decision_stated_key() {  # <status-line> -> key slug
+  _fm_key_before_colon "$1" || _fm_key_at_note_head "$1" >/dev/null || return 1
+  _fm_decision_key "$1"
+}
+
+# Fold ONE status line into a WITNESS set: the durable per-line rule
+# (_fm_decision_fold_line, still the only decision parser) plus the single
+# extra transition that a progress line stating a key drops that key. This is
+# the ONE place that extra transition is written, so the whole-file witness
+# fold below and the cursor-backed incremental fold further down cannot drift.
+# Pure text transform, no file I/O.
+_fm_decision_witness_fold_line() {  # <witness-set> <status-line> <resolve-verb> <held-verb>
+  local witness=$1 line=$2 resolve=$3 held=$4 verb key
+  verb=$(status_line_verb "$line")
+  if _fm_status_verb_is_progress "$verb" && key=$(_fm_decision_stated_key "$line"); then
+    if _fm_decision_key_transition_allowed "$key" "$(status_line_note "$line")"; then
+      witness=$(_fm_decision_drop "$witness" "$key")
+      [ -z "$witness" ] || witness="${witness}"$'\n'
+    fi
+    printf '%s' "$witness"
+    return 0
+  fi
+  _fm_decision_fold_line "$witness" "$line" "$resolve" "$held"
+}
+
+# The durable fold re-run over the whole current file with one extra
+# transition: a progress line stating a key drops that key's record. Every key
+# open in the durable set but absent here was followed by its own progress
+# line, which is the per-key evidence the active-run reconciliation needs.
+# The drop honors the reserved-namespace rule exactly as every other
+# transition does, so a reserved key is witnessed only by a line that speaks
+# its owner's vocabulary.
+# Whole-file on purpose: every caller is a one-shot surface that has already
+# folded the whole log for its durable set, so both folds see the same bytes.
+# The per-drain path never comes through here - it carries its witness set in
+# the cursor - so there is no snapshot endpoint to honor.
+# Fails (status 1, nothing printed) when the bytes cannot be re-read, so the
+# caller can keep the durable set rather than reconcile against nothing.
+_fm_open_decisions_with_keyed_progress() {  # <status-file>
+  local f=$1 line resolve held open='' size span
+  [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 1
+  resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
+  held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
+  size=$(_fm_status_file_size "$f") || return 1
+  size=${size//[[:space:]]/}
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
+  span=$(_fm_status_read_span "$f" 0 "$size" 2>/dev/null) || return 1
+  # Same test-only observability seam the incremental fold records through, so
+  # a boundedness assertion covers the whole picture: this whole-file witness
+  # fold reads bytes 0..size, which is what the one-shot callers below already
+  # pay for their durable fold, and a probe that could not see it would leave a
+  # second unbounded read invisible.
+  [ -n "${FM_OPEN_DECISIONS_READ_PROBE:-}" ] \
+    && printf '%s\t%s\n' "$f" "$size" >> "$FM_OPEN_DECISIONS_READ_PROBE"
+  while IFS= read -r line || [ -n "$line" ]; do
+    open=$(_fm_decision_witness_fold_line "$open" "$line" "$resolve" "$held")
+  done <<EOF
+$span
+EOF
+  printf '%s' "$open"
+}
+
+# fm-crew-state's current-state line for a task whose keyed decisions an active
+# run could supersede, or nothing when no such run can exist. Only a local ship
+# task can own an attributed no-mistakes run: fm-crew-state.sh skips run
+# attribution for scouts and secondmates and answers a remote mate from its
+# endpoint before its run-step path, so reading its meta the same way it does
+# and skipping those tasks here avoids paying for the axi/pane/ssh reads on
+# every drain for a task that can never produce a run-step verdict. An
+# unreadable result is reported as nothing, which fails open to the durable set.
+status_task_run_state() {  # <task-id> <status-file>
+  local task=$1 meta="${2%.status}.meta" kind remote line=''
+  if [ "$_FM_RUN_STATE_MEMO_ENABLED" = 1 ] && line=$(_fm_run_state_memo_get "$task"); then
+    printf '%s' "$line"
+    return 0
+  fi
+  [ "$_FM_RUN_STATE_MEMO_SEALED" = 0 ] || return 0
+  line=''
+  if [ -f "$meta" ] && [ -r "$meta" ]; then
+    remote=$(grep '^remote_host=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
+    kind=$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2-)
+    if [ -z "$remote" ] && [ "${kind:-ship}" = ship ]; then
+      line=$("$FM_CREW_STATE_BIN" "$task" 2>/dev/null) || line=''
+      line=${line%%$'\n'*}
+    fi
+  fi
+  if [ "$_FM_RUN_STATE_MEMO_ENABLED" = 1 ]; then
+    _FM_RUN_STATE_MEMO="${_FM_RUN_STATE_MEMO}${task}"$'\t'"${line}"$'\n'
+  fi
+  printf '%s' "$line"
+}
+
+# Per-process memo for status_task_run_state, off by default so an ordinary
+# one-shot caller keeps reading live state. fm-crew-state.sh is NOT a pure read
+# (it may make a bounded no-mistakes call, plus git and pane reads), so a
+# surface that presents the whole fleet warms every verdict it can need through
+# status_task_run_state_prefetch and then SEALS the memo. While sealed, a miss
+# never execs the reader: it reports nothing, which fails open to the durable
+# set, so "no crew-state exec happens under the presentation lock" is an
+# invariant of the code rather than a property of the warming gate being
+# perfect. The gate below folds the current durable set, so the only way to
+# miss is a decision appended between the prefetch and the scan; that key stays
+# PRESENTED for one drain (never hidden) and is warmed on the next.
+# Records are "<task>\t<line>\n"; a task whose verdict is deliberately nothing
+# (missing meta, scout, secondmate, remote mate, unreadable reader) memoizes an
+# empty line so its gate is not re-walked either. Portable: no associative
+# arrays, so this runs on bash 3.2 too.
+_FM_RUN_STATE_MEMO=''
+_FM_RUN_STATE_MEMO_ENABLED=0
+_FM_RUN_STATE_MEMO_SEALED=0
+
+_fm_run_state_memo_get() {  # <task-id> -> memoized line, status 1 when absent
+  local task=$1 rest=$_FM_RUN_STATE_MEMO
+  case "$rest" in
+    "$task"$'\t'*) rest=${rest#"$task"$'\t'} ;;
+    *$'\n'"$task"$'\t'*) rest=${rest#*$'\n'"$task"$'\t'} ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "${rest%%$'\n'*}"
+}
+
+# Turn the memo on, warm it for every task that currently holds an open keyed
+# decision, and seal it, all BEFORE the caller takes its presentation lock.
+# Only a task with a non-empty durable set can reach the active-run
+# reconciliation, so the gate is that exact set, computed by the same
+# cursor-backed fold the in-lock scan uses. This is the drain's ONLY fold of
+# each task's new appends: it commits the cursor, so the scan behind the lock
+# finds the cursor already at end of file and folds nothing a second time.
+#
+# The one exception is a home whose fleet presentation manifest does not exist
+# yet. status_presentation_cursor_offset seeds the UNREAD surface from this
+# same per-task cursor while that manifest is missing, so committing here would
+# move an offset the unread section has not read yet and swallow a buried
+# answer. Those drains fold in PEEK mode instead (no commit) and the in-lock
+# scan folds and commits as before; the very first drain writes the manifest,
+# and every drain after it takes the single-fold path.
+status_task_run_state_prefetch() {  # <state>
+  local state=$1 f task mode=peek
+  _FM_RUN_STATE_MEMO=''
+  _FM_RUN_STATE_MEMO_ENABLED=1
+  _FM_RUN_STATE_MEMO_SEALED=0
+  if [ -f "$state/.status-presentation-cursor" ] && [ ! -L "$state/.status-presentation-cursor" ]; then
+    mode=''
+  fi
+  for f in "$state"/*.status; do
+    [ -e "$f" ] || continue
+    status_open_decisions_incremental "$f" '' "$mode" >/dev/null || :
+    [ -n "$FM_OPEN_DECISIONS_OPEN" ] || continue
+    task=$(basename "$f"); task="${task%.status}"
+    status_task_run_state "$task" "$f" >/dev/null
+  done
+  _FM_RUN_STATE_MEMO_SEALED=1
+  return 0
+}
+
+# Reconcile one durable open set with the task lifecycle, one key at a time,
+# against an ALREADY COMPUTED witness set. A key is superseded only when BOTH
+# hold: fm-crew-state proves this task is working on an active no-mistakes
+# run-step, and the witness fold shows a later progress line stating that same
+# key, so the record provably predates the crew moving past it. A key raised
+# mid-run, or one followed only by keyless or other-key progress lines, is
+# still in the witness set and stays open and answerable. Do not use a pane
+# verdict here: rendered terminal activity can prove work is in progress for
+# wake triage, but cannot close a captain decision. A missing, unreadable, or
+# malformed current-state line fails open to the durable set. This is the ONE
+# lifecycle rule every consumer shares; the two callers below differ only in
+# how they obtained the witness set.
+_fm_open_decisions_keep_witnessed() {  # <open-set> <witness-set> <current-state-line>
+  local open=$1 witnessed=$2 current=$3 line
+  [ -n "$open" ] || return 0
+  case "$current" in
+    'state: working · source: run-step'*) ;;
+    *) printf '%s' "$open"; return 0 ;;
+  esac
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    _fm_open_set_has "$witnessed" "${line%%$'\t'*}" || continue
+    printf '%s\n' "$line"
+  done <<EOF
+$open
+EOF
+}
+
+# Whole-file counterpart for the one-shot callers (fm-send, fm-afk-return, the
+# fleet snapshot), which have already folded the whole log for their durable
+# set and so pay the same order of cost for the witness fold. The per-drain
+# path does NOT come through here: it carries its witness set in the same
+# cursor as its durable set (status_open_decisions_incremental). A witness
+# re-read failure is reported on stderr and fails open to the durable set,
+# rather than letting an empty witness set drop every key.
+_fm_open_decisions_reconcile_active_run() {  # <status-file> <open-set> <current-state-line>
+  local f=$1 open=$2 current=$3 witnessed
+  [ -n "$open" ] || return 0
+  case "$current" in
+    'state: working · source: run-step'*) ;;
+    *) printf '%s' "$open"; return 0 ;;
+  esac
+  if ! witnessed=$(_fm_open_decisions_with_keyed_progress "$f"); then
+    echo "warning: could not re-read $f to reconcile its open decisions with the active run; keeping every durable key open" >&2
+    printf '%s' "$open"
+    return 0
+  fi
+  _fm_open_decisions_keep_witnessed "$open" "$witnessed" "$current"
+}
+
+# The keys of a durable open set that the current answerability verdict has
+# removed, in the same "<key>\t<verb>\t<note>" shape, so a consumer can name
+# active-run supersession as the real reason a durably recorded key is not
+# answerable instead of mislabeling it closed or mistyped.
+status_open_decisions_superseded() {  # <durable-open-set> <current-open-set>
+  local durable=$1 current=$2 line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    _fm_open_set_has "$current" "${line%%$'\t'*}" && continue
+    printf '%s\n' "$line"
+  done <<EOF
+$durable
+EOF
+}
+
+# Current answerability verdict for one task's keyed status decisions.
+# The durable event fold above remains the source of every key and continues to
+# drive the incremental cursor; _fm_open_decisions_reconcile_active_run is the
+# one lifecycle rule both consumers share. A caller that already holds the
+# task's current-state line (status_task_run_state) passes it as the third
+# argument so the verdict and its explanation come from one read, and one that
+# already folded the durable set passes it as the fourth so the log is not
+# folded again.
+status_open_decisions_for_task() {  # <task-id> <status-file> [<current-state-line>] [<durable-open-set>]
+  local task=$1 f=$2 open current
+  if [ $# -ge 4 ]; then open=$4; else open=$(status_open_decisions "$f"); fi
+  [ -n "$open" ] || return 0
+  if [ $# -ge 3 ]; then current=$3; else current=$(status_task_run_state "$task" "$f"); fi
+  _fm_open_decisions_reconcile_active_run "$f" "$open" "$current"
+}
+
+# 0 when a COMPLETED single-owner task's keyed records are retired for the
+# surfaces that ask "what is still pending", rather than "which key can still
+# be answered". A scout or ship task delivers one deliverable - its report or
+# its PR - so once it is done/failed its stale, never-keyed-resolved records
+# surface as a report POINTER, not as a reopened pending decision. A secondmate
+# is persistent and multiplexes many concerns onto one stream, so a terminal
+# event on one concern must never retire another concern's key. This is the ONE
+# statement of that rule: bin/fm-fleet-snapshot.sh reaches it through
+# status_open_decisions_for_triage below with the crew's CURRENT state, and
+# bin/fm-captain-hold.sh reaches it directly with the status log's LAST event
+# verb, which is the only lifecycle signal that surface reads.
+# Deliberately NOT part of the answerability verdict: fm-send's --resolve-key
+# and the fleet-wide OPEN DECISIONS fold must keep a durably open key
+# answerable after its task finishes, so only active-run supersession removes a
+# key there.
+status_open_decisions_retired_by_completion() {  # <kind> <state-or-verb>
+  case "${1:-ship}" in secondmate) return 1 ;; esac
+  case "$2" in
+    done|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Open-decision set for a fleet TRIAGE surface (bin/fm-fleet-snapshot.sh's
+# hints.open_decisions), over the same durable fold and the same shared per-key
+# reconciliation the answerability verdict uses. Callers pass the crew's
+# already-read current-state line ("state: <s> · source: <src> · <detail>") so
+# this makes no reader call of its own.
+#
+# Triage asks a narrower question than answerability - "is this crew still
+# waiting on me right now" rather than "can this key still be answered" - but it
+# must never answer it with a DIFFERENT lifecycle rule, or the captain gets a
+# fleet view that contradicts what bin/fm-send.sh --resolve-key will accept. So
+# the supersession decision is the shared per-key one
+# (_fm_open_decisions_reconcile_active_run) verbatim: only an active run-step
+# plus a same-key progress witness retires a key, and rendered pane activity
+# never retires anything. Triage adds exactly ONE rule of its own on top, the
+# completion rule above, because a finished single-owner task has delivered its
+# report or PR and its stale records belong on the report pointer rather than in
+# a pending-decision list.
+status_open_decisions_for_triage() {  # <task-id> <status-file> <kind> <current-state-line>
+  local f=$2 kind=$3 current=$4 open state
+  open=$(status_open_decisions "$f")
+  [ -n "$open" ] || return 0
+  state=${current#state: }
+  state=${state%% *}
+  status_open_decisions_retired_by_completion "$kind" "$state" && return 0
+  _fm_open_decisions_reconcile_active_run "$f" "$open" "$current"
+}
+
 # Fleet-wide wrapper around status_open_decisions: scans every task's status
 # log under <state> and prefixes each still-open decision with its owning task
 # id, so a per-wake or per-session surface can print the consolidated open set
@@ -459,7 +767,7 @@ scan_open_decisions() {  # <state>
   for f in "$state"/*.status; do
     [ -e "$f" ] || continue
     task=$(basename "$f"); task="${task%.status}"
-    open=$(status_open_decisions "$f") || continue
+    open=$(status_open_decisions_for_task "$task" "$f") || continue
     [ -n "$open" ] || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -492,7 +800,13 @@ EOF
 # persisted open-set carries every still-open key forward across calls
 # regardless of how much new unrelated log content has since been folded in.
 #
-# The cursor format is `version`, `offset`, `ident`, then the folded open set.
+# The cursor format is `version`, `offset`, `ident`, `witness=<line-count>`,
+# that many witness-set lines, then the folded durable open set.
+# The witness set is the same fold with one extra transition - a progress line
+# stating a key drops that key - so the active-run lifecycle reconciliation is
+# answered from carried state instead of a whole-log re-read on every drain.
+# Both sets advance over the same bytes in one pass and are written together,
+# so they can never disagree about how far they have consumed.
 # FM_OPEN_DECISIONS_FOLD_VERSION must be bumped whenever
 # _fm_decision_fold_line semantics change, so persisted state from an older
 # interpretation is discarded and rebuilt from byte 0.
@@ -533,7 +847,7 @@ _fm_open_decisions_cursor_path() {  # <status-file>
   printf '%s/.%s.open-decisions-cursor' "$dir" "${base%.status}"
 }
 
-FM_OPEN_DECISIONS_FOLD_VERSION=4
+FM_OPEN_DECISIONS_FOLD_VERSION=5
 
 # Portable device:inode identity for the rotation/recreation check below.
 _fm_open_decisions_file_ident() {  # <file> -> "dev:inode", empty on I/O failure
@@ -574,10 +888,44 @@ _fm_status_read_span() {  # <status-file> <start-offset> <byte-length>
   ' "$f" "$start" "$length"
 }
 
-status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>]
-  local f=$1 captured_end=${2:-} cf offset ident open='' trusted_open='' cursor_data first rest offset_line ident_line
+# Publish one incremental fold's two results. The durable open set is printed
+# so every existing caller keeps working unchanged; both sets are also assigned
+# to globals, because a caller that needs the witness set cannot read a second
+# value out of a command substitution. Callers that want the witness set call
+# the fold DIRECTLY (not inside `$(...)`) and then read these.
+FM_OPEN_DECISIONS_OPEN=''
+FM_OPEN_DECISIONS_WITNESSED=''
+_fm_open_decisions_emit() {  # <open-set> <witness-set>
+  FM_OPEN_DECISIONS_OPEN=$1
+  FM_OPEN_DECISIONS_WITNESSED=$2
+  printf '%s' "$1"
+}
+
+# A status log this fold can SEE but cannot READ. The cursor deliberately stays
+# where it is - folding a partial read would be worse than folding nothing - so
+# the appends behind the failure are not folded yet, and a decision opened in
+# them is not yet known. Everything about that state must therefore
+# over-report, never under-report: the witness set is published EQUAL to the
+# durable set, so no key can be reported as run-superseded on evidence this
+# call could not read, and the failure is announced on stderr rather than being
+# indistinguishable from a quiet fleet. The nonzero return is part of the
+# contract: a caller must not treat a frozen fold as a successful one.
+FM_OPEN_DECISIONS_READ_FAILED=0
+_fm_open_decisions_read_failed() {  # <status-file> <carried-open-set>
+  FM_OPEN_DECISIONS_READ_FAILED=1
+  echo "warning: could not read $1 to fold its open decisions; its cursor stays where it is and every durable key is kept open" >&2
+  _fm_open_decisions_emit "$2" "$2"
+  return 1
+}
+
+status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>] [peek]
+  local f=$1 captured_end=${2:-} mode=${3:-} cf offset ident open='' witness=''
+  local trusted_open='' trusted_witness='' cursor_data rest header wcount i=0
   local version='' size actual_size cur_ident resolve held chunk_file chunk_size line cursor_dirty=0
-  local target_cursor
+  local target_cursor witness_count
+  FM_OPEN_DECISIONS_OPEN=''
+  FM_OPEN_DECISIONS_WITNESSED=''
+  FM_OPEN_DECISIONS_READ_FAILED=0
   [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 0
   cf=$(_fm_open_decisions_cursor_path "$f")
   offset=0
@@ -585,58 +933,68 @@ status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>]
   if [ -f "$cf" ] && [ -r "$cf" ] && [ ! -L "$cf" ]; then
     cursor_data=$(LC_ALL=C command cat "$cf" 2>/dev/null) || cursor_data=''
   fi
-  if [ -n "${cursor_data:-}" ]; then
-      first=${cursor_data%%$'\n'*}
-      case "$first" in
-        version=*)
-          version=${first#version=}
-          [ "$version" = "$FM_OPEN_DECISIONS_FOLD_VERSION" ] || version=''
-          rest=${cursor_data#*$'\n'}
-          offset_line=${rest%%$'\n'*}
-          case "$offset_line" in
-            offset=*) offset=${offset_line#offset=} ;;
-            *) offset=0; version='' ;;
-          esac
-          case "$offset" in
-            ''|*[!0-9]*) offset=0; version='' ;;
-            *)
-              case "$rest" in
-                *$'\n'*)
-                  rest=${rest#*$'\n'}
-                  ident_line=${rest%%$'\n'*}
-                  case "$ident_line" in
-                    ident=*)
-                      ident=${ident_line#ident=}
-                      case "$rest" in
-                        *$'\n'*) open=${rest#*$'\n'} ;;
-                      esac
-                      if [ -n "$version" ] && [ -n "$ident" ]; then trusted_open=$open; fi
-                      ;;
-                    *) offset=0; version='' ;;
-                  esac
-                  ;;
-                *) offset=0; version='' ;;
-              esac
-              ;;
-          esac
-          ;;
-      esac
+  # Cursor body, in order: version, offset, ident, witness=<line-count>, that
+  # many witness-set lines, then the durable open set. Both sets are folded
+  # over the SAME bytes in one pass below and persisted together, so they can
+  # never disagree about how far they have consumed. Any malformation drops
+  # straight through to a full re-fold from byte 0.
+  rest=${cursor_data:-}
+  while [ -n "$rest" ]; do
+    header=${rest%%$'\n'*}
+    case "$header" in
+      "version=$FM_OPEN_DECISIONS_FOLD_VERSION") ;;
+      *) break ;;
+    esac
+    case "$rest" in *$'\n'*) rest=${rest#*$'\n'} ;; *) break ;; esac
+    header=${rest%%$'\n'*}
+    case "$header" in offset=*) offset=${header#offset=} ;; *) offset=0; break ;; esac
+    case "$offset" in ''|*[!0-9]*) offset=0; break ;; esac
+    case "$rest" in *$'\n'*) rest=${rest#*$'\n'} ;; *) offset=0; break ;; esac
+    header=${rest%%$'\n'*}
+    case "$header" in ident=*) ident=${header#ident=} ;; *) offset=0; break ;; esac
+    [ -n "$ident" ] || { offset=0; break; }
+    case "$rest" in *$'\n'*) rest=${rest#*$'\n'} ;; *) offset=0; ident=''; break ;; esac
+    header=${rest%%$'\n'*}
+    case "$header" in witness=*) wcount=${header#witness=} ;; *) offset=0; ident=''; break ;; esac
+    case "$wcount" in ''|*[!0-9]*) offset=0; ident=''; break ;; esac
+    case "$rest" in *$'\n'*) rest=${rest#*$'\n'} ;; *) rest='' ;; esac
+    while [ "$i" -lt "$wcount" ]; do
+      [ -n "$rest" ] || { offset=0; ident=''; witness=''; break 2; }
+      witness="${witness}${rest%%$'\n'*}"$'\n'
+      case "$rest" in *$'\n'*) rest=${rest#*$'\n'} ;; *) rest='' ;; esac
+      i=$((i + 1))
+    done
+    version=$FM_OPEN_DECISIONS_FOLD_VERSION
+    open=$rest
+    trusted_open=$open
+    trusted_witness=$witness
+    break
+  done
+  if [ -z "$version" ]; then
+    offset=0
+    ident=''
+    open=''
+    witness=''
   fi
 
   # A stat/size-read failure is a genuine I/O error, not "the file is empty" -
-  # report the already-trusted persisted set unchanged rather than risking a
-  # silent invalidation that would wipe it.
-  cur_ident=$(_fm_open_decisions_file_ident "$f") || { printf '%s' "$trusted_open"; return 0; }
-  [ -n "$cur_ident" ] || { printf '%s' "$trusted_open"; return 0; }
+  # report the already-trusted persisted sets unchanged rather than risking a
+  # silent invalidation that would wipe them.
+  cur_ident=$(_fm_open_decisions_file_ident "$f") \
+    || { _fm_open_decisions_emit "$trusted_open" "$trusted_witness"; return 0; }
+  [ -n "$cur_ident" ] || { _fm_open_decisions_emit "$trusted_open" "$trusted_witness"; return 0; }
   actual_size=$(_fm_status_file_size "$f") \
-    || { printf '%s' "$trusted_open"; return 0; }
+    || { _fm_open_decisions_read_failed "$f" "$trusted_open"; return 1; }
   actual_size=${actual_size//[[:space:]]/}
-  case "$actual_size" in ''|*[!0-9]*) printf '%s' "$trusted_open"; return 0 ;; esac
+  case "$actual_size" in
+    ''|*[!0-9]*) _fm_open_decisions_read_failed "$f" "$trusted_open"; return 1 ;;
+  esac
   if [ -n "$captured_end" ]; then
     case "$captured_end" in
-      ''|*[!0-9]*) printf '%s' "$trusted_open"; return 0 ;;
+      ''|*[!0-9]*) _fm_open_decisions_emit "$trusted_open" "$trusted_witness"; return 0 ;;
     esac
-    [ "$captured_end" -le "$actual_size" ] || { printf '%s' "$trusted_open"; return 0; }
+    [ "$captured_end" -le "$actual_size" ] \
+      || { _fm_open_decisions_emit "$trusted_open" "$trusted_witness"; return 0; }
     size=$captured_end
   else
     size=$actual_size
@@ -645,46 +1003,96 @@ status_open_decisions_incremental() {  # <status-file> [<captured-end-offset>]
   if [ -z "$version" ] || [ -z "$ident" ] || [ "$ident" != "$cur_ident" ] || [ "$offset" -gt "$actual_size" ]; then
     offset=0
     open=''
+    witness=''
     trusted_open=''
+    trusted_witness=''
     cursor_dirty=1
+  fi
+
+  # The cursor is SHARED, and drains in one home are not serialized against each
+  # other while a presentation is in flight: another drain can commit this
+  # cursor past the endpoint this caller captured. The carried sets then
+  # describe MORE bytes than this caller is entitled to present, which is
+  # exactly what captured_end exists to prevent - a resolution beyond the
+  # endpoint would silently drop a key that is still open at it. Re-fold this
+  # caller's own window from byte 0 instead, and leave the cursor alone: the
+  # other drain's progress is real and rewinding it would only make it re-fold.
+  # Keep the carried sets as the read-failure fallback, which still names every
+  # key open as of the further offset rather than nothing.
+  if [ "$offset" -gt "$size" ]; then
+    offset=0
+    open=''
+    witness=''
+    mode=peek
   fi
 
   if [ "$offset" -lt "$size" ]; then
     chunk_file="$cf.read.$$"
     _fm_status_read_span "$f" "$offset" "$((size - offset))" > "$chunk_file" 2>/dev/null \
-      || { rm -f "$chunk_file"; printf '%s' "$trusted_open"; return 0; }
+      || { rm -f "$chunk_file"; _fm_open_decisions_read_failed "$f" "$trusted_open"; return 1; }
     chunk_size=$(LC_ALL=C wc -c < "$chunk_file" 2>/dev/null) \
-      || { rm -f "$chunk_file"; printf '%s' "$trusted_open"; return 0; }
+      || { rm -f "$chunk_file"; _fm_open_decisions_read_failed "$f" "$trusted_open"; return 1; }
     chunk_size=${chunk_size//[[:space:]]/}
     case "$chunk_size" in
-      ''|*[!0-9]*) rm -f "$chunk_file"; printf '%s' "$trusted_open"; return 0 ;;
+      ''|*[!0-9]*)
+        rm -f "$chunk_file"; _fm_open_decisions_read_failed "$f" "$trusted_open"; return 1 ;;
     esac
     # Test-only observability seam (off by default, no production behavior
     # change): when set, records exactly how many bytes THIS call folded, so a
     # test can assert the incremental path stays bounded by new appends rather
     # than re-reading the whole file, without relying on timing or source text.
+    # BOTH sets fold from this one read, so a bounded count here is a bounded
+    # count for the lifecycle reconciliation too.
     [ -n "${FM_OPEN_DECISIONS_READ_PROBE:-}" ] \
       && printf '%s\t%s\n' "$f" "$chunk_size" >> "$FM_OPEN_DECISIONS_READ_PROBE"
     resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
     held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
     while IFS= read -r line || [ -n "$line" ]; do
+      witness=$(_fm_decision_witness_fold_line "$witness" "$line" "$resolve" "$held")
       open=$(_fm_decision_fold_line "$open" "$line" "$resolve" "$held")
     done < "$chunk_file"
     rm -f "$chunk_file"
     offset=$size
     cursor_dirty=1
   fi
-  if [ "$cursor_dirty" -eq 1 ]; then
+  if [ "$cursor_dirty" -eq 1 ] && [ "$mode" != peek ]; then
     target_cursor="$cf.tmp.$$"
+    if [ -n "$witness" ]; then
+      case "$witness" in *$'\n') ;; *) witness="${witness}"$'\n' ;; esac
+    fi
+    witness_count=${witness//[!$'\n']/}
+    witness_count=${#witness_count}
     {
       printf 'version=%s\n' "$FM_OPEN_DECISIONS_FOLD_VERSION"
       printf 'offset=%s\n' "$offset"
       printf 'ident=%s\n' "$cur_ident"
+      printf 'witness=%s\n' "$witness_count"
+      if [ -n "$witness" ]; then printf '%s' "$witness"; fi
       if [ -n "$open" ]; then printf '%s' "$open"; fi
     } > "$target_cursor" || return 1
     mv -f "$target_cursor" "$cf" || return 1
   fi
-  printf '%s' "$open"
+  _fm_open_decisions_emit "$open" "$witness"
+}
+
+# Incremental counterpart to status_open_decisions_for_task. One cursor-backed
+# fold advances BOTH the durable set and its witness set over the same new
+# bytes, and the shared per-key rule then reconciles them - so this path reads
+# only what was appended since the last drain and never re-folds the whole log.
+# The supersession itself is still not a durable event: the witness set records
+# only that a same-key progress line was seen, so when the run parks the
+# current-state gate stops firing and the durable decision surfaces again
+# without any synthetic status event.
+status_open_decisions_incremental_for_task() {  # <task-id> <status-file> [<captured-end-offset>]
+  local task=$1 f=$2 captured_end=${3:-} open witnessed current
+  if ! status_open_decisions_incremental "$f" "$captured_end" >/dev/null; then
+    [ "$FM_OPEN_DECISIONS_READ_FAILED" = 1 ] || return 1
+  fi
+  open=$FM_OPEN_DECISIONS_OPEN
+  witnessed=$FM_OPEN_DECISIONS_WITNESSED
+  [ -n "$open" ] || return 0
+  current=$(status_task_run_state "$task" "$f")
+  _fm_open_decisions_keep_witnessed "$open" "$witnessed" "$current"
 }
 
 # Incremental sibling of scan_open_decisions: same fleet-wide directory walk and
@@ -697,7 +1105,7 @@ scan_open_decisions_incremental() {  # <state>
   for f in "$state"/*.status; do
     [ -e "$f" ] || continue
     task=$(basename "$f"); task="${task%.status}"
-    open=$(status_open_decisions_incremental "$f") || continue
+    open=$(status_open_decisions_incremental_for_task "$task" "$f") || continue
     [ -n "$open" ] || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -895,7 +1303,7 @@ scan_open_decisions_snapshot() {  # <state> <task-and-endpoint-snapshot>
   while IFS=$(printf '\t') read -r task endpoint ident; do
     [ -n "$task" ] || continue
     f="$state/$task.status"
-    open=$(status_open_decisions_incremental "$f" "$endpoint") || return 1
+    open=$(status_open_decisions_incremental_for_task "$task" "$f" "$endpoint") || return 1
     [ -n "$open" ] || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -935,7 +1343,7 @@ EOF
 # a caller explicitly requests a migration snapshot.
 status_open_decisions_cursor_offset() {  # <status-file>
   local f=$1 cf offset=0 ident='' version='' cursor_data first rest open=''
-  local offset_line ident_line cur_ident size
+  local offset_line ident_line cur_ident size snapshot_witness witness_line witness_skip
   [ -f "$f" ] && [ -r "$f" ] && [ ! -L "$f" ] || return 1
   cf=$(_fm_open_decisions_cursor_path "$f")
   if [ -e "$cf" ] || [ -L "$cf" ]; then
@@ -963,6 +1371,26 @@ status_open_decisions_cursor_offset() {  # <status-file>
                     ident=*)
                       ident=${ident_line#ident=}
                       case "$rest" in *$'\n'*) open=${rest#*$'\n'} ;; esac
+                      # A current-version cursor carries its witness set ahead
+                      # of the durable set; this reader wants only the durable
+                      # region, so skip the header and the lines it counts.
+                      witness_line=${open%%$'\n'*}
+                      case "$witness_line" in
+                        witness=*)
+                          witness_skip=${witness_line#witness=}
+                          case "$witness_skip" in
+                            ''|*[!0-9]*) offset=0; version='' ;;
+                            *)
+                              case "$open" in *$'\n'*) open=${open#*$'\n'} ;; *) open='' ;; esac
+                              while [ "$witness_skip" -gt 0 ]; do
+                                case "$open" in *$'\n'*) open=${open#*$'\n'} ;; *) open='' ;; esac
+                                witness_skip=$((witness_skip - 1))
+                              done
+                              ;;
+                          esac
+                          ;;
+                        *) offset=0; version='' ;;
+                      esac
                       ;;
                     *) offset=0; version='' ;;
                   esac
@@ -987,11 +1415,20 @@ status_open_decisions_cursor_offset() {  # <status-file>
     open=''
   fi
   if [ -n "${FM_STATUS_CURSOR_SNAPSHOT_FILE:-}" ]; then
+    # This legacy reader knows the durable set only, so the migrated cursor
+    # records the witness set as EQUAL to it: nothing witnessed, therefore
+    # nothing superseded, which is the fail-open direction. The next fold over
+    # new bytes advances both sets normally from there.
+    if [ -n "$open" ]; then
+      case "$open" in *$'\n') ;; *) open="${open}"$'\n' ;; esac
+    fi
+    snapshot_witness=${open//[!$'\n']/}
     {
       printf 'version=%s\n' "$FM_OPEN_DECISIONS_FOLD_VERSION"
       printf 'offset=%s\n' "$offset"
       printf 'ident=%s\n' "$cur_ident"
-      if [ -n "$open" ]; then printf '%s' "$open"; fi
+      printf 'witness=%s\n' "${#snapshot_witness}"
+      if [ -n "$open" ]; then printf '%s%s' "$open" "$open"; fi
     } > "$FM_STATUS_CURSOR_SNAPSHOT_FILE" || return 1
   fi
   printf '%s' "$offset"
@@ -1194,8 +1631,13 @@ signal_reason_is_actionable() {  # <file> ...
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crew
 # that appended paused: but then STARTED a run reports working, never paused.
-# NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so callers
-# run it only on no-verb signal and first-sighting stale paths, never every wake.
+# NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so a
+# caller must have a reason to pay for it. This absorb path runs it only on
+# no-verb signal and first-sighting stale paths. The one sanctioned every-wake
+# caller is status_task_run_state_prefetch, which the open-decisions
+# answerability verdict needs and which pays that cost once per drain, only for
+# a local ship task that actually holds an open keyed decision, and only outside
+# the fleet-wide presentation lock.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_absorb_class() {  # <id>
   local id=$1 line state src

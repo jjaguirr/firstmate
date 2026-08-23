@@ -665,8 +665,10 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
       "$kind brief still instructs the default paused status"
     assert_grep 'a blocker or wait clears' "$brief" \
       "$kind brief did not require durable resolution when a blocker clears"
-    assert_grep 'even when the answer is what started that work' "$brief" \
-      "$kind brief did not warn that an answer-started done/working never closes a decision"
+    assert_grep 'unkeyed or other-key' "$brief" \
+      "$kind brief did not warn that an unkeyed or other-key progress line never closes a decision"
+    assert_grep "only while this task's no-mistakes run is actively working" "$brief" \
+      "$kind brief did not bound same-key supersession to an actively working run"
   done
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }

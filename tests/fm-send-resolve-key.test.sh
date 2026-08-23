@@ -106,6 +106,73 @@ drain_out() {  # <home>
   FM_STATE_OVERRIDE="$1/state" "$DRAIN" 2>/dev/null
 }
 
+# The classifier consumes fm-crew-state's stable public line, so this narrow
+# fixture lets the public send and drain interfaces share a current run-step
+# verdict without manufacturing a second decision parser in either test.
+make_decision_state_reader() {  # <dir> -> echoes executable path
+  local reader="$1/fake-decision-crew-state.sh"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${FM_FAKE_DECISION_CURRENT:-state: unknown · source: none}"
+SH
+  chmod +x "$reader"
+  printf '%s\n' "$reader"
+}
+
+run_send_with_current_state() {  # <fakebin> <home> <send-log> <reader> <fm-send args...>
+  local fb=$1 home=$2 log=$3 reader=$4
+  shift 4
+  : > "$log"
+  env PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_CREW_STATE_BIN="$reader" \
+    "$SEND" "$@" 2>/dev/null
+}
+
+# Same as run_send_with_current_state but keeps fm-send's stderr in <err-file>,
+# for the legs that assert WHY a key was refused.
+run_send_with_current_state_err() {  # <fakebin> <home> <send-log> <reader> <err-file> <fm-send args...>
+  local fb=$1 home=$2 log=$3 reader=$4 err=$5
+  shift 5
+  : > "$log"
+  env PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_CREW_STATE_BIN="$reader" \
+    "$SEND" "$@" 2>"$err"
+}
+
+drain_out_with_current_state() {  # <home> <reader> [<fakebin>]
+  local home=$1 reader=$2 fakebin=${3:-}
+  if [ -n "$fakebin" ]; then
+    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$home/state" FM_CREW_STATE_BIN="$reader" "$DRAIN" 2>/dev/null
+  else
+    FM_STATE_OVERRIDE="$home/state" FM_CREW_STATE_BIN="$reader" "$DRAIN" 2>/dev/null
+  fi
+}
+
+setup_hold_home() {  # <name> -> echoes a minimal tasks-axi-backed home
+  local home
+  home=$(setup_home "$1")
+  mkdir -p "$home/data" "$home/config" "$home/projects"
+  cp "$ROOT/.tasks.toml" "$home/.tasks.toml"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+
+## Done
+EOF
+  printf '%s\n' "$home"
+}
+
+run_decision_hold() {  # <home> <command args...>
+  local home=$1
+  shift
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
+    "$ROOT/bin/fm-decision-hold.sh" "$@"
+}
+
 test_answer_send_closes_open_decision() {
   local dir fb log home rc out
   dir="$TMP_ROOT/closes"; mkdir -p "$dir"
@@ -130,6 +197,274 @@ test_answer_send_closes_open_decision() {
     fail "the answered decision still lists as open: $out"
   fi
   pass "fm-send --resolve-key: the answer send itself closes the open decision"
+}
+
+# The real public interfaces must agree on the same fixture at each state:
+# durable open, explicit resolution, and per-key active-run supersession. With
+# a real fm-crew-state over a fake no-mistakes run, a decision the crew
+# progressed past is neither presented nor answerable while the run works (and
+# the refusal names the run, not a typo), a blocker raised mid-run stays both
+# presented and answerable, and the superseded key returns through both
+# surfaces once the same run parks.
+test_send_and_drain_share_open_resolved_and_run_superseded_verdicts() {
+  local dir fb log home reader out rc worktree head err
+  dir="$TMP_ROOT/shared-verdicts"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
+  reader=$(make_decision_state_reader "$dir")
+  home=$(setup_home shared-verdicts)
+  fm_write_meta "$home/state/open.meta" "window=sess:fm-open" "kind=ship"
+  printf 'needs-decision [key=api-shape]: pick REST or RPC\n' > "$home/state/open.status"
+
+  FM_FAKE_DECISION_CURRENT='state: parked · source: run-step · awaiting answer'
+  export FM_FAKE_DECISION_CURRENT
+  out=$(drain_out_with_current_state "$home" "$reader")
+  printf '%s' "$out" | grep -F 'open [key=api-shape] needs-decision: pick REST or RPC' >/dev/null \
+    || fail "precondition: drain did not surface the durable open key: $out"
+  run_send_with_current_state "$fb" "$home" "$log" "$reader" open --resolve-key api-shape "use REST"; rc=$?
+  expect_code 0 "$rc" "the same open key listed by drain should be answerable by fm-send"
+  grep -F 'resolved [key=api-shape]: answered: use REST' "$home/state/open.status" >/dev/null \
+    || fail "fm-send did not write the supported durable resolution"
+
+  out=$(drain_out_with_current_state "$home" "$reader")
+  [ -z "$out" ] || fail "an explicitly resolved key still surfaced in drain: $out"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" open --resolve-key api-shape "duplicate"; rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-send accepted a key after its durable resolution"
+  [ ! -s "$log" ] || fail "fm-send typed a duplicate answer for a resolved key: $(cat "$log")"
+  grep -F 'already closed or mistyped' "$err" >/dev/null \
+    || fail "a durably closed key was not refused as closed or mistyped: $(cat "$err")"
+  unset FM_FAKE_DECISION_CURRENT
+
+  worktree="$dir/resumed-worktree"
+  fm_git_identity fmtest fmtest@example.invalid
+  git init -q "$worktree"
+  git -C "$worktree" commit -q --allow-empty -m init
+  git -C "$worktree" checkout -q -b fm/resumed
+  head=$(git -C "$worktree" rev-parse HEAD)
+  cat > "$fb/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}:${2:-}" in
+  axi:status) printf '%s\n' "${FM_FAKE_AXI_STATUS:-}" ;;
+esac
+SH
+  chmod +x "$fb/no-mistakes"
+  fm_write_meta "$home/state/resumed.meta" "window=sess:fm-resumed" "kind=ship" "worktree=$worktree"
+  {
+    printf 'needs-decision [key=rollout]: choose the deployment path\n'
+    printf 'needs-decision [key=schema]: pick the schema\n'
+    printf 'working [key=rollout]: resumed validation after the rollout answer\n'
+    printf 'working [key=tests]: adding coverage while waiting\n'
+    printf 'working: keyless routine note\n'
+    printf 'blocked [key=creds]: need the staging secret\n'
+  } > "$home/state/resumed.status"
+  FM_FAKE_AXI_STATUS=$(cat <<EOF
+run:
+  id: "01RUN"
+  branch: fm/resumed
+  status: ci
+  head: "$head"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    ci,running,0,0
+EOF
+)
+  export FM_FAKE_AXI_STATUS
+  out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
+  if printf '%s' "$out" | grep -F '[key=rollout]' >/dev/null; then
+    fail "drain presented a decision superseded by an active run-step: $out"
+  fi
+  printf '%s' "$out" | grep -F 'resumed [key=creds] blocked: need the staging secret' >/dev/null \
+    || fail "drain hid a blocker raised mid-run under an active run-step: $out"
+  printf '%s' "$out" | grep -F 'resumed [key=schema] needs-decision: pick the schema' >/dev/null \
+    || fail "drain let unrelated or keyless progress lines supersede an untouched key: $out"
+
+  run_send_with_current_state_err "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" "$err" resumed --resolve-key rollout "phase it"; rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-send accepted a key superseded by an active run-step"
+  [ ! -s "$log" ] || fail "fm-send typed a superseded answer: $(cat "$log")"
+  if grep -F 'resolved [key=rollout]' "$home/state/resumed.status" >/dev/null; then
+    fail "fm-send wrote a resolution for a non-answerable superseded key: $(cat "$home/state/resumed.status")"
+  fi
+  grep -F 'still recorded as open' "$err" >/dev/null \
+    || fail "the superseded refusal did not say the key is durably open: $(cat "$err")"
+  grep -F 'state: working · source: run-step' "$err" >/dev/null \
+    || fail "the superseded refusal did not name the active run as the cause: $(cat "$err")"
+  if grep -F 'already closed or mistyped' "$err" >/dev/null; then
+    fail "a superseded key was mislabeled as closed or mistyped: $(cat "$err")"
+  fi
+
+  run_send_with_current_state "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" resumed --resolve-key creds "use the vault secret"; rc=$?
+  expect_code 0 "$rc" "a blocker raised mid-run should stay answerable under an active run-step"
+  grep -F 'use the vault secret' "$log" >/dev/null || fail "the mid-run blocker answer was not delivered: $(cat "$log")"
+  grep -F 'resolved [key=creds]: answered: use the vault secret' "$home/state/resumed.status" >/dev/null \
+    || fail "fm-send did not close the mid-run blocker it answered"
+  run_send_with_current_state "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" resumed --resolve-key schema "use the flat schema"; rc=$?
+  expect_code 0 "$rc" "a key followed only by unrelated progress lines should stay answerable under an active run-step"
+  grep -F 'resolved [key=schema]: answered: use the flat schema' "$home/state/resumed.status" >/dev/null \
+    || fail "fm-send did not close the untouched key it answered"
+  out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
+  [ -z "$out" ] || fail "drain still presented a key after the mid-run answers under an active run: $out"
+
+  FM_FAKE_AXI_STATUS=$(cat <<EOF
+run:
+  id: "01RUN"
+  branch: fm/resumed
+  status: awaiting_approval
+  head: "$head"
+  pr: "https://github.com/o/r/pull/2"
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    review,awaiting_approval,1,0
+EOF
+)
+  export FM_FAKE_AXI_STATUS
+  out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
+  printf '%s' "$out" | grep -F 'resumed [key=rollout] needs-decision: choose the deployment path' >/dev/null \
+    || fail "the durable decision did not return through drain once the run parked: $out"
+  run_send_with_current_state "$fb" "$home" "$log" "$ROOT/bin/fm-crew-state.sh" resumed --resolve-key rollout "phase it"; rc=$?
+  expect_code 0 "$rc" "the durable decision should be answerable again once the run parked"
+  grep -F 'resolved [key=rollout]: answered: phase it' "$home/state/resumed.status" >/dev/null \
+    || fail "fm-send did not append the supported closing event for the durably open key"
+  out=$(drain_out_with_current_state "$home" "$ROOT/bin/fm-crew-state.sh" "$fb")
+  [ -z "$out" ] || fail "drain still presented a key after every decision was resolved: $out"
+  unset FM_FAKE_AXI_STATUS
+  pass "fm-send and OPEN DECISIONS agree per key for durable open, resolved, run-superseded, mid-run, and re-parked states"
+}
+
+# When the status re-read behind the active-run reconciliation fails, both
+# public interfaces keep the durable key: drain still presents it and fm-send
+# still answers and closes it, with the failure reported rather than hidden.
+# The drain's own presentation reads precede the fold, so the fake span reader
+# serves those honestly and fails only the reconciliation's re-read (the third
+# and last span read of a drain, the first of an fm-send); the surfaced warning
+# proves that read is the one that failed.
+test_send_keeps_a_key_open_when_the_reconcile_re_read_fails() {
+  local dir fb log home reader span calls out rc err
+  dir="$TMP_ROOT/reconcile-read-failure"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
+  reader=$(make_decision_state_reader "$dir")
+  span="$dir/flaky-span-reader"
+  calls="$dir/span-calls"
+  cat > "$span" <<'SH'
+#!/usr/bin/env bash
+set -u
+n=$(( $(cat "$FM_FAKE_SPAN_CALLS" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" > "$FM_FAKE_SPAN_CALLS"
+[ "$n" -ne "${FM_FAKE_SPAN_FAIL_CALL:-1}" ] || exit 1
+tail -c +$(( $2 + 1 )) "$1" | head -c "$3"
+SH
+  chmod +x "$span"
+  home=$(setup_home reconcile-read-failure)
+  fm_write_meta "$home/state/flaky.meta" "window=sess:fm-flaky" "kind=ship"
+  printf 'needs-decision [key=rollout]: choose the deployment path\nworking [key=rollout]: resumed\n' > "$home/state/flaky.status"
+  FM_FAKE_DECISION_CURRENT='state: working · source: run-step · ci running'
+  export FM_FAKE_DECISION_CURRENT
+
+  out=$(drain_out_with_current_state "$home" "$reader")
+  [ -z "$out" ] || fail "precondition: a readable log did not supersede the witnessed key: $out"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" flaky --resolve-key rollout "phase it"; rc=$?
+  [ "$rc" -ne 0 ] || fail "precondition: fm-send answered a superseded key"
+
+  # The drain path answers this from state carried in its own cursor, so it has
+  # no re-read to fail; a read failure there preserves both folded sets instead
+  # (tests/fm-wake-drain-open-decisions.test.sh owns that leg). fm-send is a
+  # one-shot caller that folds the whole log for its durable set anyway, so it
+  # is the surface that still re-reads - and it must fail OPEN, keeping the key
+  # answerable and saying why.
+  FM_STATUS_SPAN_READER="$span" FM_FAKE_SPAN_CALLS="$calls"
+  export FM_STATUS_SPAN_READER FM_FAKE_SPAN_CALLS
+  : > "$calls"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" flaky --resolve-key rollout "phase it"; rc=$?
+  expect_code 0 "$rc" "fm-send should keep a durable key answerable when its reconcile re-read fails"
+  grep -F 'phase it' "$log" >/dev/null || fail "the answer was not delivered: $(cat "$log")"
+  grep -F 'resolved [key=rollout]: answered: phase it' "$home/state/flaky.status" >/dev/null \
+    || fail "fm-send did not append the supported closing event after the re-read failure"
+  grep -F 'could not re-read' "$err" >/dev/null || fail "fm-send hid the re-read failure: $(cat "$err")"
+  unset FM_STATUS_SPAN_READER FM_FAKE_SPAN_CALLS FM_FAKE_DECISION_CURRENT
+  pass "fm-send keeps a key answerable and says why when its reconcile re-read fails"
+}
+
+# fm-send must agree with drain on a reserved key that a foreign same-key
+# progress line tried to witness: it is still open, so the answer is delivered
+# rather than refused as superseded. And a key whose durable set is empty is
+# refused as closed without ever paying for the current-state read.
+test_send_keeps_reserved_keys_answerable_and_skips_state_reads_for_empty_sets() {
+  local dir fb log home reader calls out rc err
+  dir="$TMP_ROOT/reserved-and-empty"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"; err="$dir/send.err"
+  reader="$dir/counting-crew-state.sh"
+  calls="$dir/crew-state-calls"
+  cat > "$reader" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$FM_FAKE_CREW_STATE_CALLS"
+printf 'state: working · source: run-step · ci running\n'
+SH
+  chmod +x "$reader"
+  home=$(setup_home reserved-and-empty)
+  fm_write_meta "$home/state/parent.meta" "window=sess:fm-parent" "kind=ship"
+  {
+    printf 'blocked [key=pending-reply-abcdef0123456789]: pending-reply-missed: task=ios pending-reply-id=abcdef0123456789 request=ship it\n'
+    printf 'working [key=pending-reply-abcdef0123456789]: retrying delivery\n'
+  } > "$home/state/parent.status"
+  fm_write_meta "$home/state/settled.meta" "window=sess:fm-settled" "kind=ship"
+  printf 'needs-decision [key=gone]: pick one\nresolved [key=gone]: picked\n' > "$home/state/settled.status"
+  export FM_FAKE_CREW_STATE_CALLS="$calls"
+
+  out=$(FM_STATE_OVERRIDE="$home/state" FM_CREW_STATE_BIN="$reader" "$DRAIN" 2>/dev/null)
+  printf '%s' "$out" | grep -F 'parent [key=pending-reply-abcdef0123456789] blocked:' >/dev/null \
+    || fail "drain superseded a reserved key on a foreign progress line: $out"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" parent --resolve-key pending-reply-abcdef0123456789 "resend it"; rc=$?
+  expect_code 0 "$rc" "a reserved key drain still lists must stay answerable by fm-send"
+  grep -F 'resend it' "$log" >/dev/null || fail "the reserved-key answer was not delivered: $(cat "$log")"
+  if grep -F 'superseded' "$err" >/dev/null; then
+    fail "fm-send called a reserved key superseded: $(cat "$err")"
+  fi
+
+  : > "$calls"
+  run_send_with_current_state_err "$fb" "$home" "$log" "$reader" "$err" settled --resolve-key gone "again"; rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-send answered a durably resolved key"
+  [ ! -s "$log" ] || fail "fm-send typed an answer for a resolved key: $(cat "$log")"
+  grep -F 'already closed or mistyped' "$err" >/dev/null \
+    || fail "a durably closed key was not refused as closed or mistyped: $(cat "$err")"
+  [ ! -s "$calls" ] || fail "fm-send read the current state for an empty durable set: $(cat "$calls")"
+  unset FM_FAKE_CREW_STATE_CALLS
+  pass "fm-send keeps a reserved key answerable and skips the state read for an empty durable set"
+}
+
+# A transferred decision is deliberately absent from the status presentation:
+# its active captain hold is now the only durable owner. The same real send
+# closes that hold, while drain never resurrects the already-transferred status
+# copy as an OPEN DECISION.
+test_send_and_drain_preserve_transferred_captain_holds() {
+  local dir fb log home reader out rc show
+  command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found (transferred-hold agreement not verified)"; return; }
+  dir="$TMP_ROOT/transferred-hold"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  reader=$(make_decision_state_reader "$dir")
+  home=$(setup_hold_home transferred-hold)
+  (cd "$home" && tasks-axi add origin "Review the sample route" --kind ship --repo sample --start) >/dev/null \
+    || fail "could not create the transferred-hold origin"
+  fm_write_meta "$home/state/origin.meta" "window=sess:fm-origin" "kind=ship"
+  printf 'needs-decision [key=route]: choose route north or route south\n' > "$home/state/origin.status"
+  run_decision_hold "$home" hold origin route --title "Choose the sample route" \
+    --reason "captain route choice pending" --repo sample >/dev/null \
+    || fail "could not create a captain hold for the transferred decision"
+  run_decision_hold "$home" complete origin route >/dev/null \
+    || fail "could not transfer the status decision to its captain hold"
+  grep -F 'captain-held [key=route]' "$home/state/origin.status" >/dev/null \
+    || fail "precondition: transfer did not close the status ledger copy"
+
+  out=$(drain_out_with_current_state "$home" "$reader")
+  [ -z "$out" ] || fail "drain resurrected a transferred status decision: $out"
+  run_send_with_current_state "$fb" "$home" "$log" "$reader" origin --resolve-key route "choose north"; rc=$?
+  expect_code 0 "$rc" "fm-send should resolve an active transferred captain hold"
+  show=$(cd "$home" && tasks-axi show origin-decision-route --full)
+  assert_contains "$show" 'state: done' "chat answer did not close the transferred captain hold"
+  assert_contains "$show" 'Resolution mode: answered' "transferred hold missed the shared answer-time close path"
+  out=$(drain_out_with_current_state "$home" "$reader")
+  [ -z "$out" ] || fail "drain presented a transferred-and-resolved decision: $out"
+  pass "fm-send and OPEN DECISIONS preserve one-owner transferred captain holds"
 }
 
 # The answerer's close is this home's own bookkeeping: it must not re-wake the
@@ -497,6 +832,10 @@ test_flag_misuse_refuses() {
 }
 
 test_answer_send_closes_open_decision
+test_send_and_drain_share_open_resolved_and_run_superseded_verdicts
+test_send_keeps_a_key_open_when_the_reconcile_re_read_fails
+test_send_keeps_reserved_keys_answerable_and_skips_state_reads_for_empty_sets
+test_send_and_drain_preserve_transferred_captain_holds
 test_answer_close_is_self_announced
 test_colon_first_key_position_is_answerable
 test_answer_starts_work_never_orphans

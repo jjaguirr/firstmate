@@ -347,6 +347,231 @@ test_previous_fold_cache_is_refolded_under_current_semantics() {
   pass "an old fold cache is rebuilt once before same-version incremental reads resume"
 }
 
+# A lifecycle reconciliation must not mutate the durable cursor's open set.
+# When an active run starts, a decision the crew progressed past disappears
+# immediately even without a new status byte, a blocker appended mid-run still
+# surfaces through the same cursor, and when the run parks again the old
+# durable decision returns without a synthetic resolved/reopen event.
+test_run_step_supersession_preserves_the_incremental_durable_set() {
+  local dir state fakebin status out cursor before after
+  dir=$(make_case cursor-run-step-supersession)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  status="$state/task8.status"
+  out="$dir/drain.out"
+  cursor="$state/.task8.open-decisions-cursor"
+  fm_write_meta "$state/task8.meta" "window=sess:fm-task8" "kind=ship"
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+  printf 'working [key=rollout]: resumed validation after the rollout answer\n' >> "$status"
+
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "initial drain before run supersession failed"
+  grep -F 'task8 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "precondition: the durable decision did not surface"
+  before=$(LC_ALL=C cksum "$cursor")
+
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain during active run supersession failed"
+  [ ! -s "$out" ] || fail "a superseded decision still surfaced: $(cat "$out")"
+  after=$(LC_ALL=C cksum "$cursor")
+  [ "$after" = "$before" ] \
+    || fail "run supersession rewrote the durable cursor instead of only reconciling its presentation"
+
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$status"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after a mid-run blocker append failed"
+  grep -F 'task8 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "a blocker appended mid-run did not surface through the cursor: $(cat "$out")"
+  if grep -F '[key=rollout]' "$out" >/dev/null; then
+    fail "the superseded decision resurfaced alongside the mid-run blocker: $(cat "$out")"
+  fi
+
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting captain decision' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after the run parked failed"
+  grep -F 'task8 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "the durable decision did not re-surface after the run parked: $(cat "$out")"
+  grep -F 'task8 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "the mid-run blocker vanished once the run parked: $(cat "$out")"
+  pass "run-step supersession leaves the cursor-backed durable decisions available and per key"
+}
+
+# The active-run supersession verdict must be delta-bounded like the durable
+# fold it rides on: the witness set lives in the same cursor, so a long-lived
+# task whose run is actively working must never re-read its whole status log to
+# decide that a key was witnessed. Each round appends a small increment to an
+# ever-growing log and asserts the read-probe recorded exactly that increment,
+# while the verdict stays correct throughout.
+test_run_supersession_reads_only_new_appends_across_drains() {
+  local dir state fakebin status out probe round increment_bytes probe_bytes total_size bootstrap_bytes
+  dir=$(make_case cursor-witness-boundedness)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  status="$state/task9.status"
+  out="$dir/drain.out"
+  probe="$dir/probe.tsv"
+  : > "$probe"
+  fm_write_meta "$state/task9.meta" "window=sess:fm-task9" "kind=ship"
+
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+  printf 'working [key=rollout]: resumed validation after the rollout answer\n' >> "$status"
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$status"
+  append_filler "$status" 400 >/dev/null
+
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "bootstrap drain over a large witnessed log failed"
+  grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "the unwitnessed blocker did not surface on the bootstrap drain: $(cat "$out")"
+  if grep -F '[key=rollout]' "$out" >/dev/null; then
+    fail "the witnessed key was not superseded on the bootstrap drain: $(cat "$out")"
+  fi
+  bootstrap_bytes=$(last_probe_bytes "$probe" "$status")
+  [ -n "$bootstrap_bytes" ] && [ "$bootstrap_bytes" -gt 0 ] \
+    || fail "the bootstrap drain recorded no read at all"
+
+  for round in 1 2 3 4 5; do
+    increment_bytes=$(append_filler "$status" 20)
+    FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+      FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" \
+      FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+      || fail "drain $round over a growing witnessed log failed"
+    grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+      || fail "the unwitnessed blocker was dropped on growth round $round: $(cat "$out")"
+    if grep -F '[key=rollout]' "$out" >/dev/null; then
+      fail "the witnessed key resurfaced on growth round $round: $(cat "$out")"
+    fi
+    probe_bytes=$(last_probe_bytes "$probe" "$status")
+    [ "$probe_bytes" = "$increment_bytes" ] \
+      || fail "round $round read $probe_bytes bytes, expected exactly this round's $increment_bytes-byte increment (the supersession verdict is not delta-bounded)"
+  done
+  total_size=$(LC_ALL=C wc -c < "$status" | tr -d '[:space:]')
+  [ "$total_size" -gt "$bootstrap_bytes" ] \
+    || fail "test setup error: the log never grew past its bootstrap size"
+
+  # A same-key progress line appended LATER must still witness the blocker,
+  # folded from the increment alone.
+  increment_bytes=$(printf 'working [key=creds]: retrying with the cached token\n' | tee -a "$status" | LC_ALL=C wc -c | tr -d '[:space:]')
+  FM_FAKE_CREW_STATE='state: working · source: run-step · ci running' \
+    FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after the late same-key progress line failed"
+  [ ! -s "$out" ] || fail "a key witnessed by a late progress line stayed presented: $(cat "$out")"
+  probe_bytes=$(last_probe_bytes "$probe" "$status")
+  [ "$probe_bytes" = "$increment_bytes" ] \
+    || fail "the witnessing drain read $probe_bytes bytes instead of the $increment_bytes-byte append"
+
+  # And the durable records are intact: parking the run brings both back.
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting captain decision' \
+    FM_STATE_OVERRIDE="$state" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain after the run parked failed"
+  grep -F 'task9 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "the durable decision did not return once the run parked: $(cat "$out")"
+  grep -F 'task9 [key=creds] blocked: need the staging secret' "$out" >/dev/null \
+    || fail "the durable blocker did not return once the run parked: $(cat "$out")"
+  pass "run-step supersession folds only new appends across successive drains"
+}
+
+# The prefetch that warms the crew-state verdicts before the presentation lock
+# folds the same cursor the in-lock scan reads, so it commits: each task's new
+# appends are read, span-copied and folded ONCE per drain, not once per surface.
+# The probe records one line per fold, so counting its lines for this drain is
+# the direct evidence.
+test_each_delta_is_folded_once_per_drain() {
+  local dir state fakebin status out probe folds increment_bytes probe_bytes
+  dir=$(make_case cursor-single-fold)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  status="$state/task10.status"
+  out="$dir/drain.out"
+  probe="$dir/probe.tsv"
+  fm_write_meta "$state/task10.meta" "window=sess:fm-task10" "kind=ship"
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+
+  # Bootstrap: no fleet presentation manifest exists yet, so the prefetch may
+  # not move a cursor the unread surface still seeds from.
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "bootstrap drain failed"
+  grep -F 'task10 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "precondition: the decision did not surface: $(cat "$out")"
+  [ -f "$state/.status-presentation-cursor" ] \
+    || fail "precondition: the bootstrap drain did not commit a fleet presentation manifest"
+
+  : > "$probe"
+  increment_bytes=$(append_filler "$status" 20)
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review' \
+    FM_STATE_OVERRIDE="$state" FM_OPEN_DECISIONS_READ_PROBE="$probe" \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "steady-state drain failed"
+  grep -F 'task10 [key=rollout] needs-decision: choose the deployment path' "$out" >/dev/null \
+    || fail "the decision stopped surfacing on the steady-state drain: $(cat "$out")"
+  folds=$(grep -Fc "$(printf '%s\t' "$status")" "$probe")
+  [ "$folds" = 1 ] \
+    || fail "the drain folded this task's delta $folds times, expected exactly 1: $(cat "$probe")"
+  probe_bytes=$(last_probe_bytes "$probe" "$status")
+  [ "$probe_bytes" = "$increment_bytes" ] \
+    || fail "the single fold read $probe_bytes bytes, expected this round's $increment_bytes-byte increment"
+
+  # An unread informational line must still reach the UNREAD surface: the
+  # prefetch commits the open-decisions cursor, never the presentation manifest.
+  printf 'note: the staging secret was rotated\n' >> "$status"
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at review' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" "$DRAIN" > "$out" \
+    || fail "drain over a new informational line failed"
+  grep -F 'the staging secret was rotated' "$out" >/dev/null \
+    || fail "committing the open-decisions cursor before the lock swallowed an unread answer: $(cat "$out")"
+  pass "each task's delta is folded exactly once per drain and unread status still surfaces"
+}
+
+# The open-decisions cursor is SHARED, and drains in one home are not serialized
+# against each other: the prefetch commits it before taking the presentation
+# lock, so a second drain (the supervise daemon plus a manual drain, say) can
+# advance it past the endpoint a first drain already captured. The carried sets
+# then describe more bytes than that first drain may present, and a resolution
+# among them would silently drop a key that is still open at its endpoint - the
+# blocker-hiding failure class this whole change exists to remove. Two separate
+# processes here, mirroring the two drains.
+test_a_cursor_ahead_of_this_snapshot_refolds_to_the_captured_endpoint() {
+  local dir state status cursor s1 out before after
+  dir=$(make_case cursor-ahead-of-snapshot)
+  state="$dir/state"
+  status="$state/task11.status"
+  cursor="$state/.task11.open-decisions-cursor"
+
+  printf 'needs-decision [key=rollout]: choose the deployment path\n' > "$status"
+  s1=$(LC_ALL=C wc -c < "$status" | tr -d '[:space:]')
+  # Everything below is appended AFTER the first drain captured its endpoint at
+  # s1, so none of it belongs in that drain's presentation.
+  printf 'resolved [key=rollout]: went with REST\n' >> "$status"
+  printf 'blocked [key=creds]: need the staging secret\n' >> "$status"
+
+  bash -c '. "$1/bin/fm-classify-lib.sh"; status_open_decisions_incremental "$2" >/dev/null' \
+    _ "$ROOT" "$status" || fail "the concurrent drain's fold failed"
+  grep -Fxq "offset=$(LC_ALL=C wc -c < "$status" | tr -d '[:space:]')" "$cursor" \
+    || fail "precondition: the concurrent drain did not commit the cursor at end of file: $(cat "$cursor")"
+  before=$(LC_ALL=C cksum "$cursor")
+
+  out=$(bash -c '. "$1/bin/fm-classify-lib.sh"; status_open_decisions_incremental "$2" "$3"' \
+    _ "$ROOT" "$status" "$s1") || fail "the snapshot-bounded fold failed"
+  case "$out" in
+    *"$(printf 'rollout\tneeds-decision')"*) : ;;
+    *) fail "a cursor advanced past this drain's captured endpoint hid a decision still open at it: '$out'" ;;
+  esac
+  case "$out" in
+    *"$(printf 'creds\t')"*)
+      fail "the snapshot-bounded fold presented a key from bytes past its captured endpoint: '$out'" ;;
+  esac
+  after=$(LC_ALL=C cksum "$cursor")
+  [ "$after" = "$before" ] \
+    || fail "the snapshot-bounded re-fold rewound the shared cursor and discarded the other drain's progress: $(cat "$cursor")"
+  pass "a cursor ahead of this drain's captured endpoint re-folds to that endpoint without rewinding it"
+}
+
 test_truncated_log_falls_back_to_a_full_refold_not_a_dropped_decision
 test_same_size_rewrite_is_detected_via_inode_identity
 test_read_failure_preserves_state_for_retry
@@ -354,3 +579,7 @@ test_cursor_cache_read_failure_refolds_without_replaying_unread_status
 test_pre_fix_cursor_refolds_corr_tagged_decision
 test_previous_fold_cache_is_refolded_under_current_semantics
 test_buried_decision_survives_many_growing_drains_and_resolution_clears_it
+test_run_step_supersession_preserves_the_incremental_durable_set
+test_run_supersession_reads_only_new_appends_across_drains
+test_each_delta_is_folded_once_per_drain
+test_a_cursor_ahead_of_this_snapshot_refolds_to_the_captured_endpoint

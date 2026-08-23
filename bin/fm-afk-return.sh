@@ -8,9 +8,13 @@
 #   fm-afk-return.sh guard    Read-only refusal while away or catch-up is pending.
 #
 # `blocked:` is the crewmate protocol's firstmate-actionable verb. A live task's
-# open blocked event must be remediated and closed with `resolved [key=...]`, or
-# explicitly reclassified in the status stream with a durable reason, before an
-# ordinary captain request may proceed. `needs-decision:` belongs to the
+# open blocked event must be remediated and closed with `resolved [key=...]`,
+# explicitly reclassified in the status stream with a durable reason, or
+# superseded by the crew's own later same-key progress while its no-mistakes run
+# is actively working, before an ordinary captain request may proceed.
+# This gate never decides that itself: it lists exactly the blockers
+# bin/fm-send.sh --resolve-key would still accept, and bin/fm-classify-lib.sh is
+# the one owner of when a key is open. `needs-decision:` belongs to the
 # configured approval authority and is deliberately not part of this blocker
 # gate; normal reporting routes it through the AGENTS.md section 7 contract.
 #
@@ -56,6 +60,11 @@ preserve_evidence() {  # <destination>
   grep '^evidence'"$(printf '\t')" "$GATE" >> "$destination" 2>/dev/null || true
 }
 
+# The catch-up list is what the captain is told is waiting for them, so it must
+# name exactly the blockers bin/fm-send.sh --resolve-key will still accept: it
+# reads the shared answerability verdict (status_open_decisions_for_task in
+# bin/fm-classify-lib.sh), never the raw durable fold, so a key an active run
+# superseded is not presented as actionable and then refused on the answer.
 scan_open_blockers() {  # -> tab-separated blocker rows
   local meta id status key verb summary clean_summary
   for meta in "$STATE"/*.meta; do
@@ -69,7 +78,7 @@ scan_open_blockers() {  # -> tab-separated blocker rows
       clean_summary=$(printf '%s' "$summary" | clean_field)
       printf 'blocker\t%s\t%s\t%s\n' "$id" "$key" "$clean_summary"
     done <<EOF
-$(status_open_decisions "$status")
+$(status_open_decisions_for_task "$id" "$status")
 EOF
   done
 }

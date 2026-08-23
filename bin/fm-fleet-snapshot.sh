@@ -36,9 +36,10 @@
 #     paths.status_log.last_event is historical wake-event data only, never
 #     current state.
 #     hints.open_decisions is the keyed open-decision set returned by
-#     fm-classify-lib.sh's authoritative status_open_decisions fold and reconciled
-#     against current_state; hints.pending_decision and hints.blocked_event are
-#     booleans derived from that set.
+#     fm-classify-lib.sh's authoritative status_open_decisions fold, reconciled
+#     against current_state by that library's status_open_decisions_for_triage;
+#     hints.pending_decision and hints.blocked_event are booleans derived from
+#     that set.
 #     endpoint.exists is the cheap backend endpoint-presence read.
 #     endpoint.agent_alive is populated for secondmates only, where it is useful
 #     return-channel supervision data; other tasks use "not_checked".
@@ -428,7 +429,7 @@ task_json_lines() {
   local meta id kind harness mode yolo project worktree home projects backend target status_log report_path
   local remote_host remote_root remote_state remote_rc remote_home_present
   local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
-  local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
+  local last_event_raw current_line pending_decision blocked_event report_present=0 pr_from_status
   local open_decisions_tsv open_decisions_json
 
   for meta in "$STATE"/*.meta; do
@@ -470,33 +471,18 @@ task_json_lines() {
     current_json=$(crew_state_json "$id")
     event_json=$(status_event_json "$status_log")
     last_event_raw=$(printf '%s' "$event_json" | jq -r '.last_event.raw // ""')
-    current_state=$(printf '%s' "$current_json" | jq -r '.state // ""')
-    current_source=$(printf '%s' "$current_json" | jq -r '.source // ""')
 
-    # Durable keyed open-decision set: fold the WHOLE status stream
-    # (fm-classify-lib.sh's status_open_decisions) so a later unrelated event can
-    # never mask a still-open captain decision. The set is derived purely from the
-    # keyed fold - never from report bodies or decision-like prose - and then
-    # reconciled against the crew LIFECYCLE, which only clears a stale decision the
-    # crew has provably moved past. Two lifecycle signals clear it, neither of which
-    # reads any report content:
-    #   - a live activity read (run-step or busy pane) that is working/done, so a
-    #     crew that resumed past a gate is not still reported as parked; and
-    #   - a TERMINAL done/failed state on a single-owner task (scout or ship), whose
-    #     deliverable is its report or PR, so a COMPLETED scout surfaces only as a
-    #     report POINTER, never as a reopened pending decision.
-    # Secondmates are excluded from lifecycle clearing: they are persistent and
-    # multiplex many concerns onto one stream, so activity on one concern must
-    # never clear another concern's keyed decision. A parked/blocked state, or a
-    # non-authoritative status-log/none read on a still-live task, keeps the fold's
-    # open decision surfacing.
-    open_decisions_tsv=$(status_open_decisions "$status_log")
-    if [ "$kind" != secondmate ] && \
-       { { { [ "$current_source" = run-step ] || [ "$current_source" = pane ]; } \
-           && [ "$current_state" != parked ] && [ "$current_state" != blocked ]; } \
-         || { [ "$current_state" = "done" ] || [ "$current_state" = "failed" ]; }; }; then
-      open_decisions_tsv=""
-    fi
+    # Durable keyed open-decision set reconciled against the crew LIFECYCLE, both
+    # owned by fm-classify-lib.sh's status_open_decisions_for_triage: the whole
+    # status stream is folded so a later unrelated event can never mask a
+    # still-open captain decision, the set is derived purely from the keyed fold
+    # (never from report bodies or decision-like prose), and only a lifecycle
+    # signal the crew has provably moved past clears it. This surface keeps no
+    # rule of its own, and the supersession decision it gets is the SAME per-key
+    # verdict bin/fm-send.sh --resolve-key and the wake drain use, so this view
+    # cannot report a key as settled that those two still treat as answerable.
+    current_line=$(printf '%s' "$current_json" | jq -r '.raw // ""')
+    open_decisions_tsv=$(status_open_decisions_for_triage "$id" "$status_log" "$kind" "$current_line")
     open_decisions_json=$(printf '%s' "$open_decisions_tsv" | jq -R -s '
       [ splits("\n") | select(length > 0)
         | (capture("^(?<key>[^\t]*)\t(?<verb>[^\t]*)\t(?<summary>.*)$")?)

@@ -116,18 +116,31 @@ EOF
 }
 
 # Print the consolidated OPEN DECISIONS section: every still-open
-# needs-decision/blocked, fleet-wide, folded from the durable status logs by
-# fm-classify-lib.sh's status_open_decisions fold (via its cursor-backed
+# needs-decision/blocked, fleet-wide, from the durable status fold and shared
+# task answerability verdict in fm-classify-lib.sh (via its cursor-backed
 # scan_open_decisions_incremental wrapper) rather than from the annotations
 # above, so a decision buried under later unrelated appends cannot be silently
 # missed. Informational `note:` lines and pending-reply resolutions are not
 # decisions; print_unread_status_section owns their one-shot surface. Runs on
 # every drain - including the empty-queue fast path - because the decision can
 # still be open even when nothing new is queued for
-# its task this turn. The incremental wrapper bounds this scan's cost to bytes
-# appended to each task's status log since the LAST drain, not that log's whole
-# lifetime, while still never dropping an old buried decision (see
-# fm-classify-lib.sh's "incremental (cursor-backed) open-decisions fold").
+# its task this turn. The incremental wrapper bounds the durable fold's cost to
+# bytes appended to each task's status log since the LAST drain, not that log's
+# whole lifetime, while still never dropping an old buried decision (see
+# fm-classify-lib.sh's "incremental (cursor-backed) open-decisions fold"). The
+# answerability verdict adds no status re-read at all: the same cursor carries
+# the witness set the run-supersession rule needs, so it rides that one fold.
+# status_task_run_state_prefetch performs that single fold and commits it before
+# the lock, so in the common case the cursor is already current by the time this
+# runs and this scan re-folds nothing. That is best-effort, not a guarantee: the
+# cursor is shared with every other drain in this home, so when it has been
+# advanced past the endpoint this drain captured, the scan re-folds its own
+# window rather than presenting bytes it did not capture.
+# Its one non-file input is an fm-crew-state read per LOCAL SHIP task whose
+# durable set is non-empty (never for a scout, secondmate, or remote mate), and
+# fm-crew-state is not a pure read, so the prefetch warms every such verdict
+# BEFORE taking the fleet-wide presentation lock and then seals the memo;
+# nothing here can exec it while that lock is held.
 # Bounded and silent: prints nothing when no decision is open, which is the
 # common case.
 print_open_decisions_section() {
@@ -250,6 +263,15 @@ print_status_sections() {
 
 print_status_presentation() {  # [<deduped-raw-rows>]
   local rows=${1:-} lock="$STATE/.status-presentation-lock" snapshot annotation_manifest fully_presented='' rc=0
+  # The open-decisions answerability verdict needs fm-crew-state, which is NOT a
+  # pure read (a bounded no-mistakes call, git reads, a pane capture). The
+  # presentation lock below is fleet-wide and acquired by an unbounded spin, so
+  # running that reader under it would let one wedged no-mistakes daemon stall
+  # every other drain in this home. Warm it here instead, outside the lock, for
+  # every task that currently holds an open decision, and seal the memo so the
+  # scan can only read it. This runs in the subshell each drain calls it from,
+  # so the memo never outlives one presentation.
+  status_task_run_state_prefetch "$STATE"
   fm_lock_acquire_wait "$lock" || return 1
   snapshot=$(status_presentation_snapshot "$STATE") || rc=1
   if [ "$rc" -eq 0 ] && [ -n "$rows" ]; then
