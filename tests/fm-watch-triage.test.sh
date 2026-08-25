@@ -27,15 +27,24 @@ DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watch-triage-tests)
 
+# A drain in a hermetic fixture is a sub-second operation, but it takes the
+# durable queue lock, and fm_lock_acquire_wait (bin/fm-wake-lib.sh) has no bound
+# by design. An unrecoverable lock therefore parks this helper forever and takes
+# the whole serial shard with it, silently. ACK_DRAIN_BOUND is a hang tripwire
+# only: a drain that needs longer than this on an empty fixture has failed, and
+# reporting that failure beats hanging the job. The bound covers the whole
+# process group (bin/fm-timeout-lib.sh), so a stuck grandchild cannot outlive it.
+ACK_DRAIN_BOUND=${FM_TEST_ACK_DRAIN_BOUND:-120}
+
 ack_stopped_cycle() {  # <state>
   local state=$1 err sequence generation
   err="$state/.test-cycle-drain.err"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2> "$err" || return 1
+  FM_STATE_OVERRIDE="$state" fm_run_timed "$ACK_DRAIN_BOUND" "$DRAIN" >/dev/null 2> "$err" || return 1
   sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$err")
   generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
   rm -f "$err"
   [ -n "$sequence" ] && [ -n "$generation" ] || return 1
-  FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
+  FM_STATE_OVERRIDE="$state" fm_run_timed "$ACK_DRAIN_BOUND" "$DRAIN" --ack-through "$sequence" \
     --recovery-generation "$generation"
 }
 
@@ -163,7 +172,11 @@ record_pi_busy() {  # <state-dir> <id>
     --source pi-ext --event agent-start
 }
 
-reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+# Teardown for a watcher this file started. Bounded through the shared stop_pid
+# (tests/wake-helpers.sh) rather than a bare `wait`, because a watcher inside
+# wake()'s signal-masked delivery window cannot answer SIGTERM and an unbounded
+# wait on it hangs the whole serial shard instead of failing a test.
+reap() { stop_pid "$1"; }
 
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
 
@@ -1125,6 +1138,12 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
 # declaration is surfaced once and then owned by the bounded PAUSE_RESURFACE_SECS
 # cadence however often the pane redraws - while a crew that declared nothing
 # keeps surfacing on every fresh stale hash (the undeclared-wedge control below).
+#
+# These three declared-wait cases each drive several watcher arms through several
+# whole poll cycles, so the poll interval is pure waiting: they run at FM_POLL=0.2
+# rather than this file's usual 1s. Nothing here is timed against the poll (every
+# threshold under test is a seconds-scale age or a marker on disk), and the serial
+# CI shard this suite runs in has no wall-clock room to spend on idle polling.
 test_finished_unlanded_pause_survives_pane_churn() {
   local dir state fakebin out capture_file statusf window key sig pid round cycles wakes bare back
   dir=$(make_case finished-unlanded-pause); state="$dir/state"; fakebin="$dir/fakebin"
@@ -1144,7 +1163,7 @@ test_finished_unlanded_pause_survives_pane_churn() {
     FM_FAKE_TMUX_CURRENT_COMMAND=grok \
     FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 100 || { reap "$pid"; fail "a finished-but-unlanded declared pause did not surface on first sight"; }
@@ -1162,7 +1181,7 @@ test_finished_unlanded_pause_survives_pane_churn() {
       FM_FAKE_TMUX_CURRENT_COMMAND=grok \
       FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-      FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_PAUSE_RESURFACE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
     cycles=0
@@ -1187,7 +1206,7 @@ test_finished_unlanded_pause_survives_pane_churn() {
     FM_FAKE_TMUX_CURRENT_COMMAND=grok \
     FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_PAUSE_RESURFACE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
   pid=$!
   if wait_for_exit "$pid" 100; then
@@ -1208,7 +1227,7 @@ test_finished_unlanded_pause_survives_pane_churn() {
     FM_FAKE_TMUX_CURRENT_COMMAND=grok \
     FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-    FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_PAUSE_RESURFACE_SECS=240 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
   pid=$!
   wait_for_exit "$pid" 100 || { reap "$pid"; fail "a declared pause past its threshold never re-surfaced for a recheck"; }
@@ -1241,7 +1260,7 @@ test_finished_unlanded_pause_survives_pane_churn() {
       FM_FAKE_TMUX_CURRENT_COMMAND=grok \
       FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available' \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-      FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_PAUSE_RESURFACE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
     cycles=0
@@ -1300,7 +1319,7 @@ test_busy_armed_declaration_still_surfaces_when_pane_goes_idle() {
     FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=999 \
-    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
 
@@ -1334,7 +1353,7 @@ test_busy_armed_declaration_still_surfaces_when_pane_goes_idle() {
     FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=999 \
-    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
   pid=$!
   cycles=0
@@ -1382,7 +1401,7 @@ test_busy_armed_declaration_surfaces_on_a_static_pane() {
     FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=999 \
-    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   # Two cycles busy and over-age: the bound arms the cadence and advances the
@@ -1415,7 +1434,7 @@ test_busy_armed_declaration_surfaces_on_a_static_pane() {
     FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=999 \
-    FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
   pid=$!
   cycles=0
@@ -2466,6 +2485,38 @@ test_terminal_first_sight_drops_a_finished_write_deferral_chain() {
   pass "both first-sight paths through a captain-relevant status drop a finished write-deferral chain with the idle window"
 }
 
+# --- fixture teardown is bounded --------------------------------------------
+# A watcher is not always killable on request. wake() in
+# bin/fm-push-transition-lib.sh masks HUP/INT/TERM before it prints a wake and
+# runs the EXIT cleanup, and that cleanup persists recovery state through
+# fm_lock_acquire_wait, which is deliberately unbounded - so a watcher signalled
+# in that window ignores SIGTERM for as long as it stays there. Teardown that
+# sends one SIGTERM and then waits with no bound inherits that: the whole serial
+# CI shard goes silent - no failing assertion, no further output - until the job
+# hits its own timeout many minutes later. Every stop path in this harness must
+# therefore end the process, not merely ask it to stop.
+test_fixture_teardown_bounds_a_signal_immune_watcher() {
+  local pid started elapsed status
+  bash -c 'trap "" HUP INT TERM; while :; do sleep 0.2; done' &
+  pid=$!
+  started=$(date +%s)
+  reap "$pid"
+  elapsed=$(( $(date +%s) - started ))
+  ! is_live_non_zombie "$pid" || fail "reap left a signal-immune watcher running"
+  [ "$elapsed" -le 60 ] || fail "reap took ${elapsed}s to end a signal-immune watcher"
+
+  bash -c 'trap "" HUP INT TERM; while :; do sleep 0.2; done' &
+  pid=$!
+  started=$(date +%s)
+  status=0
+  wait_for_exit "$pid" 5 || status=$?
+  elapsed=$(( $(date +%s) - started ))
+  expect_code 124 "$status" "wait_for_exit budget exhaustion on a signal-immune watcher"
+  ! is_live_non_zombie "$pid" || fail "wait_for_exit left a signal-immune watcher running"
+  [ "$elapsed" -le 60 ] || fail "wait_for_exit took ${elapsed}s to end a signal-immune watcher"
+  pass "fixture teardown ends a watcher that ignores SIGTERM instead of waiting on it forever"
+}
+
 # --- triage debug log stays size capped -------------------------------------
 
 test_triage_log_size_cap_accepts_spaced_wc_counts() {
@@ -2971,6 +3022,7 @@ test_write_deferral_resurfaces_on_the_bounded_cadence
 test_secondmate_home_supervision_churn_is_not_write_evidence
 test_timer_repair_drops_a_finished_write_deferral_chain
 test_terminal_first_sight_drops_a_finished_write_deferral_chain
+test_fixture_teardown_bounds_a_signal_immune_watcher
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_procevent_captured_result_surfaces_proactively
 test_procevent_unacknowledged_result_redrains_until_handled
