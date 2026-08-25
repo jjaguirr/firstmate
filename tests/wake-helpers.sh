@@ -289,9 +289,31 @@ wait_for_exit() {
     sleep 0.1
     i=$((i + 1))
   done
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  stop_pid "$pid"
   return 124
+}
+
+# stop_pid <pid> [grace-ticks]: end a watcher/daemon fixture process for
+# teardown, BOUNDED. A plain `kill` plus a bare `wait` is not bounded: a watcher
+# that has already masked HUP/INT/TERM to deliver a wake (wake() in
+# bin/fm-push-transition-lib.sh) or that is sitting in a foreground call cannot
+# answer SIGTERM, so the `wait` blocks for as long as that process lives. One
+# such process then hangs the whole serial CI shard silently - no failing
+# assertion, no further output, just the job's own timeout minutes later - which
+# is strictly worse than the test failing. Escalate to SIGKILL once the grace
+# runs out so teardown always completes and the suite keeps reporting.
+stop_pid() {  # <pid> [grace-ticks]
+  local pid=$1 grace=${2:-50} i=0
+  kill "$pid" 2>/dev/null || true
+  while [ "$i" -lt "$grace" ] && is_live_non_zombie "$pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if is_live_non_zombie "$pid"; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+  return 0
 }
 
 is_live_non_zombie() {
