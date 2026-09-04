@@ -174,7 +174,14 @@ if [ -e "$FM_HOME" ] || [ -L "$FM_HOME" ]; then
   fi
 else
   CREATED_HOME=1
-  git clone --quiet -- "$FM_ROOT" "$FM_HOME" || die "could not clone the remote Firstmate home"
+  # The code root is a live checkout that other actors maintain concurrently
+  # (fm-update fast-forwards it; git's own auto maintenance repacks it). A
+  # path clone defaults to --local, which hardlinks or copies the raw
+  # .git/objects tree file by file and dies with "failed to copy file" when
+  # a loose object is packed away or otherwise moves mid-copy. --no-local
+  # reads objects through the object database over the transport instead, so
+  # the clone sees each object wherever it currently lives.
+  git clone --quiet --no-local -- "$FM_ROOT" "$FM_HOME" || die "could not clone the remote Firstmate home"
 fi
 for operational_dir in data state config projects; do
   operational_path="$FM_HOME/$operational_dir"
