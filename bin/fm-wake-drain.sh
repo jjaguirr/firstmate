@@ -141,6 +141,15 @@ EOF
 # fm-crew-state is not a pure read, so the prefetch warms every such verdict
 # BEFORE taking the fleet-wide presentation lock and then seals the memo;
 # nothing here can exec it while that lock is held.
+# Rewrite any "[key=...]" token in presented free text to the non-key-shaped
+# "(key=...)" - byte-for-byte the same length, so line-cap accounting is
+# unaffected - so a stray token from a crewmate's note can never be misread as
+# the entry's answerable key. The real key is always disclosed separately by
+# its caller; this only strips competing key-shaped tokens from the note/title.
+fm_neutralize_key_tokens() {
+  printf '%s' "$1" | sed -E 's/\[key=([^]]*)\]/(key=\1)/g'
+}
+
 # Bounded and silent: prints nothing when no decision is open, which is the
 # common case.
 print_open_decisions_section() {
@@ -156,8 +165,12 @@ print_open_decisions_section() {
 
   while IFS=$(printf '\t') read -r task key verb note; do
     [ -n "$task" ] || continue
-    line="$task"
-    [ "$key" = default ] || line="$line [key=$key]"
+    # Neutralise any stray "[key=...]" the note itself carries (for example a
+    # crewmate's key token written mid-note, which the fold could not read as
+    # the entry's key) BEFORE appending the real key below, so exactly one
+    # key-shaped token survives: the one bin/fm-send.sh --resolve-key accepts.
+    note=$(fm_neutralize_key_tokens "$note")
+    line="$task [key=$key]"
     line="$line $verb: $note"
     # The shared cut counts the item's own characters; the trailing newline this
     # section's global budget also pays for is this caller's, so the per-item
@@ -221,7 +234,10 @@ print_record_divergence_section() {
   while IFS=$(printf '\t') read -r task origin key title; do
     [ -n "$task" ] || continue
     line="$task [key=$key] reads resolved in $origin's status log but is still held for the captain"
-    [ -z "$title" ] || line="$line: $title"
+    # Same stray-token neutralisation as OPEN DECISIONS above: this entry's
+    # key is already unconditionally disclosed, so a "[key=...]" inside the
+    # title must not read as a second, competing key-shaped token.
+    [ -z "$title" ] || line="$line: $(fm_neutralize_key_tokens "$title")"
     fm_cap_line_var "$line" $((item_bytes - 1))
     line=$FM_LINE_CAP_LINE
     bytes=$(( ${#line} + 1 ))

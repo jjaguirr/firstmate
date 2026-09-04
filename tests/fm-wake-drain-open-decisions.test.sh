@@ -401,8 +401,43 @@ test_over_long_decision_note_is_capped_with_a_marker() {
   pass "an over-long open decision is cut to its per-item budget with the shared truncation marker"
 }
 
+test_default_key_is_disclosed_and_a_mid_note_key_token_is_neutralised() {
+  local dir state out line
+  dir=$(make_case default-key-disclosure)
+  state="$dir/state"
+  out="$dir/drain.out"
+  # A crewmate wrote its key token mid-note instead of a documented key
+  # position, so the fold reads it as an unkeyed ("default") decision. The
+  # note still carries the stray "[key=...]" token verbatim. The presented
+  # entry must disclose the real, answerable key ("default") and must not
+  # leave the stray token in a key-shaped form, or an operator answering with
+  # the only key-shaped text visible gets refused by bin/fm-send.sh.
+  printf 'needs-decision: two findings [key=persea-irrigation-sse-robustness]. (1) terminal-after-61s: retry\n' \
+    > "$state/task-stray.status"
+
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out" || fail "drain failed on a mid-note key token"
+
+  line=$(grep -F 'task-stray' "$out")
+  case "$line" in
+    *'[key=default]'*) : ;;
+    *) fail "the default key was not disclosed: $line" ;;
+  esac
+  case "$line" in
+    *'[key=persea-irrigation-sse-robustness]'*) fail "the stray mid-note token still reads as a key: $line" ;;
+  esac
+  case "$line" in
+    *'(key=persea-irrigation-sse-robustness)'*) : ;;
+    *) fail "the stray mid-note token's information was dropped rather than neutralised: $line" ;;
+  esac
+  # Answerable: bin/fm-send.sh must accept the exact key the listing disclosed.
+  grep -F "close one by answering it: bin/fm-send.sh <task> --resolve-key <key>" "$out" >/dev/null \
+    || fail "the answerer-closes hint is missing"
+  pass "a default-keyed decision discloses its answerable key and neutralises a stray mid-note key token"
+}
+
 test_buried_decision_still_surfaces
 test_over_long_decision_note_is_capped_with_a_marker
+test_default_key_is_disclosed_and_a_mid_note_key_token_is_neutralised
 test_explicit_resolution_closes_it
 test_later_unrelated_terminal_line_does_not_close_it
 test_reserved_key_namespace_is_owned_by_its_library
