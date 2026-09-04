@@ -1,0 +1,39 @@
+=== status log the crewmate wrote (key token mid-note) ===
+working: reviewing SSE reconnect findings
+needs-decision: two findings [key=persea-irrigation-sse-robustness]. (1) terminal-after-61s: retry or surface? (2) keepalive gap
+
+=== BEFORE FIX (base a1a5354): OPEN DECISIONS as the captain sees it ===
+OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):
+persea needs-decision: two findings [key=persea-irrigation-sse-robustness]. (1) terminal-after-61s: retry or surface? (2) keepalive gap
+OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
+
+--- captain answers with the only key-shaped token visible ---
+$ bin/fm-send.sh persea --resolve-key persea-irrigation-sse-robustness "retry"
+WARNING: watcher still down (same stale episode; last beat: never, grace 300s) - full banner already printed this episode.
+error: --resolve-key 'persea-irrigation-sse-robustness': no open decision or blocker with that key in /tmp/fm-e2e-open-decisions.XSz9wV/home/state/persea.status, and no captain-held task 'persea-irrigation-sse-robustness' or 'persea-decision-persea-irrigation-sse-robustness' still open (already closed or mistyped). Re-check the OPEN DECISIONS listing, then resend without that key or with the right one; nothing was sent.
+exit=1
+
+=== AFTER FIX (target c214a8c): OPEN DECISIONS as the captain sees it ===
+OPEN DECISIONS (still open, folded from the durable status logs - not just the latest line):
+persea [key=default] needs-decision: two findings (key=persea-irrigation-sse-robustness). (1) terminal-after-61s: retry or surface? (2) keepalive gap
+OPEN DECISIONS: close one by answering it: bin/fm-send.sh <task> --resolve-key <key> '<answer>'
+
+--- stray token (now non-key-shaped) is still refused ---
+$ bin/fm-send.sh persea --resolve-key persea-irrigation-sse-robustness "retry"
+WARNING: watcher still down (same stale episode; last beat: never, grace 300s) - full banner already printed this episode.
+error: --resolve-key 'persea-irrigation-sse-robustness': no open decision or blocker with that key in /tmp/fm-e2e-open-decisions.XSz9wV/home/state/persea.status, and no captain-held task 'persea-irrigation-sse-robustness' or 'persea-decision-persea-irrigation-sse-robustness' still open (already closed or mistyped). Re-check the OPEN DECISIONS listing, then resend without that key or with the right one; nothing was sent.
+exit=1
+
+--- answering with the disclosed key [key=default] ---
+$ bin/fm-send.sh persea --resolve-key default "retry with backoff"
+WARNING: watcher still down (same stale episode; last beat: never, grace 300s) - full banner already printed this episode.
+exit=0
+typed to worker: retry with backoff
+
+=== status log after the answer ===
+working: reviewing SSE reconnect findings
+needs-decision: two findings [key=persea-irrigation-sse-robustness]. (1) terminal-after-61s: retry or surface? (2) keepalive gap
+resolved [key=default]: answered: retry with backoff
+
+=== OPEN DECISIONS after the answer (expect empty) ===
+(no OPEN DECISIONS section - decision closed)

@@ -1,0 +1,9 @@
+=== held task title: "Choose route [key=north-or-south] before Friday"; status resolved [key=sample-route-call] ===
+
+=== BEFORE FIX (base): RECORD DIVERGENCE entry ===
+RECORD DIVERGENCE (answered in the status log, still held in the backlog - nothing was closed automatically):
+sample-route-call [key=sample-route-call] reads resolved in sample-route-review's status log but is still held for the captain: Choose route [key=north-or-south] before Friday
+
+=== AFTER FIX (target): RECORD DIVERGENCE entry ===
+RECORD DIVERGENCE (answered in the status log, still held in the backlog - nothing was closed automatically):
+sample-route-call [key=sample-route-call] reads resolved in sample-route-review's status log but is still held for the captain: Choose route (key=north-or-south) before Friday
