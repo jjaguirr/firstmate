@@ -145,6 +145,27 @@ The current classifier matrix and its refresh guard are recorded in [Composer cl
 Kimi pointer delivery and OpenCode 1.18.4 busy-queue behavior remain pinned by `tests/fm-kimi-harness.test.sh`, `tests/fm-tmux-submit-busy.test.sh`, and `tests/fm-composer-lib.test.sh`.
 Herdr's Claude idle-native submit confirmation is pinned by `tests/fm-backend-herdr.test.sh` and refreshed by `FM_HERDR_SUBMIT_CONFIRM_LIVE=1 tests/fm-herdr-submit-confirm-live-e2e.test.sh`.
 
+### Missing-endpoint recovery
+
+Recreating a vanished endpoint reads two facts only the real server can answer: that a replacement window really opens in the recorded worktree, and that it can be closed again by the immutable id the create returned rather than by a name a sibling could share.
+Measured 2026-09-05 on tmux 3.2a, Linux x86_64, on an isolated private socket.
+
+```sh
+tests/fm-backend-tmux-smoke.test.sh
+```
+
+Observed output:
+
+```text
+ok - real tmux: kill removes the window and the readable session inventory authoritatively classifies it missing
+ok - real tmux: a replacement endpoint is created in the recorded session with its shell in the recorded worktree
+ok - real tmux: an unpublished replacement window is closed by its exact id, and a name is refused
+ok - real tmux: a vanished recorded session is reported absent and yields no replacement endpoint at all
+```
+
+That command is the guard that refreshes this record; run it after every tmux upgrade rather than trusting the version above.
+The transaction built on these facts is covered portably by `tests/fm-control-relaunch.test.sh`, and the contract is stated in [agent-control.md](../agent-control.md).
+
 ### Cleanup endpoint identity
 
 The cleanup identity boundary was validated on 2026-07-28 with tmux 3.6a and metadata fixtures for every supported backend.
@@ -595,6 +616,10 @@ ok - real herdr: an agent that does not stop fails closed instead of being repor
 
 The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so registering and not registering an agent on a plain shell pane exercises exactly the gate every lifecycle verb depends on, with no real agent launched.
 That command is the guard that refreshes this record; run it after every Herdr upgrade rather than trusting the version above.
+
+That same guard now also covers recovering a task whose pane is gone: it closes a real task pane, confirms the adapter classifies it `missing`, and drives `bin/fm-spawn.sh <id> --relaunch` against the real binary, asserting one replacement pane in the same named session and home workspace with the recorded worktree and its commits untouched.
+That case has not yet been measured, so no result is recorded for it here; run the guard above on a host with a live Herdr fleet and add its `ok - real herdr: a closed task pane is recovered ...` line with the observed Herdr version and date.
+The portable half of the same behavior is pinned by `tests/fm-control-relaunch.test.sh` and the tmux half by [Missing-endpoint recovery](#missing-endpoint-recovery).
 
 ### Away-mode transport
 

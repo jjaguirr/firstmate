@@ -36,6 +36,7 @@ Do not sweep another home's endpoints or infer ownership from a matching window 
 
 Before relaunch, prove that no live agent still owns the recorded task and that the existing worktree remains available.
 Preserve its uncommitted changes and commits, keep the same task identity, and resume or relaunch the recorded harness in that existing worktree with the same brief plus a concise progress note.
+An endpoint that has disappeared entirely is recovered by that same relaunch, which recreates one for the task in its recorded worktree and refuses whenever that cannot be proven safe, so a vanished terminal is never a reason to spawn a fresh task and abandon the work in the first copy.
 Do not use a fresh generic spawn while the recorded worktree is unaccounted for, because allocating another worktree can split one task across two copies.
 If the worktree or ownership cannot be reconciled safely, leave all state intact and report the task failed or blocked with the conflicting evidence.
 

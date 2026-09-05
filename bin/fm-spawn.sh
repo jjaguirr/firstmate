@@ -18,7 +18,10 @@
 #   refused as a flag value.
 #        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
 #   --relaunch launches a replacement agent for an EXISTING task into that
-#   task's own recorded endpoint and worktree instead of creating either. It is
+#   task's own recorded worktree instead of allocating one. A recorded endpoint
+#   that still exists is adopted rather than created; a recorded endpoint that
+#   is positively GONE is recreated once, in the recorded session and that same
+#   worktree, under the task's own recorded identity. It is
 #   the launch half of the control plane (bin/fm-control.sh relaunch), which
 #   owns the checkpoint, the progress note, stopping the previous agent, and the
 #   transaction; call fm-control rather than this flag directly unless you are
@@ -28,10 +31,19 @@
 #   positional, and batch pairs are all refused alongside it; only harness,
 #   model, and effort may change, which is what makes a harness switch one
 #   ordinary relaunch. It refuses unless the recorded endpoint is positively
-#   agent-free on a backend with a recovery-grade agent-state classifier (tmux
-#   or herdr), refuses unless the endpoint's shell is sitting in the recorded
-#   worktree, and clears the previous harness's per-task wiring before arming
-#   the new incarnation.
+#   agent-free or positively missing on a backend with a recovery-grade
+#   agent-state classifier (tmux or herdr), refuses unless the endpoint's shell
+#   is sitting in the recorded worktree, and clears the previous harness's
+#   per-task wiring before arming the new incarnation.
+#   Recreating a missing endpoint is further limited: only an ordinary ship or
+#   scout task qualifies (a secondmate's home is relaunched through its own
+#   seeded-home spawn), no process may still be running in the recorded
+#   worktree and a host that cannot be scanned for one refuses, the recorded
+#   tmux session must still exist, and a herdr record refuses when herdr is
+#   scoped to another session, when the task is bound to a projected
+#   presentation workspace, or when its recorded workspace still exists but is
+#   not this home's own. One replacement endpoint that is created but never
+#   published is closed again by its exact id.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
@@ -670,6 +682,15 @@ RELAUNCH_REPLACEMENT_BUSY_GEN=
 RELAUNCH_REPLACEMENT_HARNESS=
 RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
+RELAUNCH_ENDPOINT_MISSING=0
+RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=
+RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=
+RELAUNCH_HERDR_PANE_ID=
+RELAUNCH_LIVE_PIDS=
+RELAUNCH_LIVE_STATUS=0
+RELAUNCH_HERDR_JOURNAL=
+HERDR_LIVE_SESSION=
+HERDR_RECORDED_WS_STATE=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
 
@@ -688,6 +709,86 @@ parse_orca_worktree_result() {
   else
     ORCA_TERMINAL=
   fi
+}
+
+# relaunch_worktree_live_process: the missing-endpoint recovery's own proof
+# that recreating an endpoint cannot produce a SECOND agent working the same
+# checkout. A vanished terminal normally takes its agent with it, but a
+# detached or SIGHUP-surviving process would not appear in any endpoint the
+# backend can classify, so the worktree itself is read directly.
+#
+# Prints the conflicting process ids and returns 0 when at least one process is
+# rooted in <worktree>; returns 1 when none is; returns 2 when this host cannot
+# be scanned at all, which the caller treats as a refusal rather than as
+# absence. This process and its own ancestors are excluded, so running the
+# recovery from inside the recorded worktree is not mistaken for a stranded
+# worker. On Linux a /proc entry whose cwd cannot be read belongs to another
+# user and therefore to no agent this home ever spawned.
+relaunch_worktree_live_process() {  # <worktree> -> prints conflicting pids
+  local worktree=$1 real proc pid cwd line path self found='' ancestors=' '
+  real=$(cd "$worktree" 2>/dev/null && pwd -P) || return 2
+  self=${BASHPID:-$$}
+  while [ -n "$self" ] && [ "$self" != 0 ]; do
+    ancestors="$ancestors$self "
+    if [ -r "/proc/$self/stat" ]; then
+      self=$(awk '{print $4}' "/proc/$self/stat" 2>/dev/null) || self=
+    else
+      self=$(LC_ALL=C ps -o ppid= -p "$self" 2>/dev/null | tr -d ' ') || self=
+    fi
+    case "$self" in ''|*[!0-9]*) self= ;; esac
+  done
+  if [ -d /proc ]; then
+    for proc in /proc/[0-9]*; do
+      [ -d "$proc" ] || continue
+      pid=${proc##*/}
+      case "$ancestors" in *" $pid "*) continue ;; esac
+      cwd=$(readlink -f "$proc/cwd" 2>/dev/null) || continue
+      case "$cwd" in
+        "$real"|"$real"/*) found="$found${found:+ }$pid" ;;
+      esac
+    done
+  elif command -v lsof >/dev/null 2>&1; then
+    pid=
+    while IFS= read -r line; do
+      case "$line" in
+        p*)
+          pid=${line#p}
+          case "$pid" in ''|*[!0-9]*) return 2 ;; esac
+          ;;
+        n*)
+          [ -n "$pid" ] || return 2
+          path=${line#n}
+          case "$ancestors" in *" $pid "*) continue ;; esac
+          case "$path" in
+            "$real"|"$real"/*) found="$found${found:+ }$pid" ;;
+          esac
+          ;;
+      esac
+    done <<EOF
+$(lsof -a -d cwd -Fpn 2>/dev/null)
+EOF
+  else
+    return 2
+  fi
+  [ -n "$found" ] || return 1
+  printf '%s' "$found"
+}
+
+# relaunch_replacement_endpoint_close: close the ONE endpoint a missing-endpoint
+# recovery created, by its exact id, so an abort before the durable record names
+# it leaves no orphan shell rooted in the task's worktree.
+relaunch_replacement_endpoint_close() {  # <backend> <exact-target>
+  local backend=$1 target=$2
+  [ -n "$target" ] || return 1
+  case "$backend" in
+    tmux) fm_backend_tmux_kill_window_id "$target" ;;
+    herdr)
+      fm_backend_source herdr || return 1
+      fm_backend_kill herdr "$target"
+      fm_backend_herdr_endpoint_confirmed_gone "$target"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 spawn_abort_cleanup() {
@@ -715,6 +816,16 @@ spawn_abort_cleanup() {
         echo "warning: could not retire replacement busy generation after aborted relaunch of $ID" >&2
       fi
     fi
+  fi
+  if [ -n "$RELAUNCH_REPLACEMENT_ENDPOINT_TARGET" ] \
+     && [ "$SPAWN_META_PUBLISH_STARTED" = 0 ]; then
+    if ! relaunch_replacement_endpoint_close \
+        "$RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND" \
+        "$RELAUNCH_REPLACEMENT_ENDPOINT_TARGET"; then
+      echo "warning: could not close the unpublished replacement endpoint $RELAUNCH_REPLACEMENT_ENDPOINT_TARGET after the aborted recovery of $ID" >&2
+    fi
+    RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=
+    RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=
   fi
   if [ "$HERDR_PROJECTION_ABORT_CLEANUP" = 1 ] \
      && [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" != 1 ]; then
@@ -1002,11 +1113,6 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: backend '$BACKEND' has no recovery-grade agent-state classifier, so a relaunch cannot prove the previous agent exited; refusing rather than risking two agents in one endpoint" >&2
     exit 1
   }
-  RELAUNCH_STATE=$(fm_backend_agent_state "$BACKEND" "$RELAUNCH_TARGET")
-  [ "$RELAUNCH_STATE" = dead ] || {
-    echo "error: task $ID's endpoint reads '$RELAUNCH_STATE'; a relaunch requires a positively agent-free endpoint (stop the agent first with bin/fm-control.sh $ID exit)" >&2
-    exit 1
-  }
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
@@ -1031,8 +1137,49 @@ if [ "$RELAUNCH" -eq 1 ]; then
     HERDR_SES=$(fm_meta_get "$RELAUNCH_META" herdr_session)
     HERDR_WORKSPACE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_workspace_id)
     HERDR_TAB_ID=$(fm_meta_get "$RELAUNCH_META" herdr_tab_id)
-    HERDR_PANE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_pane_id)
+    # NOT into HERDR_PANE_ID: that name carries this process's own injected
+    # launcher ancestry, and overwriting it with the task's recorded pane would
+    # make a recovery claim the worker's vanished pane is firstmate's current
+    # parent. The recorded value is republished from here for the adopt path.
+    RELAUNCH_HERDR_PANE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_pane_id)
   fi
+  # The endpoint state gate. `dead` adopts the endpoint the record names, and a
+  # POSITIVELY missing endpoint is recreated in the recorded worktree - the one
+  # state where there is nothing to adopt but also, provably, nothing running.
+  # Every other state (alive, ambiguous, unreadable, unverified) cannot prove no
+  # agent is running and still refuses, because two agents in one endpoint is
+  # exactly what this gate exists to prevent.
+  RELAUNCH_STATE=$(fm_backend_agent_state "$BACKEND" "$RELAUNCH_TARGET")
+  case "$RELAUNCH_STATE" in
+    dead) ;;
+    missing)
+      case "$KIND" in
+        ship|scout) ;;
+        *)
+          echo "error: task $ID is a $KIND task, so recreating its missing endpoint is not this path's job; only an ordinary ship or scout worker is recovered here (a secondmate's home is relaunched through its own seeded-home spawn, which bin/fm-bootstrap.sh's liveness sweep already runs for a missing endpoint)" >&2
+          exit 1
+          ;;
+      esac
+      RELAUNCH_LIVE_PIDS=$(relaunch_worktree_live_process "$RELAUNCH_WT") \
+        && RELAUNCH_LIVE_STATUS=0 || RELAUNCH_LIVE_STATUS=$?
+      case "$RELAUNCH_LIVE_STATUS" in
+        0)
+          echo "error: task $ID's endpoint is gone but process(es) $RELAUNCH_LIVE_PIDS still runs from its recorded worktree $RELAUNCH_WT; refusing to start a second agent on work another process is holding" >&2
+          exit 1
+          ;;
+        1) ;;
+        *)
+          echo "error: task $ID's endpoint is gone and this host cannot be scanned for a process still running in its recorded worktree $RELAUNCH_WT; refusing rather than risking a second agent on the same work" >&2
+          exit 1
+          ;;
+      esac
+      RELAUNCH_ENDPOINT_MISSING=1
+      ;;
+    *)
+      echo "error: task $ID's endpoint reads '$RELAUNCH_STATE'; a relaunch requires a positively agent-free endpoint (stop the agent first with bin/fm-control.sh $ID exit)" >&2
+      exit 1
+      ;;
+  esac
   # With no explicit harness, a relaunch reuses the harness already recorded
   # for this task. It must NOT fall through to the fresh-spawn config
   # resolution, which would silently move an existing task onto whatever the
@@ -1857,6 +2004,89 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ "$KIND" = secondmate ] || WT=$RELAUNCH_WT
   WT_TARGET=$T
   SES=${T%%:*}
+  if [ "$RELAUNCH_ENDPOINT_MISSING" = 1 ]; then
+    # There is no endpoint to adopt, so exactly one replacement is created - in
+    # the RECORDED session, at the RECORDED worktree, under the task's own
+    # label. No container is invented and no worktree is allocated: a session
+    # that is itself gone is a refusal, not permission to make another one.
+    case "$BACKEND" in
+      tmux)
+        fm_backend_tmux_session_exists "$SES" || {
+          echo "error: task $ID's recorded session '$SES' is gone, so there is nowhere to recreate its endpoint; refusing to invent another session for it" >&2
+          exit 1
+        }
+        WID=$(fm_backend_tmux_create_task "$SES" "$W" "$WT") || {
+          echo "error: could not create a replacement endpoint for task $ID in its recorded session '$SES' at $WT" >&2
+          exit 1
+        }
+        T="$SES:$W"
+        WT_TARGET=$WID
+        RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=tmux
+        RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=$WID
+        ;;
+      herdr)
+        # The recorded named session is a placement boundary: a replacement
+        # must never land in whichever session this process happens to be
+        # scoped to now.
+        HERDR_LIVE_SESSION=$(fm_backend_herdr_session)
+        [ "$HERDR_LIVE_SESSION" = "$HERDR_SES" ] || {
+          echo "error: herdr is currently scoped to session '$HERDR_LIVE_SESSION', not task $ID's recorded session '$HERDR_SES'; refusing to recreate its endpoint somewhere else" >&2
+          exit 1
+        }
+        # A projected presentation workspace is a disposable single-task
+        # container bound to its own journal, and recreating a pane inside one
+        # is not a modelled state. Refuse before anything is created rather
+        # than silently relocating the task and stranding that journal.
+        RELAUNCH_HERDR_JOURNAL=$(fm_backend_herdr_projection_journal_path "$STATE" "$ID")
+        if [ -e "$RELAUNCH_HERDR_JOURNAL" ] || [ -L "$RELAUNCH_HERDR_JOURNAL" ]; then
+          echo "error: task $ID's recorded endpoint lives in projected presentation workspace ${HERDR_WORKSPACE_ID:-unknown}, which recovery does not recreate into. Its work is preserved at $WT: land it from there and retire the task with bin/fm-teardown.sh $ID" >&2
+          exit 1
+        fi
+        # The recorded workspace decides where the replacement may go. Still
+        # present and still this home's own container: recreate there. Proven
+        # gone: this home's container is re-ensured, because the workspace id
+        # is an instance handle, not the task's identity. Present but some
+        # other workspace, or unreadable: ambiguous placement, so refuse.
+        HERDR_RECORDED_WS_STATE=$(fm_backend_herdr_workspace_presence_state "$HERDR_SES" "$HERDR_WORKSPACE_ID")
+        case "$HERDR_RECORDED_WS_STATE" in
+          present|dead) ;;
+          *)
+            echo "error: task $ID's recorded herdr workspace ${HERDR_WORKSPACE_ID:-unknown} could not be read, so recovery cannot tell where its replacement belongs; refusing rather than guessing" >&2
+            exit 1
+            ;;
+        esac
+        HERDR_CONTAINER_RAW=$(fm_backend_herdr_container_ensure "$WT" launcher-home) || exit 1
+        CONTAINER=${HERDR_CONTAINER_RAW%%$'\t'*}
+        HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
+        [ "${CONTAINER%%:*}" = "$HERDR_SES" ] || {
+          echo "error: herdr resolved session '${CONTAINER%%:*}' while recreating task $ID's endpoint, not its recorded '$HERDR_SES'; refusing to launch" >&2
+          exit 1
+        }
+        if [ "$HERDR_RECORDED_WS_STATE" = present ] \
+           && [ "${CONTAINER#*:}" != "$HERDR_WORKSPACE_ID" ]; then
+          echo "error: task $ID's recorded herdr workspace $HERDR_WORKSPACE_ID still exists but is not this home's own workspace ${CONTAINER#*:}; recovery recreates only inside the recorded home workspace. Its work is preserved at $WT: land it from there and retire the task with bin/fm-teardown.sh $ID" >&2
+          exit 1
+        fi
+        HERDR_WORKSPACE_ID=${CONTAINER#*:}
+        HERDR_TASK_IDS=$(fm_backend_herdr_create_task "$CONTAINER" "$W" "$WT" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
+        read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
+$HERDR_TASK_IDS
+EOF
+        [ -n "$HERDR_TAB_ID" ] && [ -n "$HERDR_PANE_ID" ] || {
+          echo "error: herdr did not return a replacement tab and pane id for $W" >&2
+          exit 1
+        }
+        T="$HERDR_SES:$HERDR_PANE_ID"
+        WT_TARGET=$T
+        RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=herdr
+        RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=$T
+        ;;
+      *)
+        echo "error: backend '$BACKEND' cannot safely recreate a missing endpoint for task $ID" >&2
+        exit 1
+        ;;
+    esac
+  fi
 else
 case "$BACKEND" in
   tmux)
@@ -2196,9 +2426,11 @@ kimi_spawn_fail() {  # <detail>
 
 if [ "$RELAUNCH" -eq 1 ]; then
   # No worktree is acquired: the recorded one is reused as-is. What must be
-  # proven instead is that the adopted endpoint's shell is actually sitting in
-  # that worktree, so the replacement agent starts where the work is rather
-  # than wherever the pane happened to drift.
+  # proven instead is that the endpoint's shell is actually sitting in that
+  # worktree, so the replacement agent starts where the work is rather than
+  # wherever the pane happened to drift. An adopted endpoint may have drifted;
+  # a recreated one was opened at that exact path and is confirmed here through
+  # the same read, so no recovery path skips the binding proof.
   relaunch_wt_real=$(real_path_or_raw "$WT")
   relaunch_seen=
   for _ in $(seq 1 10); do
@@ -2620,6 +2852,12 @@ fi
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
+if [ "$RELAUNCH" -eq 1 ] && [ "$BACKEND" = herdr ] \
+   && [ "$RELAUNCH_ENDPOINT_MISSING" = 0 ]; then
+  # The adopt path republishes the pane the record already names; only a
+  # recreate mints a new one (which the branch above already assigned).
+  HERDR_PANE_ID=$RELAUNCH_HERDR_PANE_ID
+fi
 SPAWN_GEN="s$(date +%s).${BASHPID:-$$}.$RANDOM"
 SPAWN_META_PATH="$STATE/$ID.meta"
 if [ "$RELAUNCH" -eq 1 ]; then
@@ -2696,6 +2934,11 @@ if [ "$RELAUNCH" -eq 1 ]; then
   fm_lock_release "$SPAWN_META_LOCK"
   SPAWN_META_LOCK_HELD=0
 fi
+# The durable record now names the replacement endpoint. A later failure must
+# leave the two together for reconciliation, never close an endpoint the record
+# points at.
+RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND=
+RELAUNCH_REPLACEMENT_ENDPOINT_TARGET=
 if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   # The record is published, so this task is now part of the set a teardown
   # enumerates and locks per task. The set lock is only needed across that

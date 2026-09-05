@@ -17,6 +17,12 @@
 #   6. fm-spawn --relaunch refuses on its own: a live agent, a contradicting
 #      flag, an extra positional, or a backend that cannot prove the previous
 #      agent exited.
+#   7. A POSITIVELY MISSING endpoint is recovered rather than refused: the
+#      replacement is created in the recorded session and the recorded
+#      worktree, under the task's own recorded identity, and every other
+#      refusal - alive, ambiguous, unreadable, a non-recovery backend, a
+#      non-worker kind, an absent worktree, and a worktree that still has a
+#      live process in it - stays exactly where it was.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -36,9 +42,15 @@ TMP_ROOT=$(fm_test_tmproot fm-control-relaunch)
 mkdir -p "$TMP_ROOT"
 TMP_ROOT=$(cd "$TMP_ROOT" && pwd)
 TASK_TMPS=()
+LIVE_WORKTREE_PIDS=()
 
 relaunch_cleanup() {
-  local d
+  local d pid
+  for pid in "${LIVE_WORKTREE_PIDS[@]:-}"; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
   for d in "${TASK_TMPS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
@@ -110,7 +122,32 @@ case "${1:-}" in
     done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
-  list-windows) [ -f "$D/windows" ] && cat "$D/windows"; exit 0 ;;
+  has-session)
+    [ ! -e "$D/no-session" ] || exit 1
+    exit 0 ;;
+  list-windows)
+    if [ -e "$D/no-session" ]; then
+      printf "can't find session: %s\n" "$(cat "$D/no-session")" >&2
+      exit 1
+    fi
+    [ -f "$D/windows" ] && cat "$D/windows"; exit 0 ;;
+  kill-window)
+    printf '%s\n' "$*" >> "$D/killed"
+    : > "$D/windows"
+    exit 0 ;;
+  new-window)
+    [ -z "${FM_FAKE_NEW_WINDOW_FAIL:-}" ] || exit 1
+    name=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -n) name=${2:-}; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -n "$name" ] || exit 1
+    printf '%s\n' "$name" > "$D/windows"
+    printf '%s\n' '@replacement'
+    exit 0 ;;
 esac
 exit 0
 SH
@@ -1312,6 +1349,302 @@ test_spawn_relaunch_refuses_a_pane_outside_the_worktree() {
   pass "fm-spawn --relaunch: refuses to start a replacement outside the copy holding the work"
 }
 
+# --- 7. a positively missing endpoint is recovered, not refused --------------
+
+# make_missing_endpoint <case-dir>: the stranded shape - the recorded window is
+# absent from a readable session inventory, while the worktree, its branch, and
+# its commits are all intact.
+make_missing_endpoint() {  # <case-dir>
+  local dir=$1
+  : > "$dir/fake/windows"
+  printf 'committed work\n' > "$dir/wt/landed.txt"
+  git -C "$dir/wt" add landed.txt >/dev/null
+  git -C "$dir/wt" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm "work the replacement must inherit"
+}
+
+test_missing_endpoint_recreates_the_endpoint_in_the_recorded_worktree() {
+  local dir out rc branch head
+  dir=$(new_case missing-reattach rl40)
+  add_ship_task "$dir" rl40 claude
+  make_missing_endpoint "$dir"
+  branch=$(git -C "$dir/wt" rev-parse --abbrev-ref HEAD)
+  head=$(git -C "$dir/wt" rev-parse HEAD)
+  printf 'uncommitted work\n' > "$dir/wt/dirty.txt"
+  printf 'delivery_receipt=preserve-me\n' >> "$dir/home/state/rl40.meta"
+
+  out=$(run_control "$dir" rl40 relaunch --note "the worker's terminal disappeared"); rc=$?
+  expect_code 0 "$rc" "a positively missing endpoint should be recovered"$'\n'"$out"
+  assert_contains "$out" "relaunched rl40 harness=claude from=claude" \
+    "recovery should be the ordinary relaunch outcome, not a separate verb"
+  [ "$(meta_field "$dir" rl40 window)" = "fmses:fm-rl40" ] \
+    || fail "the replacement must carry the task's own endpoint identity"
+  [ "$(meta_field "$dir" rl40 worktree)" = "$dir/wt" ] \
+    || fail "recovery must reuse the recorded worktree, never allocate another"
+  [ "$(meta_field "$dir" rl40 kind)" = ship ] || fail "kind must survive recovery"
+  [ "$(meta_field "$dir" rl40 project)" = "$dir/proj" ] || fail "project must survive recovery"
+  [ "$(meta_field "$dir" rl40 delivery_receipt)" = preserve-me ] \
+    || fail "independent durable metadata must survive recovery"
+  [ "$(git -C "$dir/wt" rev-parse --abbrev-ref HEAD)" = "$branch" ] \
+    || fail "recovery must not move the worktree's branch"
+  [ "$(git -C "$dir/wt" rev-parse HEAD)" = "$head" ] \
+    || fail "recovery must not move the committed work"
+  [ "$(cat "$dir/wt/dirty.txt")" = "uncommitted work" ] \
+    || fail "recovery must leave uncommitted work exactly as it was"
+  assert_grep 'fm-rl40' "$dir/fake/windows" \
+    "recovery must create one replacement endpoint in the recorded session"
+  assert_grep 'encode launch-brief' "$dir/fake/literal" "the replacement agent must be launched"
+  ! grep -q '/exit' "$dir/fake/literal" \
+    || fail "there is no agent to stop, so no exit command may be sent"
+  [ "$(journal_field "$dir" rl40 exit_result)" = endpoint-missing-reattach ] \
+    || fail "the skipped stop must be a named journal state, not a swallowed failure"
+  [ "$(journal_field "$dir" rl40 phase)" = complete ] \
+    || fail "the transaction should end complete"
+  [ "$(journal_field "$dir" rl40 worktree_head)" = "$head" ] \
+    || fail "the checkpoint must still prove the work it preserved"
+  pass "fm-control relaunch: a positively missing endpoint is recreated in the recorded worktree"
+}
+
+test_missing_endpoint_refuses_a_live_process_in_the_recorded_worktree() {
+  local dir out rc live_pid
+  dir=$(new_case live-worktree-process rl41)
+  add_ship_task "$dir" rl41 claude
+  make_missing_endpoint "$dir"
+  (cd "$dir/wt" && exec sleep 30) &
+  live_pid=$!
+  LIVE_WORKTREE_PIDS+=("$live_pid")
+
+  out=$(run_control "$dir" rl41 relaunch --note "must not duplicate a detached worker"); rc=$?
+  expect_code 1 "$rc" "a process still rooted in the worktree must refuse recovery"
+  assert_contains "$out" "still runs from its recorded worktree" \
+    "the refusal should name the live-process evidence"
+  [ ! -s "$dir/fake/windows" ] || fail "a refused recovery must not create a replacement endpoint"
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  LIVE_WORKTREE_PIDS=()
+  pass "fm-control relaunch: a missing endpoint refuses while a live process remains in its worktree"
+}
+
+test_missing_endpoint_refuses_an_unscannable_worktree() {
+  local dir out rc
+  dir=$(new_case missing-unscannable rl52)
+  add_ship_task "$dir" rl52 claude
+  make_missing_endpoint "$dir"
+  # A worktree that exists but cannot be entered leaves the live-process probe
+  # with no answer at all. That must refuse, never read as "no process here".
+  # The launch owner is driven directly: the control plane's own checkpoint
+  # refuses an unresolvable worktree even earlier, so only this entry point
+  # reaches the probe's unscannable branch.
+  if [ "$(id -u)" = 0 ]; then
+    pass "skip: running as root, so directory permissions cannot blind the probe"
+    return 0
+  fi
+  chmod 000 "$dir/wt"
+  out=$(run_spawn "$dir" rl52 --relaunch --harness claude); rc=$?
+  chmod 755 "$dir/wt"
+  expect_code 1 "$rc" "an unscannable worktree must refuse recovery"
+  assert_contains "$out" "cannot be scanned" "the refusal should name the probe it could not complete"
+  [ ! -s "$dir/fake/windows" ] || fail "a refused recovery must not create a replacement endpoint"
+  pass "fm-spawn --relaunch: a worktree the host cannot scan refuses instead of assuming it is free"
+}
+
+test_missing_endpoint_refuses_a_secondmate_kind() {
+  local dir home out rc
+  dir=$(new_case missing-secondmate sm9)
+  home="$dir/home"
+  mkdir -p "$home/data/sm9"
+  printf '# secondmate brief\n' > "$home/data/sm9/brief.md"
+  fm_git_worktree "$dir/proj" "$dir/smhome" sm-branch
+  mkdir -p "$dir/smhome/state" "$dir/smhome/data"
+  printf 'sm9\n' > "$dir/smhome/.fm-secondmate-home"
+  {
+    echo "window=fmses:fm-sm9"
+    echo "endpoint_task_id=sm9"
+    echo "worktree=$dir/smhome"
+    echo "project=$dir/smhome"
+    echo "harness=claude"
+    echo "kind=secondmate"
+    echo "mode=secondmate"
+    echo "yolo=off"
+    echo "model=default"
+    echo "effort=default"
+    echo "home=$dir/smhome"
+  } > "$home/state/sm9.meta"
+  : > "$dir/fake/windows"
+  printf '%s' "$dir/smhome" > "$dir/fake/cwd"
+
+  out=$(run_control "$dir" sm9 relaunch); rc=$?
+  expect_code 1 "$rc" "a secondmate's missing endpoint must not take the worker recovery path"
+  assert_contains "$out" "ship or scout" "the refusal should name the kinds this recovery covers"
+  [ ! -s "$dir/fake/windows" ] || fail "a refused recovery must not create a replacement endpoint"
+  pass "fm-control relaunch: only an ordinary worker recovers a missing endpoint here"
+}
+
+test_missing_endpoint_refuses_an_absent_worktree() {
+  local dir out rc
+  dir=$(new_case missing-worktree-reattach rl42)
+  add_ship_task "$dir" rl42 claude
+  make_missing_endpoint "$dir"
+  mv "$dir/wt" "$dir/wt-absent"
+
+  out=$(run_control "$dir" rl42 relaunch --note "the local copy must come back first"); rc=$?
+  expect_code 1 "$rc" "an absent worktree must refuse recovery"
+  assert_contains "$out" "recorded worktree" "the refusal should name the missing local copy"
+  [ ! -s "$dir/fake/windows" ] || fail "a refused recovery must not create a replacement endpoint"
+  pass "fm-control relaunch: a missing endpoint still refuses when its worktree is gone"
+}
+
+test_missing_endpoint_refuses_a_non_root_worktree() {
+  local dir out rc
+  dir=$(new_case missing-nonroot rl43)
+  add_ship_task "$dir" rl43 claude
+  make_missing_endpoint "$dir"
+  mkdir -p "$dir/wt/nested"
+  sed -i "s#^worktree=.*#worktree=$dir/wt/nested#" "$dir/home/state/rl43.meta"
+
+  out=$(run_control "$dir" rl43 relaunch --note "an ambiguous checkout must refuse"); rc=$?
+  expect_code 1 "$rc" "a non-root worktree must refuse recovery exactly as before"
+  assert_contains "$out" "not a worktree root" "the checkpoint refusal must still fire"
+  [ ! -s "$dir/fake/windows" ] || fail "a refused recovery must not create a replacement endpoint"
+  pass "fm-control relaunch: the checkpoint still refuses a non-root worktree on the recovery path"
+}
+
+test_missing_endpoint_refuses_when_the_recorded_session_is_gone() {
+  local dir out rc
+  dir=$(new_case missing-session rl44)
+  add_ship_task "$dir" rl44 claude
+  make_missing_endpoint "$dir"
+  printf 'fmses\n' > "$dir/fake/no-session"
+
+  out=$(run_control "$dir" rl44 relaunch --note "no session to recreate into"); rc=$?
+  expect_code 1 "$rc" "a vanished recorded session must refuse recovery"
+  assert_contains "$out" "refusing to invent another session" \
+    "the refusal should say plainly that a vanished session is not replaced"
+  pass "fm-control relaunch: a missing endpoint is never recreated in an invented session"
+}
+
+test_missing_endpoint_launch_failure_keeps_the_prior_record() {
+  local dir out rc
+  dir=$(new_case missing-launch-failure rl45)
+  add_ship_task "$dir" rl45 claude
+  make_missing_endpoint "$dir"
+  cp "$dir/home/state/rl45.meta" "$dir/meta.before"
+
+  out=$(FM_FAKE_NEW_WINDOW_FAIL=1 run_control "$dir" rl45 relaunch --note "replacement creation failed"); rc=$?
+  expect_code 1 "$rc" "a failed replacement endpoint create must fail the transaction"
+  assert_contains "$out" "endpoint was already missing" \
+    "the failure should say plainly that nothing was stopped"
+  cmp -s "$dir/home/state/rl45.meta" "$dir/meta.before" \
+    || fail "a failed recovery must retain the prior durable record"
+  [ "$(journal_field "$dir" rl45 phase)" = failed:launching ] \
+    || fail "a failed recovery must record its launch phase"
+  [ "$(journal_field "$dir" rl45 rollback)" = prior-record-kept ] \
+    || fail "a failed recovery must retain its recoverable record"
+  pass "fm-control relaunch: a failed recovery keeps the prior record and says nothing was stopped"
+}
+
+test_missing_endpoint_post_create_failure_closes_the_replacement() {
+  local dir out rc
+  dir=$(new_case missing-post-create rl46)
+  add_ship_task "$dir" rl46 claude
+  make_missing_endpoint "$dir"
+  cp "$dir/home/state/rl46.meta" "$dir/meta.before"
+  printf '%s' "$dir/proj" > "$dir/fake/cwd"
+
+  out=$(run_control "$dir" rl46 relaunch --note "the replacement shell drifted"); rc=$?
+  expect_code 1 "$rc" "a replacement whose shell is outside the worktree must fail"
+  assert_grep 'kill-window' "$dir/fake/killed" \
+    "an aborted recovery must close the replacement endpoint it created"
+  assert_grep '@replacement' "$dir/fake/killed" \
+    "the aborted recovery must close it by its exact id"
+  [ ! -s "$dir/fake/windows" ] \
+    || fail "an aborted recovery must leave no orphan replacement endpoint"
+  cmp -s "$dir/home/state/rl46.meta" "$dir/meta.before" \
+    || fail "an aborted recovery must retain the prior durable record"
+
+  printf '%s' "$dir/wt" > "$dir/fake/cwd"
+  out=$(run_control "$dir" rl46 relaunch --note "retry once the orphan is gone"); rc=$?
+  expect_code 0 "$rc" "recovery must succeed once the orphan endpoint is closed"$'\n'"$out"
+  pass "fm-control relaunch: an aborted recovery closes its own replacement and stays recoverable"
+}
+
+test_missing_endpoint_success_never_closes_the_published_endpoint() {
+  local dir out rc
+  dir=$(new_case missing-keep-endpoint rl47)
+  add_ship_task "$dir" rl47 claude
+  make_missing_endpoint "$dir"
+
+  out=$(run_control "$dir" rl47 relaunch --note "the worker's terminal disappeared"); rc=$?
+  expect_code 0 "$rc" "a clean recovery should succeed"$'\n'"$out"
+  [ ! -e "$dir/fake/killed" ] \
+    || fail "a successful recovery must never close the endpoint its record names"
+  assert_grep 'fm-rl47' "$dir/fake/windows" "the published replacement endpoint must remain"
+  pass "fm-control relaunch: a published replacement endpoint is never closed on the way out"
+}
+
+test_spawn_relaunch_recovers_a_missing_endpoint_from_the_record() {
+  local dir out rc
+  dir=$(new_case direct-missing rl48)
+  add_ship_task "$dir" rl48 claude
+  make_missing_endpoint "$dir"
+
+  out=$(run_spawn "$dir" rl48 --relaunch --harness claude); rc=$?
+  expect_code 0 "$rc" "the launch owner should recover a proven missing endpoint on its own"$'\n'"$out"
+  [ "$(meta_field "$dir" rl48 worktree)" = "$dir/wt" ] \
+    || fail "direct recovery must retain the recorded worktree"
+  assert_grep 'fm-rl48' "$dir/fake/windows" "direct recovery must create a replacement endpoint"
+  pass "fm-spawn --relaunch: a proven missing endpoint is recovered from the task's own record"
+}
+
+# --- 8. the refusals that must not move -------------------------------------
+
+test_spawn_relaunch_refuses_an_ambiguous_endpoint() {
+  local dir out rc
+  dir=$(new_case ambiguous rl49)
+  add_ship_task "$dir" rl49 claude
+  printf 'someunknownproc' > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" rl49 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "an endpoint that cannot be attributed must refuse"
+  assert_contains "$out" "reads 'ambiguous'" "the refusal should name the observed state"
+  assert_contains "$out" "positively agent-free endpoint" "the refusal should demand a proven state"
+  [ -z "$(cat "$dir/fake/literal")" ] || fail "a refused relaunch must not launch a harness"
+  pass "fm-spawn --relaunch: an ambiguous endpoint still refuses"
+}
+
+test_spawn_relaunch_refuses_an_unreadable_endpoint() {
+  local dir out rc
+  dir=$(new_case unreadable rl50)
+  add_ship_task "$dir" rl50 claude
+  : > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" rl50 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "an unreadable endpoint must refuse"
+  assert_contains "$out" "reads 'unreadable'" "the refusal should name the observed state"
+  [ -z "$(cat "$dir/fake/literal")" ] || fail "a refused relaunch must not launch a harness"
+  pass "fm-spawn --relaunch: an unreadable endpoint still refuses"
+}
+
+test_spawn_relaunch_refuses_a_backend_with_no_recovery_classifier() {
+  local dir out rc
+  dir=$(new_case unverified-backend rl51)
+  add_ship_task "$dir" rl51 claude
+  make_missing_endpoint "$dir"
+  sed -i "s#^window=.*#window=zses:7#" "$dir/home/state/rl51.meta"
+  {
+    echo "backend=zellij"
+    echo "zellij_session=zses"
+    echo "zellij_tab_id=3"
+    echo "zellij_pane_id=7"
+  } >> "$dir/home/state/rl51.meta"
+
+  out=$(run_spawn "$dir" rl51 --relaunch --harness claude); rc=$?
+  expect_code 1 "$rc" "a backend with no recovery-grade classifier must refuse"
+  assert_contains "$out" "recovery-grade agent-state classifier" \
+    "the refusal should name the missing classifier"
+  pass "fm-spawn --relaunch: a backend that cannot classify an endpoint still refuses"
+}
+
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
@@ -1358,3 +1691,17 @@ test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_contradicting_flags
 test_spawn_relaunch_refuses_an_unrecorded_task
 test_spawn_relaunch_refuses_a_pane_outside_the_worktree
+test_missing_endpoint_recreates_the_endpoint_in_the_recorded_worktree
+test_missing_endpoint_refuses_a_live_process_in_the_recorded_worktree
+test_missing_endpoint_refuses_an_unscannable_worktree
+test_missing_endpoint_refuses_a_secondmate_kind
+test_missing_endpoint_refuses_an_absent_worktree
+test_missing_endpoint_refuses_a_non_root_worktree
+test_missing_endpoint_refuses_when_the_recorded_session_is_gone
+test_missing_endpoint_launch_failure_keeps_the_prior_record
+test_missing_endpoint_post_create_failure_closes_the_replacement
+test_missing_endpoint_success_never_closes_the_published_endpoint
+test_spawn_relaunch_recovers_a_missing_endpoint_from_the_record
+test_spawn_relaunch_refuses_an_ambiguous_endpoint
+test_spawn_relaunch_refuses_an_unreadable_endpoint
+test_spawn_relaunch_refuses_a_backend_with_no_recovery_classifier

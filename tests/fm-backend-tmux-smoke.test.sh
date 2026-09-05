@@ -169,5 +169,60 @@ state=$(fm_backend_agent_state tmux "$TARGET")
 fm_backend_tmux_kill "$TARGET" || fail "fm_backend_tmux_kill on an already-dead target must stay best-effort (never fail)"
 pass "real tmux: kill removes the window and the readable session inventory authoritatively classifies it missing"
 
+# --- recreating a missing endpoint in the recorded session -------------------
+# Recovering a worker whose endpoint vanished creates exactly one replacement
+# window in the session the task already recorded, opened at its recorded
+# worktree (bin/fm-spawn.sh's --relaunch recovery path). The classification
+# above is what licenses it, and these are the two real-tmux facts that path
+# depends on: the window really opens in that directory, and it can be closed
+# again by the exact id the create returned rather than by a shared name.
+
+WORKTREE=$(mktemp -d "${TMPDIR:-/tmp}/fm-backend-smoke-wt.XXXXXX")
+WORKTREE=$(cd "$WORKTREE" && pwd -P)
+REPLACEMENT_ID=$(fm_backend_tmux_create_task "$SESSION" "$WINDOW" "$WORKTREE") \
+  || fail "a replacement window could not be created in the recorded session"
+case "$REPLACEMENT_ID" in
+  @*) : ;;
+  *) fail "the replacement create should return an immutable window id, got '$REPLACEMENT_ID'" ;;
+esac
+seen=
+for _ in $(seq 1 50); do
+  seen=$(fm_backend_tmux_current_path "$REPLACEMENT_ID")
+  [ -n "$seen" ] && [ "$(cd "$seen" 2>/dev/null && pwd -P)" = "$WORKTREE" ] && break
+  sleep 0.1
+done
+[ -n "$seen" ] && [ "$(cd "$seen" 2>/dev/null && pwd -P)" = "$WORKTREE" ] \
+  || fail "the replacement window's shell should sit in the recorded worktree, got '${seen:-none}'"
+pass "real tmux: a replacement endpoint is created in the recorded session with its shell in the recorded worktree"
+
+OTHER_ID=$(fm_backend_tmux_create_task "$SESSION" "fm-smoke-bystander" "$HOME") \
+  || fail "could not create the bystander window"
+fm_backend_tmux_kill_window_id "$REPLACEMENT_ID" \
+  || fail "closing the replacement window by its exact id failed"
+if tmux list-windows -t "$SESSION" -F '#{window_id}' | grep -qx "$REPLACEMENT_ID"; then
+  fail "the replacement window should be gone after being closed by id"
+fi
+tmux list-windows -t "$SESSION" -F '#{window_id}' | grep -qx "$OTHER_ID" \
+  || fail "closing one window by id must never take a sibling with it"
+if fm_backend_tmux_kill_window_id "$WINDOW" 2>/dev/null; then
+  fail "closing by a window NAME must be refused; only an immutable id is accepted"
+fi
+pass "real tmux: an unpublished replacement window is closed by its exact id, and a name is refused"
+
+rm -rf "$WORKTREE"
+fm_backend_tmux_session_exists "$SESSION" \
+  || fail "the live session should be reported present by exact name"
+if fm_backend_tmux_session_exists "no-such-session-xyz" 2>/dev/null; then
+  fail "a session that does not exist must not be reported present"
+fi
+tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
+if fm_backend_tmux_session_exists "$SESSION" 2>/dev/null; then
+  fail "a killed session must no longer be reported present"
+fi
+if fm_backend_tmux_create_task "$SESSION" "$WINDOW" "$HOME" 2>/dev/null; then
+  fail "creating a replacement in a session that no longer exists must fail, never invent one"
+fi
+pass "real tmux: a vanished recorded session is reported absent and yields no replacement endpoint at all"
+
 cleanup_all
 trap - EXIT
