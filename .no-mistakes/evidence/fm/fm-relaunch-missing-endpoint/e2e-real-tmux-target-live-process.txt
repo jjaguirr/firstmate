@@ -1,0 +1,83 @@
+=== target-live-process: repo=/home/ubuntu/.no-mistakes/worktrees/9c45ef16ef2c/01M1W7PKH4R7NJTNJ5YDR4EMVK  case=/tmp/fm-e2e-target-live-process.wbRiWc
+
+$ tmux list-windows -t fmses  (before the pane is torn down)
+@0 bash /tmp/fm-e2e-target-live-process.wbRiWc bash
+@1 fm-e2e1 /tmp/fm-e2e-target-live-process.wbRiWc/wt bash
+
+$ fm_backend_agent_state tmux fmses:fm-e2e1
+dead
+
+$ tmux kill-window -t fmses:fm-e2e1   # the operator's terminal for the worker is destroyed
+
+$ tmux list-windows -t fmses
+@0 bash /tmp/fm-e2e-target-live-process.wbRiWc bash
+
+$ fm_backend_agent_state tmux fmses:fm-e2e1
+missing
+
+$ cat state/e2e1.meta   (recorded identity before recovery)
+window=fmses:fm-e2e1
+endpoint_task_id=e2e1
+worktree=/tmp/fm-e2e-target-live-process.wbRiWc/wt
+project=/tmp/fm-e2e-target-live-process.wbRiWc/proj
+harness=claude
+kind=ship
+mode=no-mistakes
+yolo=off
+model=default
+effort=default
+
+$ (cd wt && sleep 300) &   # a detached process still rooted in the worktree, pid 3397023
+
+$ bin/fm-control.sh e2e1 relaunch --note 'the worker terminal disappeared'
+error: task e2e1's endpoint is gone but process(es) 3397023 still runs from its recorded worktree /tmp/fm-e2e-target-live-process.wbRiWc/wt; refusing to start a second agent on work another process is holding
+error: the replacement agent for e2e1 could not be launched on claude
+error: e2e1's endpoint was already missing and the replacement did not launch; nothing was stopped, and its prior durable record, work, and recorded progress note are preserved at /tmp/fm-e2e-target-live-process.wbRiWc/wt
+exit=1
+
+$ bin/fm-spawn.sh e2e1 --relaunch   (the launch half, driven directly)
+error: task e2e1's endpoint is gone but process(es) 3397023 still runs from its recorded worktree /tmp/fm-e2e-target-live-process.wbRiWc/wt; refusing to start a second agent on work another process is holding
+exit=1
+
+$ tmux list-windows -t fmses   (after)
+@0 bash /tmp/fm-e2e-target-live-process.wbRiWc bash
+
+$ tmux capture-pane -p -t fmses:fm-e2e1 | tail -5
+can't find window: fm-e2e1
+
+$ cat state/e2e1.meta   (after)
+window=fmses:fm-e2e1
+endpoint_task_id=e2e1
+worktree=/tmp/fm-e2e-target-live-process.wbRiWc/wt
+project=/tmp/fm-e2e-target-live-process.wbRiWc/proj
+harness=claude
+kind=ship
+mode=no-mistakes
+yolo=off
+model=default
+effort=default
+
+$ cat state/e2e1.control-relaunch   (transaction journal)
+v1
+task=e2e1
+phase=failed:launching
+ts=2026-09-06T21:16:05Z
+backend=tmux
+endpoint=fmses:fm-e2e1
+worktree=/tmp/fm-e2e-target-live-process.wbRiWc/wt
+kind=ship
+from_harness=claude
+from_model=default
+from_effort=default
+to_harness=claude
+to_model=default
+to_effort=default
+rollback=prior-record-kept
+
+$ git -C wt rev-parse HEAD ; git status --short
+before=baee1bdb3dd9630edce50463e40e09e6c8316b25
+after =baee1bdb3dd9630edce50463e40e09e6c8316b25
+
+$ ls worktrees: git -C proj worktree list
+/tmp/fm-e2e-target-live-process.wbRiWc/proj  d7edea2 [master]
+/tmp/fm-e2e-target-live-process.wbRiWc/wt    baee1bd [task-e2e1]

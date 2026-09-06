@@ -1,0 +1,4 @@
+lsof=fail      -> status=2 pids=[]
+lsof=empty     -> status=2 pids=[]
+lsof=self-only -> status=1 pids=[]
+lsof=foreign   -> status=0 pids=[424242]
