@@ -1568,6 +1568,62 @@ test_missing_endpoint_post_create_failure_closes_the_replacement() {
   pass "fm-control relaunch: an aborted recovery closes its own replacement and stays recoverable"
 }
 
+test_missing_endpoint_publish_failure_closes_the_replacement() {
+  local dir out rc real_mv meta
+  dir=$(new_case missing-publish-failure rl53)
+  add_ship_task "$dir" rl53 claude
+  make_missing_endpoint "$dir"
+  meta="$dir/home/state/rl53.meta"
+  cp "$meta" "$dir/meta.before"
+  real_mv=$(command -v mv)
+  make_mv_failure_stub "$dir"
+
+  out=$(FM_REAL_MV="$real_mv" FM_FAKE_META_PUBLISH_MV_FAIL="$meta" \
+    run_control "$dir" rl53 relaunch --note "the record never landed"); rc=$?
+  expect_code 1 "$rc" "a failed metadata publication must fail the recovery"$'\n'"$out"
+  assert_grep 'kill-window' "$dir/fake/killed" \
+    "a replacement whose record never landed must be closed"
+  assert_grep '@replacement' "$dir/fake/killed" \
+    "the unpublished replacement must be closed by its exact id"
+  [ ! -s "$dir/fake/windows" ] \
+    || fail "a failed publication must leave no orphan replacement endpoint"
+  cmp -s "$meta" "$dir/meta.before" \
+    || fail "a failed publication must retain the prior durable record"
+  [ "$(journal_field "$dir" rl53 rollback)" = prior-record-kept ] \
+    || fail "the journal should record the unpublished replacement rollback"
+  pass "fm-control relaunch: a replacement whose record never published is closed"
+}
+
+test_missing_endpoint_recovery_runs_from_inside_the_worktree() {
+  local dir out rc shell
+  dir=$(new_case missing-from-inside rl54)
+  add_ship_task "$dir" rl54 claude
+  make_missing_endpoint "$dir"
+  # The operator runs the recovery from a shell inside the recorded worktree,
+  # through an ancestor whose command name contains a space, as a terminal
+  # multiplexer's does. Every ancestor rooted in the worktree is the operator,
+  # not a stranded worker, so the probe must walk past that name.
+  shell="$dir/tm ux"
+  cp "$(command -v bash)" "$shell"
+  chmod +x "$shell"
+  cat > "$dir/inside.sh" <<'SH'
+#!/usr/bin/env bash
+cd "$1" || exit 1
+shift
+"$@"
+rc=$?
+exit "$rc"
+SH
+  chmod +x "$dir/inside.sh"
+
+  out=$("$dir/inside.sh" "$dir/wt" env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
+    FM_FAKE_DIR="$dir/fake" FM_SPAWN_NO_GUARD=1 GROK_HOME="$dir/grokhome" \
+    "$shell" -c '"$0" "$@"; rc=$?; exit "$rc"' "$SPAWN" rl54 --relaunch --harness claude 2>&1); rc=$?
+  expect_code 0 "$rc" "the operator's own shell inside the worktree must not read as a stranded worker"$'\n'"$out"
+  assert_grep 'fm-rl54' "$dir/fake/windows" "the recovery must create the replacement endpoint"
+  pass "fm-spawn --relaunch: the recovery runs from inside the recorded worktree"
+}
+
 test_missing_endpoint_success_never_closes_the_published_endpoint() {
   local dir out rc
   dir=$(new_case missing-keep-endpoint rl47)
@@ -1700,6 +1756,8 @@ test_missing_endpoint_refuses_a_non_root_worktree
 test_missing_endpoint_refuses_when_the_recorded_session_is_gone
 test_missing_endpoint_launch_failure_keeps_the_prior_record
 test_missing_endpoint_post_create_failure_closes_the_replacement
+test_missing_endpoint_publish_failure_closes_the_replacement
+test_missing_endpoint_recovery_runs_from_inside_the_worktree
 test_missing_endpoint_success_never_closes_the_published_endpoint
 test_spawn_relaunch_recovers_a_missing_endpoint_from_the_record
 test_spawn_relaunch_refuses_an_ambiguous_endpoint

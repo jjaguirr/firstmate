@@ -722,16 +722,23 @@ parse_orca_worktree_result() {
 # be scanned at all, which the caller treats as a refusal rather than as
 # absence. This process and its own ancestors are excluded, so running the
 # recovery from inside the recorded worktree is not mistaken for a stranded
-# worker. On Linux a /proc entry whose cwd cannot be read belongs to another
-# user and therefore to no agent this home ever spawned.
+# worker; the lsof scan runs as a direct child whose exact pid is excluded too,
+# since it inherits this cwd. A scan that fails or reports nothing did not
+# happen, because a working lsof always lists itself, so it is unscannable
+# rather than empty. On Linux a /proc entry whose cwd cannot be read belongs to
+# another user and therefore to no agent this home ever spawned.
 relaunch_worktree_live_process() {  # <worktree> -> prints conflicting pids
-  local worktree=$1 real proc pid cwd line path self found='' ancestors=' '
+  local worktree=$1 real proc pid cwd line path self found='' ancestors=' ' \
+    scan scan_ok stat
   real=$(cd "$worktree" 2>/dev/null && pwd -P) || return 2
   self=${BASHPID:-$$}
   while [ -n "$self" ] && [ "$self" != 0 ]; do
     ancestors="$ancestors$self "
     if [ -r "/proc/$self/stat" ]; then
-      self=$(awk '{print $4}' "/proc/$self/stat" 2>/dev/null) || self=
+      stat=$(cat "/proc/$self/stat" 2>/dev/null) || stat=
+      stat=${stat##*) }
+      self=${stat#* }
+      self=${self%% *}
     else
       self=$(LC_ALL=C ps -o ppid= -p "$self" 2>/dev/null | tr -d ' ') || self=
     fi
@@ -748,15 +755,27 @@ relaunch_worktree_live_process() {  # <worktree> -> prints conflicting pids
       esac
     done
   elif command -v lsof >/dev/null 2>&1; then
+    scan=$(mktemp "${TMPDIR:-/tmp}/fm-relaunch-scan.XXXXXX") || return 2
+    lsof -a -d cwd -Fpn > "$scan" 2>/dev/null &
+    pid=$!
+    ancestors="$ancestors$pid "
+    if ! wait "$pid" || [ ! -s "$scan" ]; then
+      rm -f "$scan"
+      return 2
+    fi
     pid=
+    scan_ok=1
     while IFS= read -r line; do
       case "$line" in
         p*)
           pid=${line#p}
-          case "$pid" in ''|*[!0-9]*) return 2 ;; esac
+          case "$pid" in ''|*[!0-9]*) scan_ok=0; break ;; esac
           ;;
         n*)
-          [ -n "$pid" ] || return 2
+          if [ -z "$pid" ]; then
+            scan_ok=0
+            break
+          fi
           path=${line#n}
           case "$ancestors" in *" $pid "*) continue ;; esac
           case "$path" in
@@ -764,9 +783,9 @@ relaunch_worktree_live_process() {  # <worktree> -> prints conflicting pids
           esac
           ;;
       esac
-    done <<EOF
-$(lsof -a -d cwd -Fpn 2>/dev/null)
-EOF
+    done < "$scan"
+    rm -f "$scan"
+    [ "$scan_ok" = 1 ] || return 2
   else
     return 2
   fi
@@ -818,7 +837,9 @@ spawn_abort_cleanup() {
     fi
   fi
   if [ -n "$RELAUNCH_REPLACEMENT_ENDPOINT_TARGET" ] \
-     && [ "$SPAWN_META_PUBLISH_STARTED" = 0 ]; then
+     && { [ "$SPAWN_META_PUBLISH_STARTED" = 0 ] \
+          || { [ -n "$SPAWN_META_TMP" ] \
+               && { [ -e "$SPAWN_META_TMP" ] || [ -L "$SPAWN_META_TMP" ]; }; }; }; then
     if ! relaunch_replacement_endpoint_close \
         "$RELAUNCH_REPLACEMENT_ENDPOINT_BACKEND" \
         "$RELAUNCH_REPLACEMENT_ENDPOINT_TARGET"; then
