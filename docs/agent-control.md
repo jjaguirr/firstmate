@@ -32,7 +32,7 @@ A recorded `harness=` is not always an exact adapter name: a task launched from 
 | --- | --- | --- |
 | `interrupt` | Deliver the harness's verified interrupt sequence while leaving the agent running. | Delivery succeeds while the endpoint still exists and the agent is still alive where the backend can classify that; cancellation is confirmed only from an adapter-owned acknowledgement and otherwise reports `cancel=unconfirmed`. |
 | `exit` | Stop the agent, preserving the endpoint, the worktree, and every uncommitted change. | The backend's recovery-grade classifier reports the agent gone. Already-stopped is idempotent success. |
-| `relaunch` | Replace the running agent with a new one in the same endpoint and worktree, on the exact recorded adapter or an explicitly chosen harness, model, and effort. | The new agent is alive on the recorded endpoint, and the durable record names the harness that is actually running. |
+| `relaunch` | Replace the agent with a new one in the same endpoint and worktree, on the exact recorded adapter or an explicitly chosen harness, model, and effort. When the recorded endpoint is positively gone, recreate one for the task in that same worktree instead. | The new agent is alive on the endpoint the durable record now names, and that record names the harness that is actually running. |
 
 An exit that delivers lifecycle input but cannot prove the agent stopped fails with `exit=unconfirmed`, reports the observed agent state and any interrupt cancellation claim, and never claims that nothing changed.
 Interrupt never rewrites busy state as proof of its own success.
@@ -69,7 +69,10 @@ It is not deterministic across the verified adapters: codex and grok resume only
    A ship or scout relaunch requires `--note`, because the replacement inherits the local copy but none of the conversation; the note is appended to the instructions it reads.
    A secondmate relaunch does not require one and never rewrites its standing charter.
 4. **Stop the old agent** through the `exit` verb, with its postcondition.
-5. **Launch the replacement** through its single owner, `bin/fm-spawn.sh --relaunch`, which adopts the recorded endpoint and worktree instead of creating either, clears the previous harness's per-task wiring, and arms a fresh busy generation.
+   A positively missing endpoint has no agent to stop, so this step is skipped and journalled as `reattaching` with `exit_result=endpoint-missing-reattach` rather than swallowed as a failure; the checkpoint above still ran and still refused everything it refuses today.
+5. **Launch the replacement** through its single owner, `bin/fm-spawn.sh --relaunch`, which reuses the recorded worktree instead of allocating one, clears the previous harness's per-task wiring, and arms a fresh busy generation.
+   It adopts the recorded endpoint when one is there, and creates exactly one replacement endpoint in the recorded session and worktree when the recorded endpoint is gone.
+   Because a recreated endpoint has a new identity, the control plane re-reads the published record for the endpoint it waits on.
 
 Switching harness is therefore one ordinary relaunch rather than a separate mechanism.
 
@@ -77,6 +80,7 @@ Switching harness is therefore one ordinary relaunch rather than a separate mech
 
 - A refusal **before** the agent is stopped leaves the durable record and the instructions byte-identical.
 - A launch failure **after** the agent is stopped restores the prior durable record, keeps the progress note so a later recovery still has it, marks the journal `failed:launching`, and reports plainly that no agent is running and where the work is preserved.
+  When the endpoint was already missing, the same rollback applies and the report says plainly that nothing was stopped, because there was never an agent to stop.
 - If the launch owner already published the new record but no running agent can be confirmed, the new record is kept: the task is recorded on the new harness with no agent confirmed, which is exactly what recovery reconciles.
   Rewriting it back to the old harness would be a second, worse inaccuracy.
 
@@ -98,19 +102,24 @@ Switching harness is therefore one ordinary relaunch rather than a separate mech
   zellij, orca, and cmux are refused rather than reported as successful blind.
 - An ambiguous or unreadable endpoint state refuses.
   Only a positively classified state acts.
-- `fm-spawn --relaunch` independently refuses unless the recorded endpoint is positively agent-free and its shell is sitting in the recorded worktree, so a replacement can never join a live agent or start outside the copy holding the work.
+- `fm-spawn --relaunch` independently refuses unless the endpoint is positively agent-free or positively gone and the endpoint's shell is sitting in the recorded worktree, so a replacement can never join a live agent or start outside the copy holding the work.
+  It is the single owner of that admission gate, so a direct invocation is held to exactly the same rules as one the control plane drives.
+- Recreating a positively missing endpoint is allowed only for an ordinary ship or scout worker, and only after no live process is found rooted in its recorded worktree - a host that cannot be scanned for one refuses rather than assuming none.
+  A secondmate is not recovered here at all: its home is relaunched through its own seeded-home spawn, which the session-start liveness sweep already runs for a missing endpoint.
+  A vanished tmux session, or a Herdr record bound to a projected presentation workspace, to another session, or to a workspace that still exists but is not this home's own, all refuse before anything is created.
+  A replacement endpoint that is created but never published is closed again by its exact id, so an aborted recovery leaves no orphan shell rooted in the worktree.
 
 ## Capability matrix
 
 Backend capability comes from each adapter's real surface, not from a policy choice.
 
-| Backend | Escape | Enter | Ctrl+C | Ctrl+U | Recovery-grade agent state |
-| --- | --- | --- | --- | --- | --- |
-| tmux | yes | yes | yes | yes | yes |
-| herdr | yes | yes | yes | yes | yes |
-| zellij | yes | yes | yes | yes | no |
-| cmux | yes | yes | yes | yes | no |
-| orca | no | yes | yes | no | no |
+| Backend | Escape | Enter | Ctrl+C | Ctrl+U | Recovery-grade agent state | Recreate a missing endpoint |
+| --- | --- | --- | --- | --- | --- | --- |
+| tmux | yes | yes | yes | yes | yes | yes - one window in the recorded live session, opened at the recorded worktree |
+| herdr | yes | yes | yes | yes | yes | yes - one tab and pane in the recorded session's own home workspace, opened at the recorded worktree |
+| zellij | yes | yes | yes | yes | no | no - nothing can prove a vanished pane has no live agent |
+| cmux | yes | yes | yes | yes | no | no - nothing can prove a vanished surface has no live agent |
+| orca | no | yes | yes | no | no | no - nothing can prove the terminal's state, and Orca owns worktree lifecycle |
 
 Per-harness interrupt keys, repeat counts, composer clears, exit commands, and supported task kinds live in `bin/fm-control-lib.sh` and are exercised for every verified harness by `tests/fm-control.test.sh`.
 The empirical basis for each adapter's value is the `harness-adapters` skill's verification record for that adapter.
@@ -118,5 +127,7 @@ The empirical basis for each adapter's value is the `harness-adapters` skill's v
 ## Verification
 
 - `tests/fm-control.test.sh` - the adapter contract for every verified harness, the backend capability matrix, exact-id scoping, the closed verb list, the busy, idle, dead, and idempotent lifecycle cases, and marker non-regression, all against a stubbed session provider.
-- `tests/fm-control-relaunch.test.sh` - the relaunch transaction: identity preservation, harness switching, the progress note, checkpoint refusals, and rollback after a failed launch.
-- `tests/fm-control-herdr-smoke.test.sh` - the second state-verified backend against the real herdr binary, on an isolated throwaway lab session.
+- `tests/fm-control-relaunch.test.sh` - the relaunch transaction: identity preservation, harness switching, the progress note, checkpoint refusals, rollback after a failed launch, recreating a positively missing endpoint in its own worktree, and every refusal that must not move with it.
+- `tests/fm-backend-tmux-smoke.test.sh` - the reference backend against a real tmux server: creating a replacement endpoint in an existing session at an exact worktree, and refusing when the recorded session is gone.
+- `tests/fm-control-herdr-smoke.test.sh` - the second state-verified backend against the real herdr binary, on an isolated throwaway lab session, including recovering a closed pane, whose closure also deleted its single-task workspace, into a new pane in the same session and worktree inside the home's re-ensured workspace.
+  [`docs/verification/runtime-backends.md`](verification/runtime-backends.md) records the dated per-backend result.

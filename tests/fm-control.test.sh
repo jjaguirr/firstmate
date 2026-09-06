@@ -636,7 +636,8 @@ test_missing_endpoint_refuses() {
   out=$(run_control "$dir" t1 exit); rc=$?
   expect_code 1 "$rc" "a missing endpoint should refuse"
   assert_contains "$out" "recorded endpoint is gone" "the refusal should name the missing endpoint"
-  pass "fm-control exit: a vanished endpoint refuses instead of silently succeeding"
+  assert_contains "$out" "relaunch" "the refusal should name the verb that recovers a vanished endpoint"
+  pass "fm-control exit: a vanished endpoint refuses and points at the verb that recovers it"
 }
 
 test_interrupt_refuses_when_no_agent_runs() {

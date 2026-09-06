@@ -13,6 +13,14 @@
 # the adapter reads, so registering and not registering an agent on a plain
 # shell pane exercises exactly the classification the control plane gates on.
 #
+# The last section is the live guard for recovering a worker whose endpoint is
+# gone: it closes a real task pane, confirms the adapter classifies it
+# `missing`, and drives the supported recovery interface
+# (`bin/fm-spawn.sh <id> --relaunch`) against the real binary. A stub cannot
+# prove this, because both the classification and the workspace placement come
+# from Herdr's own responses. Run this file after every Herdr upgrade and
+# refresh docs/verification/runtime-backends.md from what it prints.
+#
 # Always runs on a private, named, throwaway lab session, never the default
 # one (tests/herdr-test-safety.sh; the 2026-07-02 incident). Skips cleanly
 # when herdr or jq is missing.
@@ -147,3 +155,114 @@ esac
 pass "real herdr: an agent that does not stop fails closed instead of being reported as stopped"
 
 fm_backend_herdr_kill "$SESSION:$PANE_ID" 2>/dev/null || true
+
+# --- recovering a task whose pane is gone ------------------------------------
+# A closed pane is the stranded shape: the worktree and its commits survive
+# while the endpoint does not. The recovery must create ONE replacement pane in
+# the same named session and the same home workspace, keep the recorded
+# worktree, and never allocate a second one.
+
+RECOVER_WT="$SCRATCH/wt-recover"
+git -C "$PROJ" worktree add --quiet -b hrecover "$RECOVER_WT"
+printf 'work the replacement must inherit\n' > "$RECOVER_WT/landed.txt"
+git -C "$RECOVER_WT" add landed.txt
+git -C "$RECOVER_WT" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+  commit -qm 'work that must survive recovery'
+RECOVER_HEAD=$(git -C "$RECOVER_WT" rev-parse HEAD)
+
+mkdir -p "$HOME_DIR/data/hrecover" "$SCRATCH/fakebin"
+printf '# brief\n' > "$HOME_DIR/data/hrecover/brief.md"
+# A harness and a Treehouse the spawn dependency check can see. The recovery
+# path never allocates a worktree, so a `treehouse get` here would itself be
+# the defect: this stub fails loudly if one is ever requested.
+cat > "$SCRATCH/fakebin/claude" <<'SH'
+#!/usr/bin/env bash
+exec sleep 120
+SH
+cat > "$SCRATCH/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  get) echo 'treehouse get must never run on the recovery path' >&2; exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$SCRATCH/fakebin/claude" "$SCRATCH/fakebin/treehouse"
+
+# The fixture pane must live in the workspace THIS home owns, because that is
+# the container the recovery re-resolves. Both calls are made under the same
+# FM_HOME the recovery will run with, exactly as bin/fm-spawn.sh makes them.
+RECOVER_CONTAINER_RAW=$(FM_HOME="$HOME_DIR" fm_backend_herdr_container_ensure "$RECOVER_WT" launcher-home) \
+  || fail "could not ensure this home's own herdr workspace for the recovery fixture"
+RECOVER_CONTAINER=${RECOVER_CONTAINER_RAW%%$'\t'*}
+RECOVER_SEEDED_TAB_ID=${RECOVER_CONTAINER_RAW#*$'\t'}
+RECOVER_WORKSPACE_ID=${RECOVER_CONTAINER#*:}
+RECOVER_TASK_IDS=$(FM_HOME="$HOME_DIR" fm_backend_herdr_create_task \
+  "$RECOVER_CONTAINER" "fm-hrecover" "$RECOVER_WT" "$RECOVER_SEEDED_TAB_ID") \
+  || fail "could not create the recovery fixture's task pane"
+read -r RECOVER_TAB_ID RECOVER_PANE_ID <<EOF
+$RECOVER_TASK_IDS
+EOF
+[ -n "$RECOVER_PANE_ID" ] || fail "create_task did not return a recovery fixture pane id"
+{
+  echo "window=$SESSION:$RECOVER_PANE_ID"
+  echo "endpoint_task_id=hrecover"
+  echo "worktree=$RECOVER_WT"
+  echo "project=$PROJ"
+  echo "harness=claude"
+  echo "kind=ship"
+  echo "mode=no-mistakes"
+  echo "yolo=off"
+  echo "model=default"
+  echo "effort=default"
+  echo "backend=herdr"
+  echo "herdr_session=$SESSION"
+  echo "herdr_workspace_id=$RECOVER_WORKSPACE_ID"
+  echo "herdr_tab_id=$RECOVER_TAB_ID"
+  echo "herdr_pane_id=$RECOVER_PANE_ID"
+} > "$HOME_DIR/state/hrecover.meta"
+
+fm_backend_herdr_kill "$SESSION:$RECOVER_PANE_ID" 2>/dev/null || true
+STATE=$(fm_backend_agent_state herdr "$SESSION:$RECOVER_PANE_ID")
+[ "$STATE" = missing ] \
+  || fail "a closed herdr pane must classify missing before recovery is exercised, got '$STATE'"
+# That pane was the only one in its workspace's only tab (create_task pruned
+# the seeded default tab), and closing a workspace's last tab deletes the
+# workspace itself. This fixture therefore exercises the reported trigger of a
+# closed Herdr workspace: the recorded workspace must read positively dead so
+# recovery re-ensures this home's own container instead of refusing.
+RECORDED_WS_STATE=$(fm_backend_herdr_workspace_presence_state "$SESSION" "$RECOVER_WORKSPACE_ID")
+[ "$RECORDED_WS_STATE" = dead ] \
+  || fail "closing the recovery fixture's last pane must delete its workspace before recovery is exercised, got '$RECORDED_WS_STATE'"
+
+OUT=$(env PATH="$SCRATCH/fakebin:$PATH" FM_HOME="$HOME_DIR" FM_ROOT_OVERRIDE="$ROOT" \
+  HERDR_SESSION="$SESSION" FM_SPAWN_NO_GUARD=1 \
+  "$ROOT/bin/fm-spawn.sh" hrecover --relaunch --harness claude 2>&1) \
+  || fail "recovering a missing herdr endpoint failed: $OUT"
+
+NEW_WINDOW=$(sed -n 's/^window=//p' "$HOME_DIR/state/hrecover.meta")
+NEW_PANE=$(sed -n 's/^herdr_pane_id=//p' "$HOME_DIR/state/hrecover.meta")
+NEW_WORKSPACE=$(sed -n 's/^herdr_workspace_id=//p' "$HOME_DIR/state/hrecover.meta")
+[ -n "$NEW_PANE" ] && [ "$NEW_PANE" != "$RECOVER_PANE_ID" ] \
+  || fail "recovery must publish a distinct replacement pane, got '${NEW_PANE:-none}'"
+[ "$NEW_WINDOW" = "$SESSION:$NEW_PANE" ] \
+  || fail "the published endpoint must name the recorded session and the new pane, got '$NEW_WINDOW'"
+[ -n "$NEW_WORKSPACE" ] && [ "$NEW_WORKSPACE" != "$RECOVER_WORKSPACE_ID" ] \
+  || fail "recovery must publish the re-ensured home workspace, not the deleted recorded one, got '${NEW_WORKSPACE:-none}'"
+[ "$(fm_backend_herdr_workspace_presence_state "$SESSION" "$NEW_WORKSPACE")" = present ] \
+  || fail "the published replacement workspace must actually exist"
+REENSURED_CONTAINER_RAW=$(FM_HOME="$HOME_DIR" fm_backend_herdr_container_ensure "$RECOVER_WT" launcher-home) \
+  || fail "could not re-resolve this home's own herdr workspace after recovery"
+REENSURED_CONTAINER=${REENSURED_CONTAINER_RAW%%$'\t'*}
+[ "${REENSURED_CONTAINER#*:}" = "$NEW_WORKSPACE" ] \
+  || fail "recovery must land in this home's own re-ensured workspace ${REENSURED_CONTAINER#*:}, got '$NEW_WORKSPACE'"
+[ "$(fm_backend_herdr_pane_presence_state "$SESSION" "$NEW_PANE")" = present ] \
+  || fail "the published replacement pane must actually exist"
+[ "$(grep -c '^worktree=' "$HOME_DIR/state/hrecover.meta")" = 1 ] \
+  || fail "recovery must publish exactly one recorded worktree"
+grep -Fqx "worktree=$RECOVER_WT" "$HOME_DIR/state/hrecover.meta" \
+  || fail "recovery must keep the worktree the task already recorded"
+[ "$(git -C "$RECOVER_WT" rev-parse HEAD)" = "$RECOVER_HEAD" ] \
+  || fail "recovery must not move the committed work"
+pass "real herdr: a closed task pane whose workspace went with it is recovered into a new pane in the same session and worktree, inside this home's re-ensured workspace"
+
+fm_backend_herdr_kill "$SESSION:$NEW_PANE" 2>/dev/null || true
