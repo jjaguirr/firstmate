@@ -1616,6 +1616,8 @@ exit "$rc"
 SH
   chmod +x "$dir/inside.sh"
 
+  # The single-quoted string is a script body for the child shell, not text meant to expand here.
+  # shellcheck disable=SC2016
   out=$("$dir/inside.sh" "$dir/wt" env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" \
     FM_FAKE_DIR="$dir/fake" FM_SPAWN_NO_GUARD=1 GROK_HOME="$dir/grokhome" \
     "$shell" -c '"$0" "$@"; rc=$?; exit "$rc"' "$SPAWN" rl54 --relaunch --harness claude 2>&1); rc=$?
