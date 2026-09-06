@@ -62,6 +62,7 @@ That path needs the home label to identify exactly one workspace: two workspaces
 Avoid naming a personal workspace `firstmate` or `2ndmate-<id>` for that reason, and because the adapter cannot distinguish that label collision from its own container.
 An older secondmate workspace using `firstmate-<id>` is not migrated automatically; rename it manually before expecting new tasks or recovery to use it.
 Recovery and list-live still scan the first workspace matching the home label, because they address panes they already recorded rather than choosing where new work goes.
+The one recovery that does place new work, recreating a task's positively missing pane through the control plane's relaunch, uses this same home-workspace placement and refuses a recorded workspace that still exists but is not this home's own; [agent-control.md](agent-control.md#fail-closed-boundaries) owns that rule.
 
 Existing task operations use recorded endpoint ids and do not move a live task when labels change.
 The per-home workspace is reused while it has task tabs.
