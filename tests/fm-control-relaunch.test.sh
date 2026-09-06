@@ -1452,7 +1452,12 @@ test_missing_endpoint_refuses_a_secondmate_kind() {
   local dir home out rc
   dir=$(new_case missing-secondmate sm9)
   home="$dir/home"
-  mkdir -p "$home/data/sm9"
+  mkdir -p "$home/data/sm9" "$home/config"
+  # A secondmate relaunch re-resolves its configured harness pin before the
+  # launch owner sees the task, so pin one here: with no pin, fm-harness.sh
+  # falls back to the calling environment, which is an unverified harness on
+  # a bare CI runner and refuses for the wrong reason.
+  printf 'claude\n' > "$home/config/secondmate-harness"
   printf '# secondmate brief\n' > "$home/data/sm9/brief.md"
   fm_git_worktree "$dir/proj" "$dir/smhome" sm-branch
   mkdir -p "$dir/smhome/state" "$dir/smhome/data"

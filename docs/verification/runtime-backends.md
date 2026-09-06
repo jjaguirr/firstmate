@@ -617,7 +617,8 @@ ok - real herdr: an agent that does not stop fails closed instead of being repor
 The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so registering and not registering an agent on a plain shell pane exercises exactly the gate every lifecycle verb depends on, with no real agent launched.
 That command is the guard that refreshes this record; run it after every Herdr upgrade rather than trusting the version above.
 
-That same guard now also covers recovering a task whose pane is gone: it closes a real task pane, confirms the adapter classifies it `missing`, and drives `bin/fm-spawn.sh <id> --relaunch` against the real binary, asserting one replacement pane in the same named session and home workspace with the recorded worktree and its commits untouched.
+That same guard now also covers recovering a task whose pane is gone: it closes a real task pane, confirms the adapter classifies it `missing`, and drives `bin/fm-spawn.sh <id> --relaunch` against the real binary, asserting one replacement pane in the same named session with the recorded worktree and its commits untouched.
+Closing that pane also closes its tab, and closing a workspace's last tab deletes the workspace, so the guard confirms the recorded workspace reads positively `dead` and then asserts the replacement landed in this home's re-ensured workspace, the branch [agent-control.md](../agent-control.md#fail-closed-boundaries) licenses for a proven-gone workspace.
 That case has not yet been measured, so no result is recorded for it here; run the guard above on a host with a live Herdr fleet and add its `ok - real herdr: a closed task pane is recovered ...` line with the observed Herdr version and date.
 The portable half of the same behavior is pinned by `tests/fm-control-relaunch.test.sh` and the tmux half by [Missing-endpoint recovery](#missing-endpoint-recovery).
 
