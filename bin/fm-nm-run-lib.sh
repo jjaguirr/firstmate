@@ -55,19 +55,30 @@ fm_nm_field() {  # <toon-output> <key>
   printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*\(.*\)/\1/p" | head -1
 }
 
-# Does run head $2 match worktree $1's code identity? Three outcomes, because
-# "this run is provably not ours" and "we cannot tell whose run this is" are
-# different facts and collapsing them is what let a live run be misread as a
-# dead one (see the incident note in bin/fm-crew-state.sh's header):
+# Does run head $2 match worktree $1's code identity? Four outcomes, because
+# each names a different fact and collapsing any two of them is what let a live
+# run be misread as a dead one (see the incident notes in bin/fm-crew-state.sh's
+# header). "Provably not ours" and "we cannot tell whose run this is" were the
+# first pair to be separated; "the branch was rewritten" and "the crew committed
+# past the run" are the second, because a rewritten head is exactly what a
+# pipeline rebase leaves on the branch a crew owns, while a run head the crew
+# has since committed past is a run that crew genuinely moved on from:
 #
 #   $FM_NM_HEAD_MATCH (0)      attributable to this worktree
 #     - equal commits (short or full SHA), or
 #     - worktree HEAD is an ancestor of the run head, i.e. pipeline fix commits
 #       on the same history advanced the run tip past local HEAD
 #   $FM_NM_HEAD_MISMATCH (1)   provably NOT this worktree's code
-#     - run head is a strict ancestor of worktree HEAD (local work advanced
-#       outside the run), or the two diverged (the branch tip was rewritten)
+#     - run head is a strict ancestor of worktree HEAD: local work advanced
+#       outside the run, so the crew is past it
 #     - no head recorded at all, so there is nothing to bind
+#   $FM_NM_HEAD_DIVERGED (3)   provably not this worktree's code EITHER, but by
+#                              a rewrite rather than by the crew moving on
+#     - both heads resolve and neither is an ancestor of the other, so the
+#       branch's history was rewritten. Routinely that rewrite is the pipeline
+#       rebasing the branch this crew owns, after which no run row can match the
+#       local head again, so a caller reporting state may weigh branch identity
+#       here - see bin/fm-crew-state.sh's run-selection rules.
 #   $FM_NM_HEAD_UNRESOLVED (2) undecidable, NOT a refutation
 #     - the run head is not an object this worktree has, so neither the equality
 #       nor the ancestry test can run. The routine cause is benign and expected:
@@ -78,12 +89,15 @@ fm_nm_field() {  # <toon-output> <key>
 #     - the worktree's own HEAD cannot be read
 #
 # Callers that only ever attribute on proof can keep testing the exit status as
-# a boolean: both non-match outcomes are non-zero, so `... || return 1` still
-# refuses. A caller that reports state must branch on 2 explicitly rather than
-# reading it as a mismatch.
+# a boolean: every non-match outcome is non-zero, so `... || return 1` still
+# refuses on all three. bin/fm-teardown.sh depends on exactly that, and aborting
+# a run is destructive, so a diverged head must keep refusing there too. A
+# caller that reports state must branch on 2 and 3 explicitly rather than
+# reading either as a plain mismatch.
 FM_NM_HEAD_MATCH=0
 FM_NM_HEAD_MISMATCH=1
 FM_NM_HEAD_UNRESOLVED=2
+FM_NM_HEAD_DIVERGED=3
 fm_nm_head_matches_worktree() {  # <worktree> <run_head>
   local wt=$1 run_head=$2 local_full run_full
   [ -n "$run_head" ] || return "$FM_NM_HEAD_MISMATCH"
@@ -93,5 +107,7 @@ fm_nm_head_matches_worktree() {  # <worktree> <run_head>
   [ "$run_full" = "$local_full" ] && return "$FM_NM_HEAD_MATCH"
   git -C "$wt" merge-base --is-ancestor "$local_full" "$run_full" 2>/dev/null \
     && return "$FM_NM_HEAD_MATCH"
-  return "$FM_NM_HEAD_MISMATCH"
+  git -C "$wt" merge-base --is-ancestor "$run_full" "$local_full" 2>/dev/null \
+    && return "$FM_NM_HEAD_MISMATCH"
+  return "$FM_NM_HEAD_DIVERGED"
 }

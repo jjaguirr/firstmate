@@ -1929,22 +1929,56 @@ EOF
   assert_not_contains "$out" "state: working" "a superseded live row must not report working"
   assert_contains "$out" "state: failed" "the newest same-branch row's own word is reported"
   assert_contains "$out" "source: run-step" "the newest row's verdict stays run-step sourced"
-  assert_not_contains "$out" "superseded" "a coarse verdict must not bury the crew's open blocker"
-  assert_contains "$out" "waiting on a credential" "the crew's recorded blocker stays visible"
+  assert_contains "$out" "superseded (run failed)" "a terminated run leaves no open decision to keep"
   pass "a live row below a newer terminal row is not claimed"
+}
+
+# The rewrite acceptance must not swallow the OTHER refutation it used to share
+# an exit status with: a run head that is a strict ancestor of the worktree head
+# is a run this crew committed past, not a rebase, and attributing it reports a
+# healthy working crew as FAILED - the same harm, through the opposite fact.
+test_crew_committed_past_its_failed_run_is_not_claimed() {
+  reset_fakes
+  local d run_head out
+  d=$(new_case committed-past-failed)
+  make_repo_on_branch "$d/wt" fm/feat-past-failed
+  run_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/past-failed.meta" "window=fm:fm-past-failed" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: reworking the change the run rejected\n' > "$d/state/past-failed.status"
+  # The crew committed its fix on top of the run that failed, so that run's head
+  # is now a strict ancestor of the worktree head.
+  git -C "$d/wt" commit -q --allow-empty -m 'crew fix on top of the failed run'
+  git -C "$d/wt" merge-base --is-ancestor "$run_head" HEAD \
+    || fail "fixture run head must be a strict ancestor of the worktree head"
+  FM_FAKE_RUN_HEAD="$run_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-past-failed)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-past-failed $(git -C "$d/wt" rev-parse --short=8 "$run_head")  2026-09-07 02:02
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" past-failed
+  out=$(run_crew_state "$d" past-failed)
+  assert_not_contains "$out" "state: failed" "a run the crew committed past must not be attributed"
+  assert_not_contains "$out" "source: run-step" "a head merely behind the worktree carries no verdict"
+  assert_contains "$out" "state: working" "the crew's own current state is read instead"
+  pass "a crew that committed past its failed run is not claimed"
 }
 
 # --- the shared predicate itself (bin/fm-nm-run-lib.sh) ---------------------
 #
-# Three outcomes, not two: attributable, provably not ours, undecidable. The
-# incident above is what happens when the third collapses into the second.
+# Four outcomes, not two: attributable, behind us, rewritten, undecidable. Each
+# collapse cost an incident above - undecidable read as a refutation reported a
+# live parked run as the dead one below it, and a rewrite read as the crew
+# committing past its run reported a rebased branch's live owner as failed.
 head_match_rc() {  # <worktree> <run-head> -> echoes the exit status
   local rc=0
   fm_nm_head_matches_worktree "$1" "$2" || rc=$?
   printf '%s' "$rc"
 }
 
-test_head_predicate_reports_three_outcomes() {
+test_head_predicate_reports_four_outcomes() {
   local d live_head advanced rewritten rc
   d="$TMP_ROOT/head-predicate"
   mkdir -p "$d"
@@ -1966,17 +2000,23 @@ test_head_predicate_reports_three_outcomes() {
   rc=$(head_match_rc "$d" "$advanced")
   [ "$rc" = "$FM_NM_HEAD_MATCH" ] || fail "a descendant run head must attribute (got $rc)"
 
-  # Local work advanced past the run head: provably not this run's code.
+  # Local work advanced past the run head: provably not this run's code, and the
+  # crew moved on from it under its own steam.
   git -C "$d" commit -q --allow-empty -m 'local work after the run'
   rc=$(head_match_rc "$d" "$live_head")
   [ "$rc" = "$FM_NM_HEAD_MISMATCH" ] || fail "local work past the run head must refute (got $rc)"
 
-  # A rewritten (diverged) tip: also provably not ours.
+  # A rewritten (diverged) tip: also provably not ours, but a DIFFERENT fact -
+  # this is what a pipeline rebase leaves on the branch the crew owns.
   git -C "$d" checkout -q --orphan tmp-predicate-rewrite
   git -C "$d" commit -q --allow-empty -m 'rewritten tip'
   rewritten=$(git -C "$d" rev-parse HEAD)
   rc=$(head_match_rc "$d" "$live_head")
-  [ "$rc" = "$FM_NM_HEAD_MISMATCH" ] || fail "a diverged head must refute (got $rc)"
+  [ "$rc" = "$FM_NM_HEAD_DIVERGED" ] || fail "a diverged head must be its own outcome (got $rc)"
+  [ "$FM_NM_HEAD_DIVERGED" != "$FM_NM_HEAD_MISMATCH" ] \
+    || fail "a rewrite and a run the crew committed past must not share an outcome"
+  [ "$FM_NM_HEAD_DIVERGED" != "$FM_NM_HEAD_MATCH" ] \
+    || fail "a diverged head must still refuse a proof-only caller"
   [ -n "$rewritten" ] || fail "rewrite fixture produced no head"
 
   # No head recorded at all: nothing to bind, so a refusal, not a maybe.
@@ -1987,7 +2027,7 @@ test_head_predicate_reports_three_outcomes() {
   rc=$(head_match_rc "$d" 0123456789abcdef0123456789abcdef01234567)
   [ "$rc" = "$FM_NM_HEAD_UNRESOLVED" ] \
     || fail "an unresolvable run head must be its own outcome, not a mismatch (got $rc)"
-  pass "the shared head predicate separates undecidable from provably-not-ours"
+  pass "the shared head predicate reports four distinct outcomes"
 }
 
 test_active_run_is_authoritative
@@ -2059,6 +2099,7 @@ test_rebased_completed_row_beats_older_terminal_row_at_local_head
 test_live_rebased_row_overrides_a_dead_attributable_record
 test_rebased_terminal_row_does_not_hide_a_real_failure
 test_live_row_below_a_newer_terminal_row_is_not_claimed
-test_head_predicate_reports_three_outcomes
+test_crew_committed_past_its_failed_run_is_not_claimed
+test_head_predicate_reports_four_outcomes
 
 echo "all fm-crew-state tests passed"
