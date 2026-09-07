@@ -549,7 +549,7 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
         # left that can tell a live run from a dead one, so say so rather than
         # reading a pane or a stale log as if no run existed.
         emit_unresolved_head "$(strip_quotes "$(nm_field head)")"
-      elif [ "$coarse_rc" = 0 ] && [ -n "$COARSE_STATUS" ]; then
+      elif [ "$coarse_rc" = 0 ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse
       fi

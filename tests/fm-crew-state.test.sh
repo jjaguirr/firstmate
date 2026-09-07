@@ -1426,10 +1426,13 @@ test_missing_run_head_falls_back_to_current_state() {
 # refusals that must NOT widen as a result.
 
 # A branch at <branch> whose local head is the DEAD run's head, with the live
-# run one commit further on. Echoes "<dead-head> <live-head>". With `absent` the
-# live commit is removed from the local object store, reproducing the local copy
-# that has not yet synced the pipeline's pushed commits; with `present` it is
-# still resolvable, the same shape once that sync has happened.
+# run one commit further on. Sets STALE_DEAD_HEAD and STALE_LIVE_HEAD. With
+# `absent` the live commit is removed from the local object store, reproducing
+# the local copy that has not yet synced the pipeline's pushed commits; with
+# `present` it is still resolvable, the same shape once that sync has happened.
+#
+# Call this as a plain command, never in a command substitution: the `absent`
+# guard below must be able to end the run, which it cannot do from a subshell.
 make_stale_local_head_repo() {  # <dir> <branch> <present|absent>
   local dir=$1 branch=$2 live=$3 dead_head live_head
   mkdir -p "$dir"
@@ -1447,18 +1450,19 @@ make_stale_local_head_repo() {  # <dir> <branch> <present|absent>
     git -C "$dir" rev-parse --verify -q "${live_head}^{commit}" >/dev/null 2>&1 \
       && fail "fixture did not remove the live run head from the local object store"
   fi
-  printf '%s %s\n' "$dead_head" "$live_head"
+  STALE_DEAD_HEAD=$dead_head
+  STALE_LIVE_HEAD=$live_head
 }
 
 # Both runs are attributable - the dead one by equality with the stale local
 # head, the live one by ancestry - so the live run must win.
 test_live_run_beats_dead_run_at_stale_local_head() {
   reset_fakes
-  local d heads dead_head live_head out
+  local d dead_head live_head out
   d=$(new_case live-beats-dead)
-  heads=$(make_stale_local_head_repo "$d/wt" fm/feat-live-dead present)
-  dead_head=${heads%% *}
-  live_head=${heads##* }
+  make_stale_local_head_repo "$d/wt" fm/feat-live-dead present
+  dead_head=$STALE_DEAD_HEAD
+  live_head=$STALE_LIVE_HEAD
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/live-dead.meta" "window=fm:fm-live-dead" "worktree=$d/wt" "kind=ship" "harness=claude"
   printf 'needs-decision: review gate\n' > "$d/state/live-dead.status"
@@ -1482,11 +1486,11 @@ EOF
 # dead run below it is never claimed.
 test_unresolvable_live_head_reports_unknown_not_failed() {
   reset_fakes
-  local d heads dead_head live_head out
+  local d dead_head live_head out
   d=$(new_case unresolvable-live-head)
-  heads=$(make_stale_local_head_repo "$d/wt" fm/feat-unresolvable absent)
-  dead_head=${heads%% *}
-  live_head=${heads##* }
+  make_stale_local_head_repo "$d/wt" fm/feat-unresolvable absent
+  dead_head=$STALE_DEAD_HEAD
+  live_head=$STALE_LIVE_HEAD
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/unres.meta" "window=fm:fm-unres" "worktree=$d/wt" "kind=ship" "harness=claude"
   printf 'needs-decision: review gate\n' > "$d/state/unres.status"
@@ -1511,11 +1515,11 @@ EOF
 # confirming the failure it set out to check.
 test_unresolvable_row_stops_terminal_failure_confirmation() {
   reset_fakes
-  local d heads dead_head live_head out
+  local d dead_head live_head out
   d=$(new_case unresolvable-confirm)
-  heads=$(make_stale_local_head_repo "$d/wt" fm/feat-unres-confirm absent)
-  dead_head=${heads%% *}
-  live_head=${heads##* }
+  make_stale_local_head_repo "$d/wt" fm/feat-unres-confirm absent
+  dead_head=$STALE_DEAD_HEAD
+  live_head=$STALE_LIVE_HEAD
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/unresc.meta" "window=fm:fm-unresc" "worktree=$d/wt" "kind=ship" "harness=claude"
   FM_FAKE_RUN_HEAD="$dead_head"
