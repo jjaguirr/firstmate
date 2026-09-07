@@ -1978,11 +1978,39 @@ EOF
   FM_FAKE_BUSY=0
   arm_idle_record "$d/state" rebased-below
   out=$(run_crew_state "$d" rebased-below)
+  assert_not_contains "$out" "source: run-step" "a superseded live row must not be attributed"
   assert_not_contains "$out" "state: working" "a superseded live row must not report working"
-  assert_contains "$out" "state: failed" "the newest same-branch row's own word is reported"
-  assert_contains "$out" "source: run-step" "the newest row's verdict stays run-step sourced"
-  assert_contains "$out" "superseded (run failed)" "a terminated run leaves no open decision to keep"
+  assert_contains "$out" "state: blocked" "the crew's own current state is still read"
   pass "a live row below a newer terminal row is not claimed"
+}
+
+# The boundary the diverged acceptance must never cross, on the path where
+# nothing corroborates: `axi status` answers about another crew, so the coarse
+# scan alone decides, and the branch's newest row is a terminal word on a
+# rewritten head. Branch identity after a rewrite is not proof, so it cannot
+# manufacture the one verdict recovery acts on - a crew reworking on top of its
+# own rebased failure must not read failed.
+test_diverged_terminal_row_alone_never_reports_failed() {
+  reset_fakes
+  local d live_head out
+  d=$(new_case diverged-terminal-alone)
+  make_rebased_live_head_repo "$d/wt" fm/feat-diverged-terminal
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/div-term.meta" "window=fm:fm-div-term" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: reworking after the rebased run failed\n' > "$d/state/div-term.status"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-diverged-terminal $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" div-term
+  out=$(run_crew_state "$d" div-term)
+  assert_not_contains "$out" "state: failed" "an uncorroborated terminal word at a rewritten head must not report failed"
+  assert_not_contains "$out" "source: run-step" "a terminal word at a rewritten head carries no verdict"
+  assert_contains "$out" "state: working" "the crew's own current state is read instead"
+  pass "a diverged terminal row alone never reports failed"
 }
 
 # Newest-owns-the-branch is scoped to the newest same-branch row whatever that
@@ -2187,6 +2215,7 @@ test_completed_rebased_row_overrides_a_dead_attributable_record
 test_cancelled_rebased_row_does_not_release_a_real_failure
 test_rebased_terminal_row_does_not_hide_a_real_failure
 test_live_row_below_a_newer_terminal_row_is_not_claimed
+test_diverged_terminal_row_alone_never_reports_failed
 test_diverged_row_below_a_behind_row_is_not_claimed
 test_crew_committed_past_its_failed_run_is_not_claimed
 test_head_predicate_reports_four_outcomes

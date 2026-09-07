@@ -69,8 +69,9 @@ A detailed record for the crew's own branch is trusted on such a head exactly as
 The one verdict withheld there is a terminal failure, which is released only when the run row that owns the branch did not itself fail.
 A running row resolves it to working and a completed one to done, while a failed or cancelled row never licenses reporting a terminal failure and leaves that verdict corroborated or unknown.
 A rewritten head is likewise no proof that the run belongs to another worktree, because a pipeline that rebases and pushes its own fix commits leaves exactly that shape on the crew's own branch and no row matches the local head again afterwards.
-So the newest same-branch row in the coarse listing is attributed on branch identity alone, whatever its status word, when its head is diverged from the local head rather than merely behind it.
-The coarse scan orders its evidence strongest first: a row proven to be on this worktree's own code and still running wins outright, otherwise that newest diverged row wins, otherwise the newest head-proof row wins.
+So the newest same-branch row in the coarse listing is attributed on branch identity alone when its head is diverged from the local head rather than merely behind it, but only when its status word is running or a success.
+Branch identity after a rewrite is not proof, so it never licenses the one verdict recovery acts on: a failed or cancelled word at a diverged head stays history and is reported only where something corroborates it.
+The coarse scan takes that newest diverged row when it has one, otherwise the newest head-proof row.
 A diverged row that is not the newest same-branch row is history that a later run superseded and is still skipped, so a live row below a newer terminal row is never resurrected.
 A run head that is only an ancestor of the local head is a different fact, because the crew committed past that run, so such a row carries no verdict and a crew working on top of its own failed run never reads failed.
 A coarse working verdict may not mark an open needs-decision or blocked status line superseded, because a coarse row cannot tell a run parked at a gate from a working one, so it leaves the crew's open decision visible instead; a coarse terminal verdict supersedes as a detailed one does.

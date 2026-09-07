@@ -46,11 +46,12 @@
 #          is also exactly what a pipeline rebase leaves on the branch this crew
 #          owns, and after that rewrite no row matches the local head again. So
 #          in the coarse listing the newest same-branch row at a diverged head is
-#          attributed on branch identity, whatever its status word, instead of
-#          being skipped past to the branch's own dead history below it
-#          (2026-09-07). The evidence ordering, strongest first: a row proven to
-#          be on this worktree's own code AND still `running` wins outright;
-#          otherwise that newest diverged row wins; otherwise the newest
+#          attributed on branch identity, but ONLY when its word is live or a
+#          success, instead of being skipped past to the branch's own dead
+#          history below it (2026-09-07). Branch identity after a rewrite is not
+#          proof, so it can never manufacture the one verdict recovery acts on: a
+#          `failed` or `cancelled` word at a diverged head stays history and is
+#          reported only where something corroborates it. Otherwise the newest
 #          head-proof row wins as before. A diverged row that is not the newest
 #          same-branch row is history the later run superseded and is still
 #          skipped, so a live row below a newer terminal row is never
@@ -440,9 +441,10 @@ nm_ci_checks_state() {
 #   0 - echoes a status word (running/completed/cancelled/failed; the only words
 #       the installed CLI emits here, verified against the real listing - a
 #       parked run reads `running`), picked by the evidence ordering in the scan
-#       below: a live row proven to be on this worktree's own code first, then
-#       the newest same-branch row at a DIVERGED head, then the newest head-proof
-#       row. A row refuted as behind the worktree carries no verdict at all.
+#       below: the newest same-branch row at a DIVERGED head when its word is
+#       live or a success, else the newest head-proof row. A row refuted as
+#       behind the worktree carries no verdict at all, and neither does a
+#       terminal word at a diverged head.
 #   1 - no attributable row within FM_CREW_STATE_RUNS_LIMIT rows, including
 #       when the listing itself is empty or the call did not answer
 #   2 - a same-branch row cannot be decided, because its head is not an object
@@ -470,11 +472,9 @@ nm_runs_status_for_branch() {  # <branch>
       rc=$?
       case "$rc" in
         "$FM_NM_HEAD_MATCH")
-          # Head proof plus liveness is the strongest evidence there is: the run
-          # is on this worktree's own code AND it is alive, so it wins over a
-          # held candidate. A terminal proof row yields to the held candidate,
-          # which is newer and owns the branch.
-          if [ "$st" = running ] || [ -z "$cand" ]; then
+          # A held candidate is by construction the branch's NEWEST row, so it
+          # owns the branch and a proven row below it is history.
+          if [ -z "$cand" ]; then
             printf '%s' "$st"
           else
             printf '%s' "$cand"
@@ -498,14 +498,19 @@ nm_runs_status_for_branch() {  # <branch>
           # no row can ever match the local head again. Branch identity plus a
           # rewritten head this copy can resolve is then stronger evidence of
           # current ownership than a proven-but-dead older row, so the NEWEST
-          # such row is held as a candidate - whatever its status word - instead
-          # of being skipped past to the branch's own dead history below it
-          # (2026-09-07: that skip reported a worker parked at a gate as FAILED,
-          # and reported a completed run as failed). The scan continues so a live
-          # head-proof row below can still win outright. A diverged row that is
-          # NOT the newest same-branch row is history the newest-owns-the-branch
-          # rule already superseded, and is still skipped.
-          [ "$seen_same_branch" = 1 ] || cand=$st
+          # such row is held as a candidate instead of being skipped past to the
+          # branch's own dead history below it (2026-09-07: that skip reported a
+          # worker parked at a gate as FAILED, and reported a completed run as
+          # failed). Only a LIVE or SUCCESS word is held, because branch identity
+          # after a rewrite is not proof and a terminal failure is the one verdict
+          # recovery acts on (nm_coarse_word_is_live_or_success owns that
+          # asymmetry). A `failed` or `cancelled` word here stays history, so such
+          # a branch reports its failure only where something corroborates it. A
+          # diverged row that is NOT the newest same-branch row is history the
+          # newest-owns-the-branch rule already superseded, and is skipped too.
+          if [ "$seen_same_branch" = 0 ] && nm_coarse_word_is_live_or_success "$st"; then
+            cand=$st
+          fi
           seen_same_branch=1
           continue
           ;;
@@ -586,14 +591,15 @@ nm_coarse_run_verdict() {  # <coarse-status> -> "<state> <detail>"
   esac
 }
 
-# Does a coarse word license overriding a detailed record's terminal FAILURE?
-# The gate is asymmetric on purpose, and that asymmetry is the whole point of it:
-# a live or successful newest row is evidence the failure being reported is not
-# the branch's current story, while a coarse `failed` or `cancelled` word would
-# only trade one terminal verdict for another and cannot corroborate a failure on
-# its own (PR 6). So success and liveness override; failure never does, and stays
-# corroborated or unknown.
-nm_coarse_overrides_terminal_failure() {  # <coarse-status>
+# Is a coarse word live or successful, i.e. one that cannot manufacture a
+# terminal failure? Every rule in this file that trusts a row on weaker evidence
+# than head proof is asymmetric on purpose, and this predicate is where that
+# asymmetry lives: a live or successful row is evidence about the branch's
+# current story, while a `failed` or `cancelled` word can only trade one terminal
+# verdict for another and cannot corroborate a failure on its own (PR 6). A false
+# FAILED is the verdict recovery acts on, so it is never reported from anything
+# short of proof.
+nm_coarse_word_is_live_or_success() {  # <coarse-status>
   local verdict
   verdict=$(nm_coarse_run_verdict "$1")
   case "${verdict%% *}" in
@@ -633,7 +639,7 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
         coarse_rc=$?
         if [ "$coarse_rc" = 2 ]; then
           emit_unresolved_head "$COARSE_STATUS"
-        elif [ "$coarse_rc" = 0 ] && nm_coarse_overrides_terminal_failure "$COARSE_STATUS"; then
+        elif [ "$coarse_rc" = 0 ] && nm_coarse_word_is_live_or_success "$COARSE_STATUS"; then
           # A newer run owns this branch and did not fail, so the older record's
           # failure is not this branch's current story. nm_coarse_overrides_
           # terminal_failure owns which words may say that.
@@ -650,11 +656,11 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # the record is trusted exactly as a resolvable head would trust it, and
       # the ONE verdict still withheld is the same one withheld above, a
       # terminal failure, because that is what recovery acts on, and it is
-      # released on the same words (nm_coarse_overrides_terminal_failure).
+      # released on the same words (nm_coarse_word_is_live_or_success).
       if nm_detailed_run_is_terminal_failure; then
         COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
         coarse_rc=$?
-        if [ "$coarse_rc" = 0 ] && nm_coarse_overrides_terminal_failure "$COARSE_STATUS"; then
+        if [ "$coarse_rc" = 0 ] && nm_coarse_word_is_live_or_success "$COARSE_STATUS"; then
           HAVE_RUN=1
           RUN_SOURCE=coarse
         elif [ "$coarse_rc" = 2 ]; then
