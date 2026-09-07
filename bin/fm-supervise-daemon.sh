@@ -477,6 +477,8 @@ clear_pause_tracking() {  # <window> <state>
   rm -f "$state/.subsuper-paused-$key" "$state/.subsuper-stale-$key" \
     "$state/.paused-$watcher_key" "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key" \
+    "$state/.wedge-affirmative-$watcher_key" "$state/.wedge-affirmative-since-$watcher_key" \
+    "$state/.wedge-affirmative-resurfaced-$watcher_key" \
     "$state/.writing-since-$watcher_key" "$state/.writing-resurfaced-$watcher_key" \
     "$state/.reconciled-$watcher_key" "$state/.reconciled-since-$watcher_key" \
     "$state/.reconciled-resurfaced-$watcher_key"

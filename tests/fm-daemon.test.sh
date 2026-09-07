@@ -293,6 +293,9 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
   : > "$state/.paused-$watcher_key"
   : > "$state/.stale-$watcher_key"
   : > "$state/.wedge-escalations-$watcher_key"
+  printf '3\n' > "$state/.wedge-affirmative-$watcher_key"
+  date +%s > "$state/.wedge-affirmative-since-$watcher_key"
+  date +%s > "$state/.wedge-affirmative-resurfaced-$watcher_key"
   # The reconciled expected-idle chain the watcher writes for an undeclared park
   # or an unlanded done. The daemon owns this reset in away mode, and it also
   # removes the .paused-* marker the watcher's own clear keys off, so anything it
@@ -307,6 +310,9 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
   [ ! -e "$state/.paused-$watcher_key" ] || fail "terminal signal retained watcher pause tracking"
   [ ! -e "$state/.stale-$watcher_key" ] || fail "terminal signal retained watcher stale tracking"
   [ ! -e "$state/.wedge-escalations-$watcher_key" ] || fail "terminal signal retained watcher wedge tracking"
+  [ ! -e "$state/.wedge-affirmative-$watcher_key" ] || fail "terminal signal retained the watcher affirmative-liveness count"
+  [ ! -e "$state/.wedge-affirmative-since-$watcher_key" ] || fail "terminal signal retained the watcher affirmative backoff anchor"
+  [ ! -e "$state/.wedge-affirmative-resurfaced-$watcher_key" ] || fail "terminal signal retained the watcher affirmative backoff throttle"
   [ ! -e "$state/.reconciled-$watcher_key" ] || fail "terminal signal retained the watcher reconciled surface record"
   [ ! -e "$state/.reconciled-since-$watcher_key" ] || fail "terminal signal retained the watcher reconciled age anchor"
   [ ! -e "$state/.reconciled-resurfaced-$watcher_key" ] || fail "terminal signal retained the watcher reconciled re-surface throttle"
