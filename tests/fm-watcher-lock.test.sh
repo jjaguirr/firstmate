@@ -25,6 +25,10 @@ mark_pr_check_migration_complete() {
   chmod 0600 "$state/.pr-check-migration-scan-v1" "$state/.pr-check-migration-v1"
 }
 
+count_marked() {  # <file>
+  awk 'NF { c++ } END { print c + 0 }' "$1" 2>/dev/null
+}
+
 drain_and_ack() {  # <state>
   local state=$1 err sequence generation
   err="$state/.test-drain.err"
@@ -287,33 +291,73 @@ test_lock_steals_dead_pid_lock() {
   pass "dead-pid stale lock is reclaimed by a single acquirer"
 }
 
+# fm_lock_try_acquire is one SHOT, not a wait: a contender that collides with the
+# steal-mutex holder mid-reclaim aborts instead of blocking, and while that holder
+# is mid-reclaim the primary lock is briefly absent, so a first shot can lose to a
+# transient race that leaves nobody holding anything. Demanding a winner from 40
+# first shots therefore asserts liveness this primitive never promised, and CI
+# collected the zero-winner interleaving. Every real caller retries -
+# fm_lock_acquire_wait is exactly that loop - so the contenders retry here within a
+# bounded window the winner outlives. The invariant under test is unchanged and
+# still exact: concurrent steals of one stale lock yield exactly one holder.
 test_lock_stale_steal_single_winner_under_concurrency() {
-  local dir state lockdir dead marker i pids pid wins
+  local dir state lockdir dead marker losers release i pids pid wins settled
   dir=$(make_case lock-stale-concurrency)
   state="$dir/state"
   lockdir="$state/.contend.lock"
   marker="$dir/wins"
+  losers="$dir/losers"
+  release="$dir/release"
   dead=$(dead_pid)
   mkdir "$lockdir"
   printf '%s\n' "$dead" > "$lockdir/pid"
   : > "$marker"
+  : > "$losers"
   pids=
   i=1
   while [ "$i" -le 40 ]; do
     FM_STATE_OVERRIDE="$state" bash -c '
       . "$1"
-      if fm_lock_try_acquire "$2"; then
-        printf "%s\n" "${BASHPID:-$$}" >> "$3"
-        sleep 1
-      fi
-    ' _ "$LIB" "$lockdir" "$marker" &
+      lockdir=$2; marker=$3; losers=$4; release=$5
+      deadline=$(( $(date +%s) + 5 ))
+      while :; do
+        if fm_lock_try_acquire "$lockdir"; then
+          printf "%s\n" "${BASHPID:-$$}" >> "$marker"
+          # Hold the stolen lock until every other contender has stopped trying,
+          # so a second win can only come from a real mutual-exclusion break and
+          # never from this winner exiting and leaving another stale lock behind.
+          held=0
+          while [ ! -e "$release" ] && [ "$held" -lt 600 ]; do
+            sleep 0.05
+            held=$((held + 1))
+          done
+          exit 0
+        fi
+        [ "$(date +%s)" -lt "$deadline" ] || break
+        sleep 0.05
+      done
+      printf "%s\n" "${BASHPID:-$$}" >> "$losers"
+    ' _ "$LIB" "$lockdir" "$marker" "$losers" "$release" &
     pids="$pids $!"
     i=$((i + 1))
   done
+  settled=0
+  i=0
+  while [ "$i" -lt 600 ]; do
+    if [ "$(( $(count_marked "$marker") + $(count_marked "$losers") ))" -ge 40 ]; then
+      settled=1
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  : > "$release"
   for pid in $pids; do
     wait "$pid" 2>/dev/null || true
   done
-  wins=$(awk 'NF { c++ } END { print c + 0 }' "$marker")
+  wins=$(count_marked "$marker")
+  [ "$settled" -eq 1 ] \
+    || fail "stale-lock contenders never settled (wins=$wins, losers=$(count_marked "$losers") of 40)"
   [ "$wins" -eq 1 ] || fail "expected exactly one stale-lock stealer, got $wins"
   pass "concurrent stale-lock steal yields exactly one winner"
 }

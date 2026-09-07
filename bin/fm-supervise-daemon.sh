@@ -1229,6 +1229,10 @@ handle_wake() {  # <reason> <state>
     stale:*)  kind=stale; arg="${reason#stale: }"; stale_detail="${arg#"$arg"}"
               case "$arg" in *" ("*) stale_detail="${arg#*" ("}"; arg="${arg%% \(*}" ;; esac
               decision=$(classify_stale "$arg" "$state")
+              # Every wedge-escalation arm of bin/fm-watch.sh's wedge_timer_check
+              # emits this token sequence deliberately, so keep the glob and that
+              # function's reasons byte-compatible; wedge_timer_check owns the
+              # contract and which arm carries a demand-deep-inspection marker.
               case "$stale_detail" in
                 idle\ *s,\ possible\ wedge,\ escalation\ *)
                   decision="escalate|${reason#stale: }" ;;
