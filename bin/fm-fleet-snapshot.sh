@@ -68,6 +68,25 @@
 # Human views must render this output instead of parsing state files again.
 set -u
 
+# Passing large backlog/task JSON straight to jq as --argjson exceeds
+# Linux's per-argv-entry MAX_ARG_STRLEN (131072 bytes) well before the
+# much larger total ARG_MAX, and jq fails with "Argument list too long".
+# json_arg_file writes such a payload to a private temp file so jq can
+# read it with --slurpfile instead, crossing argv only as a short path.
+SNAPSHOT_TMPFILES=""
+json_arg_file() {  # <json-text>
+  local f
+  f=$(mktemp "${TMPDIR:-/tmp}/fm-fleet-snapshot.XXXXXX.json") || return 1
+  SNAPSHOT_TMPFILES="$SNAPSHOT_TMPFILES $f"
+  printf '%s' "$1" >"$f"
+  printf '%s' "$f"
+}
+cleanup_snapshot_tmpfiles() {
+  # shellcheck disable=SC2086 # word-splitting the tracked path list is intentional
+  [ -n "$SNAPSHOT_TMPFILES" ] && rm -f $SNAPSHOT_TMPFILES
+}
+trap cleanup_snapshot_tmpfiles EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
@@ -618,10 +637,15 @@ task_json_lines() {
 # Meta inventory remains the sole source of live workers; this object only
 # discloses backlog↔task inconsistency for renderers (Bearings omitted/gates).
 main_inventory_json() {  # <backlog-json> <tasks-json>
+  local backlog_file tasks_file
+  backlog_file=$(json_arg_file "$1") || return 1
+  tasks_file=$(json_arg_file "$2") || return 1
   jq -n \
-    --argjson backlog "$1" \
-    --argjson tasks "$2" '
-    ([ $backlog.records[]?
+    --slurpfile backlog "$backlog_file" \
+    --slurpfile tasks "$tasks_file" '
+    ($backlog[0]) as $backlog
+    | ($tasks[0]) as $tasks
+    | ([ $backlog.records[]?
        | select((.state == "in_flight" or .state == "queued") and (.structured | not)) ]) as $unstructured_current
     | ([ $backlog.records[]?
          | select(.state == "in_flight" and .structured and .requires_child_metadata) ]) as $owned_in_flight
@@ -646,6 +670,9 @@ main_inventory_json() {  # <backlog-json> <tasks-json>
 # This mode never reads parent events or terminal text and never aggregates
 # nested secondmates.
 secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
+  local backlog_file tasks_file
+  backlog_file=$(json_arg_file "$1") || return 1
+  tasks_file=$(json_arg_file "$2") || return 1
   jq -n \
     --arg generated "$SNAPSHOT_NOW" \
     --arg home "$FM_HOME" \
@@ -653,9 +680,11 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
     --argjson queued_n "$FM_SNAPSHOT_SECONDMATE_QUEUED" \
     --argjson decisions_n "$FM_SNAPSHOT_SECONDMATE_DECISIONS" \
     --argjson landed_n "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" \
-    --argjson backlog "$1" \
-    --argjson tasks "$2" '
-    def trunc($n):
+    --slurpfile backlog "$backlog_file" \
+    --slurpfile tasks "$tasks_file" '
+    ($backlog[0]) as $backlog
+    | ($tasks[0]) as $tasks
+    | def trunc($n):
       tostring | gsub("\\s+"; " ")
       | if length > $n then .[:$n] + "…" else . end;
     ([ $backlog.records[]?
@@ -1128,10 +1157,12 @@ secondmate_current_json() {  # <parent-tasks-json>
   local tasks=$1 registry union rows total_registered total shown truncated
   local row id home host remote registered registry_error task status_file event_raw event_note event_epoch event_age
   local activity_scan activities decisions reconciliation provenance freshness reason summary summary_rc summary_bytes summary_valid summary_reason summary_invalidity state current_reason terminal terminal_contradiction contradiction
-  local records='[]' seen_homes=''
+  local records='[]' seen_homes='' tasks_file
   registry=$(registry_secondmates_json) || return 1
-  union=$(jq -n --argjson registry "$registry" --argjson tasks "$tasks" '
-    ($registry.records // []) as $registered
+  tasks_file=$(json_arg_file "$tasks") || return 1
+  union=$(jq -n --argjson registry "$registry" --slurpfile tasks "$tasks_file" '
+    ($tasks[0]) as $tasks
+    | ($registry.records // []) as $registered
     | (($registered | map(.id)) // []) as $registered_ids
     | ([ $registered[] as $r
          | $r + {parent_task:([$tasks[] | select(.id == $r.id)][0] // null)} ]
@@ -1361,6 +1392,8 @@ scout_report_lines() {
 
 BACKLOG_JSON=$(backlog_json) || { echo "fm-fleet-snapshot: backlog read failed" >&2; exit 1; }
 TASKS_JSON=$(task_json_lines) || { echo "fm-fleet-snapshot: task snapshot failed" >&2; exit 1; }
+BACKLOG_JSON_FILE=$(json_arg_file "$BACKLOG_JSON") || { echo "fm-fleet-snapshot: backlog temp file failed" >&2; exit 1; }
+TASKS_JSON_FILE=$(json_arg_file "$TASKS_JSON") || { echo "fm-fleet-snapshot: tasks temp file failed" >&2; exit 1; }
 
 if [ "$OUTPUT_MODE" = secondmate-home-summary ]; then
   secondmate_home_summary_json "$BACKLOG_JSON" "$TASKS_JSON" \
@@ -1384,13 +1417,15 @@ jq -n \
   --arg data "$DATA" \
   --arg config "$CONFIG" \
   --arg projects "$PROJECTS" \
-  --argjson backlog "$BACKLOG_JSON" \
-  --argjson tasks "$TASKS_JSON" \
+  --slurpfile backlog "$BACKLOG_JSON_FILE" \
+  --slurpfile tasks "$TASKS_JSON_FILE" \
   --argjson main_inventory "$MAIN_INVENTORY_JSON" \
   --argjson scout_reports "$SCOUT_REPORTS_JSON" \
   --argjson secondmate_current "$SECONDMATE_CURRENT_JSON" \
   --argjson secondmate_landed "$SECONDMATE_LANDED_JSON" \
-  'def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
+  '($backlog[0]) as $backlog
+   | ($tasks[0]) as $tasks
+   | def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
    def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
    {

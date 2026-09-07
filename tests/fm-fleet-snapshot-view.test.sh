@@ -262,6 +262,52 @@ EOF
   pass "main_inventory discloses orphan/unstructured and clears when inventory is consistent"
 }
 
+# Regression: a backlog large enough that its JSON crosses Linux's single-argv
+# MAX_ARG_STRLEN (131072 bytes) must not make jq exec fail with "Argument list
+# too long" at either --argjson call site (main inventory and the secondmate
+# home summary).
+write_oversized_backlog() {  # <home>
+  local home=$1 title
+  title=$(printf 'x%.0s' $(seq 1 2000))
+  {
+    printf '## Queued\n'
+    for i in $(seq 1 100); do
+      printf -- '- [ ] big-task-%d - %s (repo: alpha) (kind: ship)\n' "$i" "$title"
+    done
+    printf '\n## Done\n'
+  } > "$home/data/backlog.md"
+}
+
+test_oversized_backlog_survives_argv_limit_json() {
+  local home out backlog_bytes
+  home=$(make_home oversized-backlog-json)
+  write_oversized_backlog "$home"
+  backlog_bytes=$(FM_HOME="$home" "$SNAPSHOT" --json | jq -c '.backlog' | LC_ALL=C wc -c | tr -d ' ')
+  [ "$backlog_bytes" -gt 131072 ] \
+    || fail "fixture backlog JSON must exceed MAX_ARG_STRLEN to exercise the bug, got $backlog_bytes bytes"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json 2>&1) \
+    || fail "snapshot must survive a backlog JSON larger than MAX_ARG_STRLEN: $out"
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-fleet-snapshot.v1"
+      and .main_inventory.valid == true
+      and ([.backlog.records[] | select(.state == "queued")] | length) == 100
+  ' >/dev/null || fail "oversized-backlog snapshot missing expected records: $out"
+  pass "an oversized backlog crosses the argv limit and the JSON snapshot still succeeds"
+}
+
+test_oversized_backlog_survives_argv_limit_secondmate_summary() {
+  local home out
+  home=$(make_home oversized-backlog-summary)
+  write_oversized_backlog "$home"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --secondmate-home-summary 2>&1) \
+    || fail "secondmate home summary must survive a backlog JSON larger than MAX_ARG_STRLEN: $out"
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-secondmate-home-summary.v1"
+      and .counts.queued == 100
+  ' >/dev/null || fail "oversized-backlog secondmate summary missing expected records: $out"
+  pass "an oversized backlog crosses the argv limit and the secondmate home summary still succeeds"
+}
+
 test_normalized_roles_and_plural_blocker_readiness() {
   local home fakebin out
   home=$(make_home normalized-records)
@@ -866,6 +912,8 @@ test_parked_scout_decision_stays_pending() {
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure
+test_oversized_backlog_survives_argv_limit_json
+test_oversized_backlog_survives_argv_limit_secondmate_summary
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
