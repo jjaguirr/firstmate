@@ -41,6 +41,15 @@
 #          attributable row before it is reported: a live run wins over a dead
 #          one whenever both are attributable. Nothing else about the detailed
 #          record is second-guessed, so step and gate detail is never lost.
+#        - A refuted head is not proof the run belongs to another worktree: it
+#          is also exactly what a pipeline rebase leaves on the branch this crew
+#          owns, and after that rewrite no row matches the local head again. So
+#          in the coarse listing the newest same-branch row is attributed on
+#          branch identity plus liveness when it is still `running` at a head
+#          this copy can resolve, instead of being skipped past to the branch's
+#          own dead history below it (2026-09-07). A refuted TERMINAL row still
+#          carries no verdict and is still skipped, so a rewrite never turns a
+#          real failure into a cheerful verdict.
 #        - An undecidable head is NOT a mismatch and is never silently skipped.
 #          Its routine cause is benign - the pipeline pushes its own fix commits
 #          from its own copy of the branch, so until the crew syncs, the run tip
@@ -420,16 +429,18 @@ nm_ci_checks_state() {
 # Three outcomes, mirroring fm_nm_head_matches_worktree's three:
 #   0 - echoes that row's status word (running/completed/cancelled/failed; the
 #       only words the installed CLI emits here, verified against the real
-#       listing - a parked run reads `running`)
+#       listing - a parked run reads `running`). A row is attributed either by
+#       head proof or, for the newest same-branch row only, by liveness after a
+#       rewrite (see the mismatch arm below for why, and how narrowly).
 #   1 - no attributable row within FM_CREW_STATE_RUNS_LIMIT rows, including
 #       when the listing itself is empty or the call did not answer
 #   2 - the newest same-branch row cannot be decided, because its head is not an
 #       object this local copy has. Echoes that head instead of a status word
-#       and stops: a proven mismatch is history that can be skipped past, but an
-#       undecidable row might BE the branch's live owner, and claiming an older
-#       row past it is exactly how a live run gets reported as a dead one.
+#       and stops: a refuted TERMINAL row is history that can be skipped past,
+#       but an undecidable row might BE the branch's live owner, and claiming an
+#       older row past it is exactly how a live run gets reported as a dead one.
 nm_runs_status_for_branch() {  # <branch>
-  local branch=$1 out row st rest br sha rc
+  local branch=$1 out row st rest br sha rc newest_same_branch=1
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
   [ -n "$out" ] || return 1
   while IFS= read -r row; do
@@ -455,7 +466,33 @@ nm_runs_status_for_branch() {  # <branch>
           printf '%s' "$sha"
           return 2
           ;;
-        *) continue ;;
+        *)
+          # A refuted head is not proof the row belongs to some other worktree:
+          # it is equally what a pipeline that rebases and pushes its own fix
+          # commits leaves on the branch THIS crew owns, and after that rewrite
+          # no row can ever match the local head again. Branch identity plus
+          # LIVENESS is the evidence that survives the rewrite, so the newest
+          # same-branch row is attributed on those two facts alone when it is
+          # still running, rather than being skipped past to the branch's own
+          # dead history below it (2026-09-07: that skip reported a worker
+          # parked at a gate as FAILED). The acceptance is deliberately narrow
+          # in three ways, because branch name alone is weak evidence:
+          #   - only `running`, the one word that cannot manufacture a terminal
+          #     verdict. A refuted terminal row still carries no verdict of its
+          #     own and is still skipped as history.
+          #   - only a head this copy can resolve, which an unrelated repo that
+          #     merely reuses the branch name does not have. An unreadable head
+          #     is the UNRESOLVED case above and never reaches here.
+          #   - only the NEWEST same-branch row, the one the newest-owns-the-
+          #     branch rule can call the current owner. A live row below a
+          #     newer terminal row was already superseded by that later run.
+          if [ "$newest_same_branch" = 1 ] && [ "$st" = running ] && [ -n "$sha" ]; then
+            printf '%s' "$st"
+            return 0
+          fi
+          newest_same_branch=0
+          continue
+          ;;
       esac
     fi
   done <<< "$out"
