@@ -76,12 +76,21 @@ set -u
 # --slurpfile, so only a short path crosses argv: the backlog and task JSON,
 # the scout report list, each registered secondmate's home summary, the
 # accumulated secondmate record lines, and the combined secondmate_current
-# and secondmate_landed objects. The EXIT trap removes the directory.
+# and secondmate_landed objects. The directory holds task titles and PR
+# URLs, so it is removed on normal exit and on SIGINT/SIGTERM/SIGHUP alike:
+# an EXIT-only trap would leave it behind on Ctrl-C, the ordinary way this
+# script dies when bin/fm-fleet-view.sh shells out to it in the foreground.
 SNAPSHOT_TMPDIR=""
 cleanup_snapshot_tmpdir() {
   [ -n "$SNAPSHOT_TMPDIR" ] && rm -rf "$SNAPSHOT_TMPDIR"
 }
+cleanup_snapshot_tmpdir_on_signal() {
+  cleanup_snapshot_tmpdir
+  trap - EXIT
+  exit 130
+}
 trap cleanup_snapshot_tmpdir EXIT
+trap cleanup_snapshot_tmpdir_on_signal INT TERM HUP
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"

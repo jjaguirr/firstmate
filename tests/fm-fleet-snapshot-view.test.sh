@@ -377,6 +377,32 @@ test_oversized_scout_reports_survive_argv_limit() {
   pass "an oversized scout report list crosses the argv limit and the JSON snapshot still succeeds"
 }
 
+# Regression: SNAPSHOT_TMPDIR holds backlog/task JSON (task titles, PR URLs)
+# and must not survive a real signal death, not just normal exit. Kill a
+# slow-running snapshot with SIGTERM and confirm its temp directory is gone.
+test_sigterm_removes_snapshot_tmpdir() {
+  local home tmproot pid waited after
+  home=$(make_home signal-cleanup)
+  write_oversized_backlog "$home" 3000 40
+  tmproot=$(mktemp -d)
+  ( TMPDIR="$tmproot" FM_HOME="$home" "$SNAPSHOT" --json >/dev/null 2>&1 ) &
+  pid=$!
+  waited=0
+  while [ "$waited" -lt 40 ]; do
+    [ -n "$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)" ] && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  kill -0 "$pid" 2>/dev/null \
+    || fail "snapshot exited before it could be signaled; make the fixture slower"
+  kill -TERM "$pid"
+  wait "$pid" 2>/dev/null
+  after=$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)
+  rm -rf "$tmproot"
+  [ -z "$after" ] || fail "SIGTERM left the snapshot temp directory behind: $after"
+  pass "SIGTERM during a slow snapshot still removes its private temp directory"
+}
+
 test_normalized_roles_and_plural_blocker_readiness() {
   local home fakebin out
   home=$(make_home normalized-records)
@@ -985,6 +1011,7 @@ test_oversized_backlog_survives_argv_limit_json
 test_oversized_backlog_survives_argv_limit_secondmate_summary
 test_oversized_secondmate_summary_survives_argv_limit
 test_oversized_scout_reports_survive_argv_limit
+test_sigterm_removes_snapshot_tmpdir
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
