@@ -7,9 +7,12 @@
 # actively-running no-mistakes step, or a backend busy signal), and surfaced
 # otherwise, so a crew that finishes (or stops and waits) without a current
 # working signal is never silently swallowed. A declared wait, either a paused:
-# external wait or a verified captain-held transfer, is the separate idle absorb
+# external wait or a verified captain-held transfer, is one separate idle absorb
 # case and re-surfaces only on its long bounded cadence, although its initial
-# no-verb status signal still surfaces in normal mode.
+# no-verb status signal still surfaces in normal mode. A crew bin/fm-crew-state.sh
+# reconciles as parked at a decision or done with its work finished is the other: its
+# pane is idle by design, so after the one surface each distinct reconciled state
+# earns, later redraws of that same state take the same bounded cadence.
 # While state/.afk exists, the daemon owns triage and this watcher queues and exits
 # on every wake. Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
@@ -23,8 +26,10 @@
 #                          external-wait pause or verified captain-held transfer is
 #                          absorbed instead with its own long re-surface cadence,
 #                          never as a wedge, and that recheck reason names which
-#                          human the wait is on. Only when neither absorb class
-#                          applies does the log's last line decide:
+#                          human the wait is on. A reconciled parked or done state
+#                          surfaces once and is then absorbed onto that same bounded
+#                          cadence. Only when no absorb class applies does the log's
+#                          last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
@@ -359,6 +364,29 @@ clear_write_tracking() {  # <window-key>
   rm -f "$STATE/.writing-since-$key" "$STATE/.writing-resurfaced-$key"
 }
 
+# Drop a window's reconciled expected-idle chain wherever the crew is observed
+# working again, so a crew that parks, resumes, and later parks a second time
+# earns its own surface instead of inheriting the first one's, and so the bounded
+# re-surface cadence is measured from the CURRENT expected-idle stretch.
+#
+# Two readings prove the crew left the wait, and both drop this chain: an
+# authoritative working verdict on the stale path, and a pane actually RENDERING
+# BUSY. A changed hash on an idle pane is neither, and deliberately does NOT drop
+# it: an idle pane that merely redrew is the same reconciled wait, and dropping
+# the record there would re-surface it on every redraw - the exact behavior this
+# chain exists to stop. Keeping the busy reading in that exempt set was the
+# original mistake, because a crew that parks, is answered, resumes behind a busy
+# pane, and parks again at a SECOND gate appends nothing to its status log while a
+# run owns it (AGENTS.md's sparse status-reporting contract), so the second park
+# produced a digest identical to the first: it inherited the spent surface and the
+# old age anchor, went unreported for up to PAUSE_RESURFACE_SECS, and then printed
+# an age measured from the wrong park.
+clear_reconciled_tracking() {  # <window-key>
+  local key=$1
+  rm -f "$STATE/.reconciled-$key" "$STATE/.reconciled-since-$key" \
+    "$STATE/.reconciled-resurfaced-$key"
+}
+
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
 # absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
 # watcher restart between recording the hash and recording the timer), or
@@ -398,6 +426,23 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         wake "$reason"
       fi
       ;;
+  esac
+}
+
+# 0 when an existing wedge timer has reached STALE_ESCALATE_SECS and so is one
+# poll away from escalating. Callers use it to re-read the authoritative crew state
+# at that single moment rather than every poll, so a run that parked at a gate or
+# went checks-green while its pane never changed a byte cannot escalate as a wedge.
+# The timestamp CONTENT, not the file mtime, is the timer contract, because a
+# repair or a test deliberately writes an older epoch into a freshly modified
+# sidecar. A missing or malformed timestamp reads as due so it reaches
+# wedge_timer_check's existing self-repair path.
+wedge_timer_is_due() {  # <since-file>
+  local since
+  since=$(cat "$1" 2>/dev/null || true)
+  case "$since" in
+    ''|*[!0-9]*) return 0 ;;
+    *) [ "$(( $(date +%s) - since ))" -ge "$STALE_ESCALATE_SECS" ] ;;
   esac
 }
 
@@ -510,6 +555,7 @@ clear_pause_tracking() {  # <window-key>
   local key=$1
   clear_pause_state "$key"
   clear_write_tracking "$key"
+  clear_reconciled_tracking "$key"
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
@@ -565,7 +611,11 @@ pause_state_class() {  # <window> <task>
   # captain hold - which has no current-state mapping and so arrives as `none` -
   # would be silenced by every caller rather than taking the bounded re-surface
   # cadence, and a forgotten hold would rot invisibly.
-  [ "$class" = none ] && class=paused
+  # A crew that already DECLARED its wait keeps the declared-pause cadence for
+  # every expected-idle verdict, so widening crew_absorb_class cannot change what
+  # this arm returns. The reconciled parked/done absorber owns only crews that have
+  # no declaration of their own on the log.
+  case "$class" in none|parked|done) class=paused ;; esac
   case "$class" in
     paused) date +%s > "$recheck_file" ;;
     *) rm -f "$recheck_file" ;;
@@ -596,6 +646,100 @@ surface_nonterminal_stale() {  # <window> <hash>
       "$STATE/.paused-resurfaced-$key" "$STATE/.paused-surfaced-$key"
   fi
   wake "stale: $win"
+}
+
+# The reconciled expected-idle state a surface was spent on, as a stable digest of
+# the class, the declaration standing on the log, and that log's own mtime. Keyed
+# to the STATE and not merely to the window, so a crew that moves from parked to
+# done, raises a second decision, or resumes and finishes again, is a new event that
+# earns its own surface rather than inheriting the previous one's. The mtime is what
+# separates "the same wait, redrawn" from "the crew wrote something new": a pane
+# redraw changes the hash and leaves the log untouched, while any fresh append
+# changes this digest even when the appended text repeats.
+reconciled_idle_digest() {  # <class> <status-line> <status-mtime>
+  printf '%s\n%s\n%s' "$1" "$2" "$3" | hash_pane
+}
+
+# Surface-or-absorb a stale pane whose authoritative current state
+# bin/fm-crew-state.sh has reconciled as `parked` (held at a decision) or `done`
+# (work finished, whether or not it has landed). Such a pane is idle BY DESIGN -
+# the decision record and the PR merge poll own what happens next - so its hash
+# carries no wedge evidence at all.
+#
+# Expected-idle is NOT invisible. The FIRST sight of each distinct reconciled state
+# surfaces exactly as the ordinary stale paths would, because a crew parked at a
+# gate it never announced, or finished with nothing yet watching it, must still
+# reach firstmate once. Only after that surface is spent does a later hash under the
+# SAME reconciled state count as the same wait redrawn - a token counter, a clock, a
+# footer - and take the shared bounded re-surface cadence instead of costing a whole
+# supervision turn per redraw. That is the same shape pause_declaration_surfaced
+# gives a declared wait, for the states a crew never has to declare.
+#
+# The absorb RE-ARMS the wedge timer rather than dropping it. Two things follow, and
+# both are the point: the next expiry re-reads the authoritative state, so a pane
+# that stops being parked or done while it stays frozen escalates as the wedge it
+# has become; and an absorbed pane costs one crew-state read per STALE_ESCALATE_SECS
+# rather than one per poll. The re-surface age is anchored on .reconciled-since-<key>
+# - the moment this expected-idle stretch began - not on the status file, because a
+# crew can be parked at a gate for hours without writing a single status line.
+handle_reconciled_idle_stale() {  # <window> <task> <hash> <parked|done>
+  local win=$1 task=$2 h=$3 class=$4 key statusf last mtime digest since age detail reason
+  key=$(window_key "$win")
+  statusf="$STATE/$task.status"
+  last=$(last_status_line "$statusf")
+  mtime=$(stat_mtime "$statusf" || true)
+  digest=$(reconciled_idle_digest "$class" "$last" "$mtime")
+  since="$STATE/.reconciled-since-$key"
+  if [ "$(cat "$STATE/.reconciled-$key" 2>/dev/null || true)" != "$digest" ]; then
+    fm_wake_append stale "$win" "stale: $win" || exit 1
+    printf '%s' "$h" > "$STATE/.stale-$key"
+    rm -f "$STATE/.stale-since-$key"
+    clear_write_tracking "$key"
+    printf '%s' "$digest" > "$STATE/.reconciled-$key"
+    date +%s > "$since"
+    date +%s > "$STATE/.reconciled-resurfaced-$key"
+    mark_surfaced "$statusf"
+    wake "stale: $win"
+    return
+  fi
+  printf '%s' "$h" > "$STATE/.stale-$key"
+  date +%s > "$STATE/.stale-since-$key"
+  rm -f "$STATE/.wedge-escalations-$key"
+  clear_pause_state "$key"
+  clear_write_tracking "$key"
+  [ -e "$since" ] || date +%s > "$since"
+  age=$(age_of "$since")
+  if [ "$class" = parked ]; then
+    detail="parked, awaiting a decision"
+    reason="parked ${age}s, awaiting a decision - reconciled expected idle, rechecked on a long cadence not a wedge; answer the open decision or restart the work"
+  else
+    # `done` covers a PR that is merely green and one that already merged
+    # (bin/fm-crew-state.sh maps checks-passed, passed and completed onto the same
+    # token), so this recheck states only what is certainly true - the work is
+    # finished and the crew is still sitting there - and asks which it is. Naming
+    # an unfinished landing would hand the captain the wrong next action for half
+    # the crews that reach it.
+    detail="done, not yet cleaned up"
+    reason="done ${age}s, finished and not yet cleaned up - reconciled expected idle, rechecked on a long cadence not a wedge; confirm whether this work has landed"
+  fi
+  resurface_absorbed "$win" "$STATE/.reconciled-resurfaced-$key" "$age" "stale: $win ($reason)"
+  triage_log "absorbed stale ($detail, age ${age}s): $win"
+}
+
+# Re-read the authoritative crew state for an ALREADY-classified stale hash whose
+# wedge timer has come due, and hand it to the reconciled-idle absorber when that
+# state is expected idle. A no-mistakes run can park at an approval gate, or go
+# checks-green, while the pane it renders never changes a byte; the timer armed
+# while that run WAS working would otherwise escalate the transition as a wedge.
+# Every other verdict stays on the existing timer, so a genuinely frozen crew
+# escalates exactly as it did before.
+wedge_timer_due_check() {  # <window> <task> <hash> <since-file> <escalation-file> <triage-label>
+  local win=$1 task=$2 h=$3 since_file=$4 escalation_file=$5 label=$6 class
+  class=$(crew_absorb_class "$task")
+  case "$class" in
+    parked|done) handle_reconciled_idle_stale "$win" "$task" "$h" "$class" ;;
+    *)           wedge_timer_check "$win" "$since_file" "$label" "$escalation_file" "$task" ;;
+  esac
 }
 
 # Check and heartbeat cadence must survive actionable exits and restarts: the
@@ -1235,19 +1379,35 @@ EOF
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
-              printf '%s' "$h" > "$sf"
-              date +%s > "$ssf"
-              clear_write_tracking "$key"
-              triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
-            else
-              fm_wake_append stale "$w" "stale: $w" || exit 1
-              printf '%s' "$h" > "$sf"
-              rm -f "$ssf"
-              clear_write_tracking "$key"
-              mark_surfaced "$STATE/$(window_to_task "$w" "$STATE").status"
-              wake "stale: $w"
-            fi
+            class=$(crew_absorb_class "$task")
+            case "$class" in
+              working)
+                printf '%s' "$h" > "$sf"
+                date +%s > "$ssf"
+                clear_write_tracking "$key"
+                clear_reconciled_tracking "$key"
+                triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
+                ;;
+              parked|done)
+                # The log's captain-relevant line and the reconciled state agree
+                # that this pane is waiting, not wedged. That agreement is exactly
+                # what makes a redraw uninformative, so the first sight still
+                # surfaces and only the repeats are absorbed.
+                handle_reconciled_idle_stale "$w" "$task" "$h" "$class"
+                ;;
+              *)
+                fm_wake_append stale "$w" "stale: $w" || exit 1
+                printf '%s' "$h" > "$sf"
+                rm -f "$ssf"
+                clear_write_tracking "$key"
+                mark_surfaced "$STATE/$task.status"
+                wake "stale: $w"
+                ;;
+            esac
+          elif [ -e "$ssf" ] && wedge_timer_is_due "$ssf"; then
+            # The timer this hash has been riding is about to escalate, so spend
+            # one authoritative read before calling a wait a wedge.
+            wedge_timer_due_check "$w" "$task" "$h" "$ssf" "$ewf" "stale (overridden terminal status)"
           elif [ -e "$ssf" ]; then
             # This exact hash was already overridden as provably-working (a
             # wedge timer is running for it) - keep treating it that way
@@ -1261,13 +1421,18 @@ EOF
         else
           # Non-terminal stale: a crew gone quiet without a captain-relevant status.
           # Decided once per distinct stale hash (the costly state reads run only
-          # on first sight, never every poll) via pause_state_class, which returns:
+          # on first sight and at an expiring wedge timer, never every poll) via
+          # pause_state_class, which returns:
           #   - working: an actively-running pipeline legitimately sits on a static
           #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
           #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
           #   - paused: a declared wait pause_state_class admits (its header owns which
           #     liveness evidence each kind of crew must supply), so absorb on the long
           #     PAUSE_RESURFACE_SECS cadence instead of wedge-escalating;
+          #   - parked/done: the crew never declared a wait, but its authoritative state
+          #     is held at a decision or finished with its work done, so the idleness is
+          #     expected: surface each distinct reconciled state once, then absorb its
+          #     redraws onto that same bounded cadence (handle_reconciled_idle_stale);
           #   - none: no running pipeline, no exact busy verdict, no admitted declared wait.
           #     Surface immediately so firstmate inspects the inconclusive state
           #     (it may be done via an interactive menu that wrote no done: status,
@@ -1277,7 +1442,8 @@ EOF
           #     wait redrawn, not a new event (see the surfaced-record case below).
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
-            case "$(pause_state_class "$w" "$task")" in
+            class=$(pause_state_class "$w" "$task")
+            case "$class" in
               working)
                 clear_pause_tracking "$key"
                 printf '%s' "$h" > "$sf"
@@ -1286,6 +1452,12 @@ EOF
                 ;;
               paused)
                 handle_paused_stale "$w" "$task" "$h"
+                ;;
+              parked|done)
+                # No declaration on the log, so nothing else here is throttling
+                # this pane - but the reconciled state says the idleness is
+                # expected. Surface the state once, then absorb its redraws.
+                handle_reconciled_idle_stale "$w" "$task" "$h" "$class"
                 ;;
               *)
                 # A live agent's first-sighted declaration still surfaces once, so
@@ -1319,9 +1491,16 @@ EOF
           else
             task=$(window_to_task "$w" "$STATE")
             if [ -e "$pf" ] || status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
-              case "$(pause_state_class "$w" "$task")" in
+              # Reaching here means a declaration stands (the loop top drops the
+              # cadence flag the moment one ends), and pause_state_class maps every
+              # expected-idle verdict under a declaration onto that declaration's own
+              # cadence - so parked and done never arrive here and the reconciled
+              # absorber owns only undeclared waits.
+              class=$(pause_state_class "$w" "$task")
+              case "$class" in
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$key"
+                         clear_reconciled_tracking "$key"
                          printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" "$task"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
@@ -1337,6 +1516,8 @@ EOF
                            surface_nonterminal_stale "$w" "$h"
                          fi ;;
               esac
+            elif [ -e "$ssf" ] && wedge_timer_is_due "$ssf"; then
+              wedge_timer_due_check "$w" "$task" "$h" "$ssf" "$ewf" "non-terminal stale"
             else
               wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf" "$task"
             fi
@@ -1352,6 +1533,16 @@ EOF
         else
           rm -f "$ssf" "$ewf"
           clear_write_tracking "$key"
+        fi
+        # A pane rendering busy is the crew working, not the same wait redrawn, so
+        # it ends any reconciled expected-idle stretch and the NEXT park earns its
+        # own surface. Unlike the pause bookkeeping below there is no declaration to
+        # weigh against the busy reading: a reconciled state is read from the crew,
+        # never declared by it, so the crew rendering busy is the whole of the
+        # evidence. Keyed to the busy verdict alone, so a merely changed hash on a
+        # still-idle pane is untouched.
+        if [ "$busy_now" -eq 0 ]; then
+          clear_reconciled_tracking "$key"
         fi
         # Pause bookkeeping is NOT dropped here. A busy reading is one poll's
         # rendered verdict, while the declaration on the log is the crew's own
@@ -1369,6 +1560,11 @@ EOF
       else
         rm -f "$ssf" "$ewf"
         clear_write_tracking "$key"
+      fi
+      # Same rule as the unchanged-hash reset above: the busy verdict ends the
+      # reconciled stretch, the changed hash on its own does not.
+      if [ "$busy_now" -eq 0 ]; then
+        clear_reconciled_tracking "$key"
       fi
       task=$(window_to_task "$w" "$STATE")
       # A new hash under a standing declaration is reclassified, never cleared on

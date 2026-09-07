@@ -283,12 +283,23 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
   : > "$state/.paused-$watcher_key"
   : > "$state/.stale-$watcher_key"
   : > "$state/.wedge-escalations-$watcher_key"
+  # The reconciled expected-idle chain the watcher writes for an undeclared park
+  # or an unlanded done. The daemon owns this reset in away mode, and it also
+  # removes the .paused-* marker the watcher's own clear keys off, so anything it
+  # leaves behind here is orphaned: a later identical reconciled state would reuse
+  # a spent surface record and a stale age anchor.
+  : > "$state/.reconciled-$watcher_key"
+  : > "$state/.reconciled-since-$watcher_key"
+  : > "$state/.reconciled-resurfaced-$watcher_key"
   FM_STATE_OVERRIDE="$state" handle_wake "signal: $state/held-w10-terminal.status" "$state"
   [ ! -e "$state/.subsuper-paused-$key" ] || fail "terminal signal retained the daemon pause marker"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "terminal signal retained daemon stale tracking"
   [ ! -e "$state/.paused-$watcher_key" ] || fail "terminal signal retained watcher pause tracking"
   [ ! -e "$state/.stale-$watcher_key" ] || fail "terminal signal retained watcher stale tracking"
   [ ! -e "$state/.wedge-escalations-$watcher_key" ] || fail "terminal signal retained watcher wedge tracking"
+  [ ! -e "$state/.reconciled-$watcher_key" ] || fail "terminal signal retained the watcher reconciled surface record"
+  [ ! -e "$state/.reconciled-since-$watcher_key" ] || fail "terminal signal retained the watcher reconciled age anchor"
+  [ ! -e "$state/.reconciled-resurfaced-$watcher_key" ] || fail "terminal signal retained the watcher reconciled re-surface throttle"
   FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "terminal stale dedupe restored daemon stale tracking"
   pass "a terminal signal clears pause and stale tracking across both supervisors"

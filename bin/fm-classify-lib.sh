@@ -17,9 +17,11 @@
 # (crew_absorb_class and its working/paused wrappers) is NOT a pure status-file
 # read: it reuses bin/fm-crew-state.sh, which may make a bounded no-mistakes call,
 # to decide whether a crew that just stopped its turn or went stale is working,
-# deliberately paused, or neither. Callers run it ONLY on no-verb signal handling
-# and first sighting of a stale hash, never on every wake, so the per-wake triage
-# stays cheap. status_open_decisions_incremental (see "incremental (cursor-backed)
+# deliberately paused, idle by design at a decision or with its work finished, or none of
+# those. Callers run it ONLY on no-verb signal handling, first sighting of a stale
+# hash, and an already-classified stale hash whose wedge timer has come due, never
+# on every wake, so the per-wake triage stays cheap.
+# status_open_decisions_incremental (see "incremental (cursor-backed)
 # open-decisions fold" below) also writes: it persists a per-status-file byte
 # cursor and folded open-set as a side effect, so a per-drain fleet-wide scan
 # stays bounded by new appends instead of re-reading each task's whole lifetime
@@ -1626,9 +1628,17 @@ signal_reason_is_actionable() {  # <file> ...
 #             (e.g. waiting on CI);
 #   paused  - the crew's authoritative current state is a declared external-wait
 #             pause (paused:), which is EXPECTED to idle;
-#   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
-#             torn-down/unknown crew, or an unreadable verdict).
-# One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
+#   parked  - the crew is held at a decision (a no-mistakes approval or fix-review
+#             gate, or a needs-decision status), so its pane is idle BY DESIGN
+#             while the decision, not the pane, is what has to move;
+#   done    - the crew's work is finished, whether or not it has landed, so its
+#             pane is idle BY DESIGN while the PR poll owns what happens next;
+#   none    - none of those, so the wake must surface (a stopped, blocked, failed,
+#             torn-down, or unknown crew, or an unreadable verdict).
+# parked and done say the idleness is EXPECTED, never that there is nothing to
+# report: each still earns one presentation, and bin/fm-watch.sh's reconciled-idle
+# absorber owns that surface-once-then-bounded-recheck contract.
+# One fm-crew-state.sh read serves EVERY absorb reason at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crew
 # that appended paused: but then STARTED a run reports working, never paused.
 # NOT a pure read: fm-crew-state.sh may make a bounded no-mistakes call, so a
@@ -1645,11 +1655,13 @@ crew_absorb_class() {  # <id>
   line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
   state=${line#state: }; state=${state%% *}
-  if [ "$state" = paused ]; then printf 'paused'; return; fi
-  if [ "$state" = working ]; then
-    src=${line#*source: }; src=${src%% *}
-    case "$src" in run-step|pane) printf 'working'; return ;; esac
-  fi
+  case "$state" in
+    paused|parked|done) printf '%s' "$state"; return ;;
+    working)
+      src=${line#*source: }; src=${src%% *}
+      case "$src" in run-step|pane) printf 'working'; return ;; esac
+      ;;
+  esac
   printf 'none'
 }
 
@@ -1659,7 +1671,7 @@ crew_absorb_class() {  # <id>
 # ONLY when this returns 0, and SURFACED otherwise (the crew may be done, waiting
 # on a decision, or wedged). For stale panes it is checked before trusting the
 # status log so a pre-validation captain-relevant line does not override an active
-# run. See crew_absorb_class for the exact working/paused/none decision.
+# run. See crew_absorb_class for the exact working/paused/parked/done/none decision.
 crew_is_provably_working() {  # <id>
   [ "$(crew_absorb_class "$1")" = working ]
 }

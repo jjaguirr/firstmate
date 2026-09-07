@@ -979,6 +979,31 @@ test_no_run_idle_pane_paused() {
   pass "no run + idle pane on a paused: status reports state: paused with its reason"
 }
 
+# A `paused:` line is the crew's OWN declaration, and the run step outranks it the
+# moment a run starts: the crew that declared an external wait and then began
+# validating is working, not paused. Every absorb decision built on this reader -
+# the watcher's declared-pause cadence and its reconciled expected-idle absorber
+# both read state through here, never by tailing the log - depends on that ordering,
+# because reading the log instead would let a stale declaration silence an active run.
+test_started_run_outranks_a_declared_pause() {
+  reset_fakes
+  local d; d=$(new_case paused-then-running)
+  make_repo_on_branch "$d/wt" fm/feat-pause-run
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-pause-run.meta" "window=fm:fm-feat-pause-run" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'paused: holding for the upstream tool release\n' > "$d/state/feat-pause-run.status"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-pause-run)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" feat-pause-run
+  local out; out=$(run_crew_state "$d" feat-pause-run)
+  assert_contains "$out" "state: working" "a run started after a paused: line -> working"
+  assert_contains "$out" "source: run-step" "a run started after a paused: line -> run-step source"
+  case "$out" in
+    *"state: paused"*) fail "a started run was reported as the crew's declared pause: $out" ;;
+  esac
+  pass "a run started after a paused: declaration reports working, never the declared pause"
+}
+
 test_no_run_idle_pane_custom_paused_verb() {
   reset_fakes
   local d; d=$(new_case custom-paused)
@@ -1822,6 +1847,7 @@ test_no_run_herdr_idle_agent_status_and_idle_record_stays_idle
 test_no_run_idle_pane_uses_log
 test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused
+test_started_run_outranks_a_declared_pause
 test_no_run_idle_pane_custom_paused_verb
 test_no_run_idle_secondmate_resolved_event_not_state
 test_dead_window_ignores_stale_status_log
