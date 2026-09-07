@@ -85,12 +85,15 @@ cleanup_snapshot_tmpdir() {
   [ -n "$SNAPSHOT_TMPDIR" ] && rm -rf "$SNAPSHOT_TMPDIR"
 }
 cleanup_snapshot_tmpdir_on_signal() {
+  local sig=$1
   cleanup_snapshot_tmpdir
-  trap - EXIT
-  exit 130
+  trap - EXIT "$sig"
+  kill -"$sig" "$$"
 }
 trap cleanup_snapshot_tmpdir EXIT
-trap cleanup_snapshot_tmpdir_on_signal INT TERM HUP
+trap 'cleanup_snapshot_tmpdir_on_signal INT' INT
+trap 'cleanup_snapshot_tmpdir_on_signal TERM' TERM
+trap 'cleanup_snapshot_tmpdir_on_signal HUP' HUP
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"

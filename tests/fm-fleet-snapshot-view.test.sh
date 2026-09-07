@@ -358,11 +358,12 @@ test_oversized_secondmate_summary_survives_argv_limit() {
 # them without bound until their {id,path} list crosses MAX_ARG_STRLEN and the
 # final combined --json jq can no longer take them through argv.
 test_oversized_scout_reports_survive_argv_limit() {
-  local home out reports_bytes i
+  local home out reports_bytes pad i
   home=$(make_home oversized-scout-reports)
-  for i in $(seq 1 1500); do
-    mkdir -p "$home/data/scout-report-$i"
-    printf '# Scout %d\n' "$i" > "$home/data/scout-report-$i/report.md"
+  pad=$(printf 'r%.0s' $(seq 1 200))
+  for i in $(seq 1 300); do
+    mkdir -p "$home/data/scout-report-$i-$pad"
+    printf '# Scout %d\n' "$i" > "$home/data/scout-report-$i-$pad/report.md"
   done
   out=$(FM_HOME="$home" "$SNAPSHOT" --json 2>&1) \
     || fail "snapshot must survive a scout report list larger than MAX_ARG_STRLEN: $out"
@@ -370,7 +371,7 @@ test_oversized_scout_reports_survive_argv_limit() {
   [ "$reports_bytes" -gt 131072 ] \
     || fail "fixture scout report list must exceed MAX_ARG_STRLEN to exercise the bug, got $reports_bytes bytes"
   printf '%s' "$out" | jq -e '
-    (.scout_reports | length) == 1500
+    (.scout_reports | length) == 300
       and (.scout_reports[0].id | startswith("scout-report-"))
       and all(.scout_reports[]; .kind == "scout")
   ' >/dev/null || fail "oversized scout report snapshot missing expected pointers: $out"
@@ -381,24 +382,29 @@ test_oversized_scout_reports_survive_argv_limit() {
 # and must not survive a real signal death, not just normal exit. Kill a
 # slow-running snapshot with SIGTERM and confirm its temp directory is gone.
 test_sigterm_removes_snapshot_tmpdir() {
-  local home tmproot pid waited after
+  local home tmproot pid waited before after
   home=$(make_home signal-cleanup)
   write_oversized_backlog "$home" 3000 40
-  tmproot=$(mktemp -d)
-  ( TMPDIR="$tmproot" FM_HOME="$home" "$SNAPSHOT" --json >/dev/null 2>&1 ) &
+  tmproot=$(fm_test_tmproot fm-fleet-snapshot-signal) \
+    || fail "could not create an isolated TMPDIR for the signal test"
+  ( export TMPDIR="$tmproot" FM_HOME="$home"; exec "$SNAPSHOT" --json >/dev/null 2>&1 ) &
   pid=$!
   waited=0
-  while [ "$waited" -lt 40 ]; do
-    [ -n "$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)" ] && break
+  before=""
+  while [ "$waited" -lt 100 ]; do
+    before=$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)
+    [ -n "$before" ] && break
     sleep 0.1
     waited=$((waited + 1))
   done
-  kill -0 "$pid" 2>/dev/null \
-    || fail "snapshot exited before it could be signaled; make the fixture slower"
+  if [ -z "$before" ]; then
+    kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    fail "snapshot never created its temp directory, so the signal trap was never exercised"
+  fi
   kill -TERM "$pid"
   wait "$pid" 2>/dev/null
   after=$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)
-  rm -rf "$tmproot"
   [ -z "$after" ] || fail "SIGTERM left the snapshot temp directory behind: $after"
   pass "SIGTERM during a slow snapshot still removes its private temp directory"
 }
