@@ -1,0 +1,77 @@
+firstmate wedge escalation - supervisor-visible wake reasons
+watcher under test: /home/ubuntu/.no-mistakes/worktrees/9c45ef16ef2c/01M1YRW1282HVQ7HEC0VK1QJ7F/bin/fm-watch.sh
+date: 2026-09-07T21:13:26Z
+
+------------------------------------------------------------
+SCENARIO 1  idle-stale pane, run-step still says 'validating (running)',
+            but the pane's foreground process is a bare shell: no agent at
+            the recorded endpoint. Expected: marker on escalation 1.
+------------------------------------------------------------
+supervisor sees:
+  stale: test:fm-dead-agent (idle 501s, possible wedge, escalation 1, demand-deep-inspection: no agent is alive at the recorded endpoint - inspect now, do not re-absorb on the run-step/pane state alone)
+persisted escalation counter: 1
+
+------------------------------------------------------------
+SCENARIO 2  the reported defect: agent ALIVE at the recorded endpoint
+            (harness in the pane foreground), counter PRE-SEEDED at the
+            FM_WEDGE_DEMAND_INSPECT_COUNT threshold of 3. Expected: the wake
+            still fires and still reports an unresolved possible wedge, but
+            never carries demand-deep-inspection and never advances the count.
+------------------------------------------------------------
+round 1, supervisor sees:
+  stale: test:fm-alive-agent (idle 501s, possible wedge, escalation 3 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+round 2, supervisor sees:
+  stale: test:fm-alive-agent (idle 501s, possible wedge, escalation 3 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+persisted escalation counter after 2 alive escalations: 3  (pre-seeded 3, unadvanced)
+
+------------------------------------------------------------
+SCENARIO 3  same pane, but the endpoint answers nothing readable, so the
+            liveness verdict is 'unknown'. Expected: the PRE-EXISTING
+            repetition schedule is untouched - count climbs 1,2,3 and the
+            marker fires at 3.
+------------------------------------------------------------
+round 1, supervisor sees:
+  stale: test:fm-wedged (idle 500s, possible wedge, escalation 1)
+round 2, supervisor sees:
+  stale: test:fm-wedged (idle 500s, possible wedge, escalation 2)
+round 3, supervisor sees:
+  stale: test:fm-wedged (idle 500s, possible wedge, escalation 3, demand-deep-inspection: 3 unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)
+persisted escalation counter: 3
+
+------------------------------------------------------------
+SCENARIO 4  a secondmate with a bare shell in the pane foreground - the
+            exact fixture that reads 'dead' for an ordinary crew. Expected:
+            its endpoint is never probed, so it keeps the repetition
+            schedule and its first escalation carries no marker.
+------------------------------------------------------------
+supervisor sees:
+  stale: test:fm-mate-unprobed (idle 501s, possible wedge, escalation 1)
+persisted escalation counter: 1
+
+------------------------------------------------------------
+SCENARIO 5  a pane past the busy-turn bound whose agent reads ALIVE. This
+            path refuses the affirmative reading, so the pre-change behavior
+            must hold byte for byte: count climbs 1,2,3 and the marker fires
+            at 3.
+------------------------------------------------------------
+round 1, supervisor sees:
+  stale: test:fm-busy-alive (idle 501s, possible wedge, escalation 1)
+round 2, supervisor sees:
+  stale: test:fm-busy-alive (idle 501s, possible wedge, escalation 2)
+round 3, supervisor sees:
+  stale: test:fm-busy-alive (idle 501s, possible wedge, escalation 3, demand-deep-inspection: 3 unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)
+persisted escalation counter: 3
+
+------------------------------------------------------------
+SCENARIO 6  the killed agent behind a busy-LOOKING pane, the case that
+            used to wait out three escalations before a supervisor saw it.
+            Expected: marker on escalation 1.
+------------------------------------------------------------
+supervisor sees:
+  stale: test:fm-busy-dead-agent (idle 501s, possible wedge, escalation 1, demand-deep-inspection: no agent is alive at the recorded endpoint - inspect now, do not re-absorb on the run-step/pane state alone)
+persisted escalation counter: 1
+
+------------------------------------------------------------
+ALIVE-ARM REASON captured for the daemon-routing check:
+  stale: test:fm-alive-agent (idle 501s, possible wedge, escalation 3 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+------------------------------------------------------------

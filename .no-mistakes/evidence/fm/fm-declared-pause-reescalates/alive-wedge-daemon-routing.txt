@@ -1,0 +1,12 @@
+daemon under test: /home/ubuntu/.no-mistakes/worktrees/9c45ef16ef2c/01M1YRW1282HVQ7HEC0VK1QJ7F/bin/fm-supervise-daemon.sh
+crew status line:  paused: awaiting an external dependency
+wake handed to the daemon (alive-arm reason from the real watcher):
+  stale: sess:fm-alive-agent (idle 501s, possible wedge, escalation 3 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+
+captain escalation feed (state/.subsuper-escalations):
+  sess:fm-alive-agent (idle 501s, possible wedge, escalation 3 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+
+demand-deep-inspection token in the escalation: no
+ordinary stale tracking retained: no
+pause tracking preserved:         yes
+worker interrupted or killed:     no

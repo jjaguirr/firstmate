@@ -1,0 +1,17 @@
+BASELINE at commit 3a4a733 (before this change)
+watcher under test: /tmp/fm-base/bin/fm-watch.sh
+
+------------------------------------------------------------
+SCENARIO 1 fixture, base watcher: agent gone, run-step still says working.
+------------------------------------------------------------
+supervisor saw:
+  stale: test:fm-dead-agent (idle 501s, possible wedge, escalation 1)
+demand-deep-inspection on this first escalation: no
+
+------------------------------------------------------------
+SCENARIO 2 fixture, base watcher: agent ALIVE, counter pre-seeded at 3.
+------------------------------------------------------------
+supervisor saw:
+  stale: test:fm-alive-agent (idle 501s, possible wedge, escalation 4, demand-deep-inspection: same pane has wedge-escalated 4 times in a row - do not re-absorb on the run-step/pane state alone)
+demand-deep-inspection despite a demonstrably live agent: yes
+escalation counter after the round: 4  (was 3)
