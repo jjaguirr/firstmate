@@ -64,8 +64,11 @@
 #                          the same wedge timer, which refuses an affirmative
 #                          liveness reading there and so keeps the identical
 #                          "stale: ..." reason, escalation count, and
-#                          demand-deep-inspection marker it always had (only the
-#                          idle-stale path admits that reading - see
+#                          demand-deep-inspection marker it always had for an
+#                          alive or unknown reading, while a dead or
+#                          authoritatively missing endpoint carries the marker at
+#                          its first escalation there too (only the
+#                          idle-stale path admits an alive reading - see
 #                          wedge_timer_check), for human inspection only - never
 #                          an automatic interrupt, signal, or restart of the
 #                          worker or its tool process.
@@ -186,8 +189,10 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # STALE_ESCALATE_SECS-paced wedge_timer_check used for a provably-working
 # non-busy stale, refusing an affirmative liveness reading there - so it escalates
 # via the existing stale reason, escalation counter, and demand-deep-inspection
-# marker for human inspection only, never an automatic interrupt, signal, or
-# restart - unless the crew declared the wait
+# marker for an alive or unknown reading, while a dead or authoritatively missing
+# endpoint carries that marker at its first escalation there too (wedge_timer_check
+# owns the full contract), for human inspection only, never an automatic
+# interrupt, signal, or restart - unless the crew declared the wait
 # itself, which takes the long pause cadence instead. A completed turn touches
 # turn-ended and resets the age. Set generously above any legitimate interval
 # between completed turns, including long tool calls, builds, or test runs.
