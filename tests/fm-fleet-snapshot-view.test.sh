@@ -380,16 +380,23 @@ test_oversized_scout_reports_survive_argv_limit() {
 
 # Regression: SNAPSHOT_TMPDIR holds backlog/task JSON (task titles, PR URLs)
 # and must not survive a real signal death, not just normal exit. Kill a
-# slow-running snapshot with SIGTERM and confirm its temp directory is gone.
-test_sigterm_removes_snapshot_tmpdir() {
-  local home tmproot pid waited before after status i
-  home=$(make_home signal-cleanup)
+# slow-running snapshot with a real signal and confirm it died from that signal
+# and left no temp directory behind.
+#
+# SIGINT is checked alongside SIGTERM because it is the discriminating case: an
+# EXIT-only trap still cleans up on SIGTERM on Linux (bash defers the fatal
+# signal until the foreground jq it is waiting on exits, then runs the EXIT
+# trap), but it swallows SIGINT entirely and the snapshot runs to completion
+# with status 0 - so Ctrl-C through bin/fm-fleet-view.sh never stopped it.
+signal_kills_snapshot_and_removes_tmpdir() {  # <signal> <expected-status>
+  local sig=$1 expected=$2 home tmproot pid waited before after status i
+  home=$(make_home "signal-cleanup-$sig")
   write_oversized_backlog "$home" 500 40
   for i in $(seq 1 200); do
     mkdir -p "$home/data/slow-scout-$i"
     printf '# Scout %d\n' "$i" > "$home/data/slow-scout-$i/report.md"
   done
-  tmproot=$(fm_test_tmproot fm-fleet-snapshot-signal) \
+  tmproot=$(fm_test_tmproot "fm-fleet-snapshot-signal-$sig") \
     || fail "could not create an isolated TMPDIR for the signal test"
   ( export TMPDIR="$tmproot" FM_HOME="$home"; exec "$SNAPSHOT" --json >/dev/null 2>&1 ) &
   pid=$!
@@ -404,14 +411,19 @@ test_sigterm_removes_snapshot_tmpdir() {
     waited=$((waited + 1))
   done
   [ -n "$before" ] || fail "snapshot never created its temp directory, so the signal trap was never exercised"
-  kill -TERM "$pid"
+  kill -"$sig" "$pid"
   wait "$pid" 2>/dev/null
   status=$?
-  [ "$status" -eq 143 ] \
-    || fail "snapshot must die from the SIGTERM it was sent, got exit status $status"
+  [ "$status" -eq "$expected" ] \
+    || fail "snapshot must die from the SIG$sig it was sent (expected $expected), got exit status $status"
   after=$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)
-  [ -z "$after" ] || fail "SIGTERM left the snapshot temp directory behind: $after"
-  pass "SIGTERM during a slow snapshot still removes its private temp directory"
+  [ -z "$after" ] || fail "SIG$sig left the snapshot temp directory behind: $after"
+}
+
+test_signal_removes_snapshot_tmpdir() {
+  signal_kills_snapshot_and_removes_tmpdir TERM 143
+  signal_kills_snapshot_and_removes_tmpdir INT 130
+  pass "SIGTERM and SIGINT during a slow snapshot kill it and remove its private temp directory"
 }
 
 test_normalized_roles_and_plural_blocker_readiness() {
@@ -1022,7 +1034,7 @@ test_oversized_backlog_survives_argv_limit_json
 test_oversized_backlog_survives_argv_limit_secondmate_summary
 test_oversized_secondmate_summary_survives_argv_limit
 test_oversized_scout_reports_survive_argv_limit
-test_sigterm_removes_snapshot_tmpdir
+test_signal_removes_snapshot_tmpdir
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
