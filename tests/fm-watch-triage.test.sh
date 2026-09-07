@@ -2112,6 +2112,10 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
   # The crew's pipeline is actively running: a static pane is normal (waiting on CI).
+  # No pane current command is faked, so the endpoint reads back unreadable and the
+  # agent verdict is `unknown`: this case pins the repetition FALLBACK, the arm that
+  # keeps the pre-existing threshold when no liveness evidence is available. The
+  # evidence-driven arms are pinned by the dead/missing and alive cases below.
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # Priming round: first sighting of this stale hash classifies and absorbs it
@@ -2184,6 +2188,193 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
   reap "$pid"
   unset FM_FAKE_CREW_STATE
   pass "a pane becoming active again resets the consecutive wedge-escalation counter"
+}
+
+# --- the marker's trigger is evidence first, repetition only as a fallback ----
+# The threshold above is a proxy for "the affirmative reading that keeps absorbing
+# this pane may be wrong", and a proxy is all it was: a run-step verdict repeats
+# just as reliably when it is right. So the escalation that is about to fire reads
+# the agent at the recorded endpoint - the same reading a supervisor's own deep
+# inspection would take - and lets that decide the marker. A dead endpoint is the
+# failure the marker exists for and no longer waits out three rounds; an alive one
+# is not evidence of a wedge and no longer counts toward a marker whose text tells
+# the supervisor to stop trusting exactly the reading that just came back
+# affirmative. Every arm still queues the same stale wake on the same cadence, so
+# nothing that surfaced before this existed is absorbed now.
+
+# The pane is idle with a bare shell in the foreground: the recorded endpoint is
+# alive but its agent is gone. That is a duplicate-work hazard the supervisor must
+# reach immediately, so the FIRST escalation carries the marker.
+test_wedge_dead_agent_demands_inspection_at_first_escalation() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case wedge-dead-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-dead-agent"
+  printf 'idle building output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/dead-agent.meta"
+  printf 'working: kicked off the validation run\n' > "$state/dead-agent.status"
+  sig=$(seen_sig "$state/dead-agent.status"); printf '%s' "$sig" > "$state/.seen-dead-agent_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # Already classified and absorbed as provably working on an earlier poll: this is
+  # the wedge timer coming due, which is the only branch that escalates.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  # The run-step still claims the crew is validating: exactly the affirmative
+  # reading whose repetition used to be the only path to the marker.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a dead agent behind a working run-step never escalated: $(cat "$out")"; }
+  grep -F "escalation 1" "$out" >/dev/null || fail "the dead-agent escalation was not the first one: $(cat "$out")"
+  grep -F "demand-deep-inspection" "$out" >/dev/null \
+    || fail "a dead agent did not demand deep inspection on its first escalation: $(cat "$out")"
+  grep -F "no agent is alive at the recorded endpoint" "$out" >/dev/null \
+    || fail "the dead-agent marker did not name the evidence that triggered it: $(cat "$out")"
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 1 ] \
+    || fail "the dead-agent escalation was not counted"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional dead-agent stop"
+  unset FM_FAKE_CREW_STATE
+  pass "a pane whose agent is gone demands deep inspection on its first escalation instead of after the repetition threshold"
+}
+
+# The recorded window is absent from a successful session inventory: authoritatively
+# missing, which fm_backend_agent_alive reports as the same confident dead verdict.
+test_wedge_missing_endpoint_demands_inspection_at_first_escalation() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case wedge-missing-endpoint); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-missing-endpoint"
+  printf 'idle building output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/missing-endpoint.meta"
+  printf 'working: kicked off the validation run\n' > "$state/missing-endpoint.status"
+  sig=$(seen_sig "$state/missing-endpoint.status"); printf '%s' "$sig" > "$state/.seen-missing-endpoint_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # Already classified and absorbed as provably working on an earlier poll: this is
+  # the wedge timer coming due, which is the only branch that escalates.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+
+  # The window under supervision comes from the recorded metadata, while the
+  # session inventory the fake tmux answers with names a different window: the
+  # recorded endpoint is gone.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="test:fm-some-other-window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a missing endpoint never escalated: $(cat "$out")"; }
+  grep -F "escalation 1" "$out" >/dev/null || fail "the missing-endpoint escalation was not the first one: $(cat "$out")"
+  grep -F "demand-deep-inspection" "$out" >/dev/null \
+    || fail "a missing endpoint did not demand deep inspection on its first escalation: $(cat "$out")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional missing-endpoint stop"
+  unset FM_FAKE_CREW_STATE
+  pass "a pane whose recorded endpoint is gone demands deep inspection on its first escalation"
+}
+
+# The opposite reading, and the reported defect: the agent is alive, so the
+# supervisor's deep inspection would come back affirmative exactly as the last
+# three did. The wake still fires - an alive agent can still be hung behind a
+# foreground call - but it must not push the pane toward a marker that tells the
+# supervisor to distrust that same affirmative reading. A counter already sitting
+# at the threshold must not be advanced or spent by it either.
+test_wedge_alive_agent_does_not_advance_escalation_count() {
+  local dir state fakebin out capture_file window key pane_hash sig pid n
+  dir=$(make_case wedge-alive-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-alive-agent"
+  printf 'idle building output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/alive-agent.meta"
+  # No declaration at all: a worker simply blocked on the background run it
+  # started itself, which is the ordinary shape of every validation in the fleet.
+  printf 'working: kicked off the validation run\n' > "$state/alive-agent.status"
+  sig=$(seen_sig "$state/alive-agent.status"); printf '%s' "$sig" > "$state/.seen-alive-agent_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # Already classified and absorbed as provably working on an earlier poll: this is
+  # the wedge timer coming due, which is the only branch that escalates.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  # Pre-seeded AT the threshold: even a pane that already earned the marker under
+  # the old repetition rule stops earning it once the endpoint reads alive.
+  printf '3\n' > "$state/.wedge-escalations-$key"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  n=1
+  while [ "$n" -le 2 ]; do
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    : > "$out"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 100 || { reap "$pid"; fail "an alive agent's stale pane stopped waking supervision on round $n: $(cat "$out")"; }
+    grep -F "stale: $window" "$out" >/dev/null || fail "round $n did not print the stale wake: $(cat "$out")"
+    grep -F "possible wedge" "$out" >/dev/null \
+      || fail "round $n stopped reporting an unresolved possible wedge: $(cat "$out")"
+    grep -F "agent alive at the recorded endpoint" "$out" >/dev/null \
+      || fail "round $n did not carry the affirmative liveness fact: $(cat "$out")"
+    grep -F "demand-deep-inspection" "$out" >/dev/null \
+      && fail "round $n demanded deep inspection for an agent that is demonstrably alive: $(cat "$out")"
+    ack_stopped_cycle "$state" || fail "could not acknowledge alive-agent round $n"
+    n=$((n + 1))
+  done
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 3 ] \
+    || fail "an affirmative liveness reading advanced the wedge-escalation counter"
+  unset FM_FAKE_CREW_STATE
+  pass "an escalation on a pane whose agent is alive still wakes supervision but never advances the demand-deep-inspection count"
+}
+
+# A secondmate idles by design and a remotely placed one records an endpoint this
+# home cannot probe at all, so its liveness is never read here - the same refusal
+# pause_state_class makes. It therefore keeps the repetition schedule rather than
+# collecting a confident dead verdict about a healthy mate. Reached the way a mate
+# actually reaches the wedge timer: away mode owns triage, so the declared-wait
+# exemption in the busy-turn bound is skipped.
+test_wedge_secondmate_endpoint_is_never_probed() {
+  local dir state fakebin out capture_file window key sig pid
+  dir=$(make_case wedge-mate-unprobed); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-mate-unprobed"
+  printf 'Working... (12.3s)' > "$capture_file"
+  printf 'window=%s\nkind=secondmate\nharness=pi\n' "$window" > "$state/mate-unprobed.meta"
+  record_pi_busy "$state" mate-unprobed
+  printf 'paused: waiting on the upstream release\n' > "$state/mate-unprobed.status"
+  sig=$(seen_sig "$state/mate-unprobed.status"); printf '%s' "$sig" > "$state/.seen-mate-unprobed_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  set_mtime "$(( $(date +%s) - 4000 ))" "$state/mate-unprobed.meta"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$state/.afk"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  # A bare shell in the foreground would read `dead` for any ordinary crew.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a mate past the busy-turn bound never escalated under away mode: $(cat "$out")"; }
+  grep -F "escalation 1" "$out" >/dev/null || fail "the mate escalation was not counted on the repetition schedule: $(cat "$out")"
+  grep -F "no agent is alive at the recorded endpoint" "$out" >/dev/null \
+    && fail "a secondmate's endpoint was probed for agent liveness: $(cat "$out")"
+  grep -F "demand-deep-inspection" "$out" >/dev/null \
+    && fail "a mate's first escalation demanded deep inspection off an endpoint read it must not take: $(cat "$out")"
+  rm -f "$state/.afk"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional mate escalation stop"
+  unset FM_FAKE_CREW_STATE
+  pass "a secondmate's endpoint liveness is never read by the wedge escalation, so it keeps the repetition schedule"
 }
 
 # --- busy pane duration bound: a completed-turn age gate on top of busy -----
@@ -3391,6 +3582,10 @@ test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
+test_wedge_dead_agent_demands_inspection_at_first_escalation
+test_wedge_missing_endpoint_demands_inspection_at_first_escalation
+test_wedge_alive_agent_does_not_advance_escalation_count
+test_wedge_secondmate_endpoint_is_never_probed
 test_busy_pane_below_turn_age_bound_is_absorbed
 test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound
