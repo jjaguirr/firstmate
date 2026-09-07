@@ -450,7 +450,7 @@ nm_ci_checks_state() {
 #       undecidable row might BE the branch's live owner, and claiming an older
 #       row past it is exactly how a live run gets reported as a dead one.
 nm_runs_status_for_branch() {  # <branch>
-  local branch=$1 out row st rest br sha rc cand=""
+  local branch=$1 out row st rest br sha rc cand="" seen_same_branch=0
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
   [ -n "$out" ] || return 1
   while IFS= read -r row; do
@@ -504,14 +504,17 @@ nm_runs_status_for_branch() {  # <branch>
           # head-proof row below can still win outright. A diverged row that is
           # NOT the newest same-branch row is history the newest-owns-the-branch
           # rule already superseded, and is still skipped.
-          [ -n "$cand" ] || cand=$st
+          [ "$seen_same_branch" = 1 ] || cand=$st
+          seen_same_branch=1
           continue
           ;;
         *)
           # Refuted as behind this worktree, or no head to bind at all: the crew
           # committed past that run, so it is a run this crew genuinely moved on
           # from and it carries no verdict. bin/fm-nm-run-lib.sh owns why that is
-          # a different fact from a rewrite.
+          # a different fact from a rewrite. It still OWNS the branch as its
+          # newest row, so a diverged row below it stays history.
+          seen_same_branch=1
           continue
           ;;
       esac
@@ -529,10 +532,12 @@ nm_runs_status_for_branch() {  # <branch>
 CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 
 # Does the active axi-status run's head field match this worktree's code
-# identity? Branch match is a precondition (caller). Rule and its three exit
+# identity? Branch match is a precondition (caller). Rule and its four exit
 # statuses owned by fm_nm_head_matches_worktree in bin/fm-nm-run-lib.sh, and
-# passed through unchanged: callers here must tell an undecidable head from a
-# refuted one.
+# passed through unchanged: callers here must tell an undecidable head from
+# either refutation. Only a match is attributed from the detailed record; a head
+# behind this worktree and a rewritten one both fall through to the coarse
+# fallback, which is where a rewrite can still own the branch.
 nm_run_head_matches_worktree() {
   local run_head
   run_head=$(strip_quotes "$(nm_field head)")
@@ -540,7 +545,7 @@ nm_run_head_matches_worktree() {
 }
 
 # Coarse runs-list rows are "<status> <branch> <short-sha> ...". Applies the
-# same rule, and returns the same three statuses, to the short sha of a row
+# same rule, and returns the same four statuses, to the short sha of a row
 # already matched by branch.
 nm_coarse_head_matches_worktree() {  # <short-sha>
   fm_nm_head_matches_worktree "$WT" "$1"

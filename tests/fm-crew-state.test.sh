@@ -1933,6 +1933,40 @@ EOF
   pass "a live row below a newer terminal row is not claimed"
 }
 
+# Newest-owns-the-branch is scoped to the newest same-branch row whatever that
+# row's outcome, not just a newer DIVERGED one. A row refuted as behind this
+# worktree still owns the branch as its newest row, so an older diverged row
+# below it is history: claiming it reports a crew whose newest run is running as
+# FAILED, the same harm through a lower row.
+test_diverged_row_below_a_behind_row_is_not_claimed() {
+  reset_fakes
+  local d behind live_head out
+  d=$(new_case diverged-below-behind)
+  make_rebased_live_head_repo "$d/wt" fm/feat-diverged-below
+  live_head=$REBASED_LIVE_HEAD
+  behind=$(git -C "$d/wt" rev-parse HEAD~1)
+  git -C "$d/wt" merge-base --is-ancestor "$behind" HEAD \
+    || fail "fixture behind head must be a strict ancestor of the worktree head"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/div-below.meta" "window=fm:fm-div-below" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: stage 2 after committing past the run\n' > "$d/state/div-below.status"
+  # Nothing attributes from the detailed record: the CLI answered about another
+  # crew's branch, so only the coarse scan decides.
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-diverged-below $(git -C "$d/wt" rev-parse --short=8 "$behind")  2026-09-07 02:02
+  failed     fm/feat-diverged-below $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-05 06:01
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" div-below
+  out=$(run_crew_state "$d" div-below)
+  assert_not_contains "$out" "state: failed" "a diverged row below a newer row must not carry the verdict"
+  assert_not_contains "$out" "source: run-step" "no row owns the branch once the newest one is refused"
+  assert_contains "$out" "state: working" "the crew's own current state is read instead"
+  pass "a diverged row below a behind-us row is not claimed"
+}
+
 # The rewrite acceptance must not swallow the OTHER refutation it used to share
 # an exit status with: a run head that is a strict ancestor of the worktree head
 # is a run this crew committed past, not a rebase, and attributing it reports a
@@ -2099,6 +2133,7 @@ test_rebased_completed_row_beats_older_terminal_row_at_local_head
 test_live_rebased_row_overrides_a_dead_attributable_record
 test_rebased_terminal_row_does_not_hide_a_real_failure
 test_live_row_below_a_newer_terminal_row_is_not_claimed
+test_diverged_row_below_a_behind_row_is_not_claimed
 test_crew_committed_past_its_failed_run_is_not_claimed
 test_head_predicate_reports_four_outcomes
 
