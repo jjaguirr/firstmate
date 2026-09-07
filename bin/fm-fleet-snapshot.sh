@@ -71,9 +71,12 @@ set -u
 # Passing large backlog/task JSON straight to jq as --argjson exceeds
 # Linux's per-argv-entry MAX_ARG_STRLEN (131072 bytes) well before the
 # much larger total ARG_MAX, and jq fails with "Argument list too long".
-# The two growing payloads are written once into this run's private temp
-# directory so jq reads them with --slurpfile, crossing argv only as a
-# short path. The directory is removed when the script exits.
+# Every payload whose size grows with the backlog or the fleet is therefore
+# written into this run's private temp directory and read back with
+# --slurpfile, so only a short path crosses argv: the backlog and task JSON,
+# the scout report list, each registered secondmate's home summary, the
+# accumulated secondmate record lines, and the combined secondmate_current
+# and secondmate_landed objects. The EXIT trap removes the directory.
 SNAPSHOT_TMPDIR=""
 cleanup_snapshot_tmpdir() {
   [ -n "$SNAPSHOT_TMPDIR" ] && rm -rf "$SNAPSHOT_TMPDIR"
