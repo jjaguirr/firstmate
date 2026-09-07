@@ -2379,6 +2379,206 @@ test_wedge_secondmate_endpoint_is_never_probed() {
   pass "a secondmate's endpoint liveness is never read by the wedge escalation, so it keeps the repetition schedule"
 }
 
+# --- bounded backoff for a pane that keeps reading alive ---------------------
+# Change A stopped an affirmative reading from pushing a pane toward the marker,
+# but the pane still woke supervision every FM_STALE_ESCALATE_SECS: the captain
+# answered eighteen of those in one session, each one honestly, each one telling
+# him what the last had. Past FM_WEDGE_AFFIRMATIVE_BACKOFF_COUNT consecutive
+# machine-verified affirmative readings the WAKE moves onto the bounded
+# PAUSE_RESURFACE_SECS cadence while the READ stays on the short one, so a pane
+# that dies while backed off is still caught at the next read. The accepted cost
+# and the reason it was accepted live beside that constant in bin/fm-watch.sh.
+
+# Fixture shared by the backoff cases: an idle pane already classified as
+# provably working, whose recorded endpoint has a live agent in the foreground.
+backoff_case() {  # <name> -> echoes "<dir> <state> <fakebin> <window> <key>"
+  local name=$1 dir state fakebin window key pane_hash sig
+  dir=$(make_case "$name"); state="$dir/state"; fakebin="$dir/fakebin"
+  window="test:fm-$name"
+  printf 'idle building output' > "$dir/pane.txt"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/$name.meta"
+  printf 'working: kicked off the validation run\n' > "$state/$name.status"
+  sig=$(seen_sig "$state/$name.status"); printf '%s' "$sig" > "$state/.seen-${name}_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '%s %s %s %s %s\n' "$dir" "$state" "$fakebin" "$window" "$key"
+}
+
+# One watcher round against a backoff fixture. Echoes "wake" or "absorbed".
+backoff_round() {  # <dir> <state> <fakebin> <window> <comm> [extra env...]
+  local dir=$1 state=$2 fakebin=$3 window=$4 comm=$5
+  shift 5
+  local out="$dir/watch.out" key pid
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_FAKE_TMUX_CURRENT_COMMAND="$comm" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH" > "$out" &
+  pid=$!
+  if wait_for_exit "$pid" 100; then
+    ack_stopped_cycle "$state" >/dev/null 2>&1
+    printf 'wake'
+  else
+    reap "$pid"
+    printf 'absorbed'
+  fi
+}
+
+test_wedge_alive_backoff_stops_escalating_after_three_affirmatives() {
+  local dir state fakebin window key n result
+  read -r dir state fakebin window key <<< "$(backoff_case alive-backoff)"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  n=1
+  while [ "$n" -le 3 ]; do
+    result=$(backoff_round "$dir" "$state" "$fakebin" "$window" grok)
+    [ "$result" = wake ] || fail "affirmative escalation $n was absorbed before the backoff count was reached"
+    grep -F "agent alive at the recorded endpoint" "$dir/watch.out" >/dev/null \
+      || fail "affirmative escalation $n did not carry the liveness fact: $(cat "$dir/watch.out")"
+    n=$((n + 1))
+  done
+  [ "$(cat "$state/.wedge-affirmative-$key" 2>/dev/null || echo 0)" = 3 ] \
+    || fail "three affirmative readings were not recorded"
+
+  # The fourth reading tells the supervisor nothing the first three did not.
+  result=$(backoff_round "$dir" "$state" "$fakebin" "$window" grok)
+  [ "$result" = absorbed ] || fail "the fourth consecutive affirmative reading still woke supervision: $(cat "$dir/watch.out")"
+  [ ! -s "$dir/watch.out" ] || fail "the backed-off pane printed a wake reason: $(cat "$dir/watch.out")"
+  [ -s "$state/.wedge-affirmative-since-$key" ] || fail "the backoff did not anchor its own age"
+  # The READ stays on the short cadence: the idle timer is re-armed rather than
+  # dropped, so the next poll cycle still reaches the endpoint.
+  [ -s "$state/.stale-since-$key" ] || fail "the backoff dropped the idle timer instead of re-arming it"
+  # And the escalation counter is still untouched by any of it.
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 0 ] \
+    || fail "an affirmative reading advanced the wedge-escalation counter"
+  unset FM_FAKE_CREW_STATE
+  pass "a pane whose endpoint keeps reading alive stops waking supervision once the backoff count is reached"
+}
+
+# The safety property. A pane that dies inside the backed-off window must be
+# caught on the NEXT read, not at the end of the long cadence, and must return to
+# the short cadence with nothing carried over from the readings before it.
+test_wedge_backoff_snaps_back_when_the_agent_dies() {
+  local dir state fakebin window key result
+  read -r dir state fakebin window key <<< "$(backoff_case backoff-death)"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  # Already deep into a backed-off stretch.
+  printf '7\n' > "$state/.wedge-affirmative-$key"
+  echo $(( $(date +%s) - 900 )) > "$state/.wedge-affirmative-since-$key"
+  date +%s > "$state/.wedge-affirmative-resurfaced-$key"
+
+  # The agent is gone: a bare shell holds the pane.
+  result=$(backoff_round "$dir" "$state" "$fakebin" "$window" zsh)
+  [ "$result" = wake ] || fail "a pane whose agent died inside the backed-off window stayed absorbed: $(cat "$dir/watch.out")"
+  grep -F "demand-deep-inspection" "$dir/watch.out" >/dev/null \
+    || fail "the death inside the backed-off window did not demand deep inspection: $(cat "$dir/watch.out")"
+  grep -F "escalation 1" "$dir/watch.out" >/dev/null \
+    || fail "the death was not counted as this pane's first unexplained escalation: $(cat "$dir/watch.out")"
+  [ ! -e "$state/.wedge-affirmative-$key" ] || fail "the affirmative count survived a dead reading"
+  [ ! -e "$state/.wedge-affirmative-since-$key" ] || fail "the backoff anchor survived a dead reading"
+  [ ! -e "$state/.wedge-affirmative-resurfaced-$key" ] || fail "the backoff throttle survived a dead reading"
+  unset FM_FAKE_CREW_STATE
+  pass "a pane that dies inside the backed-off window is caught on the next read and returns to the short cadence at once"
+}
+
+# Unknown is not alive. An ambiguous, unreadable, or unverified endpoint proves
+# nothing, so it must end the backoff exactly as a dead reading does rather than
+# extending it on evidence that does not exist.
+test_wedge_backoff_snaps_back_on_an_unknown_reading() {
+  local dir state fakebin window key result
+  read -r dir state fakebin window key <<< "$(backoff_case backoff-unknown)"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  printf '7\n' > "$state/.wedge-affirmative-$key"
+  echo $(( $(date +%s) - 900 )) > "$state/.wedge-affirmative-since-$key"
+
+  # An empty pane current command reads back unreadable, so the verdict is unknown.
+  result=$(backoff_round "$dir" "$state" "$fakebin" "$window" "")
+  [ "$result" = wake ] || fail "an unknown reading was treated as affirmative and stayed backed off: $(cat "$dir/watch.out")"
+  grep -F "escalation 1" "$dir/watch.out" >/dev/null \
+    || fail "the unknown reading did not take the repetition schedule: $(cat "$dir/watch.out")"
+  grep -F "agent alive at the recorded endpoint" "$dir/watch.out" >/dev/null \
+    && fail "an unknown reading claimed the agent was alive: $(cat "$dir/watch.out")"
+  [ ! -e "$state/.wedge-affirmative-$key" ] || fail "the affirmative count survived an unknown reading"
+  [ ! -e "$state/.wedge-affirmative-since-$key" ] || fail "the backoff anchor survived an unknown reading"
+  unset FM_FAKE_CREW_STATE
+  pass "an unknown endpoint reading ends the backoff on the same terms a dead one does"
+}
+
+# A backed-off pane is quiet, never invisible: it re-surfaces once per
+# PAUSE_RESURFACE_SECS through the same bounded helper a declared wait uses.
+test_wedge_backoff_resurfaces_on_the_bounded_cadence() {
+  local dir state fakebin window key result
+  read -r dir state fakebin window key <<< "$(backoff_case backoff-resurface)"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  printf '9\n' > "$state/.wedge-affirmative-$key"
+  # The backed-off stretch is older than the bounded cadence and has never
+  # re-surfaced, so this round owes one recheck.
+  echo $(( $(date +%s) - 5000 )) > "$state/.wedge-affirmative-since-$key"
+  set_mtime "$(( $(date +%s) - 5000 ))" "$state/.wedge-affirmative-since-$key"
+
+  result=$(backoff_round "$dir" "$state" "$fakebin" "$window" grok)
+  [ "$result" = wake ] || fail "a long-backed-off pane never re-surfaced for its recheck: $(cat "$dir/watch.out")"
+  grep -F "rechecked on a long cadence" "$dir/watch.out" >/dev/null \
+    || fail "the backed-off recheck did not name its own cadence: $(cat "$dir/watch.out")"
+  grep -F "possible wedge" "$dir/watch.out" >/dev/null \
+    || fail "the backed-off recheck stopped reporting an unresolved possible wedge: $(cat "$dir/watch.out")"
+  grep -F "demand-deep-inspection" "$dir/watch.out" >/dev/null \
+    && fail "the backed-off recheck demanded inspection of a demonstrably alive agent: $(cat "$dir/watch.out")"
+  [ -s "$state/.wedge-affirmative-resurfaced-$key" ] || fail "the bounded recheck did not throttle itself"
+  unset FM_FAKE_CREW_STATE
+  pass "a backed-off pane still re-surfaces once per bounded cadence, so it cannot rot invisibly"
+}
+
+# The scoping carried over from Change A: a pane past the busy-turn bound refuses
+# an alive reading as evidence, because a hung foreground call keeps its agent
+# alive. Backing that pane off would stretch the 25-hour hung-call case instead
+# of catching it, so it must never accumulate an affirmative count at all.
+test_wedge_busy_turn_bound_pane_is_never_backed_off() {
+  local dir state fakebin out capture_file window key sig pid n
+  dir=$(make_case backoff-busy-refused); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-backoff-busy"
+  printf 'Working...' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=pi\n' "$window" > "$state/backoff-busy.meta"
+  record_pi_busy "$state" backoff-busy
+  printf 'working: setup complete\n' > "$state/backoff-busy.status"
+  sig=$(seen_sig "$state/backoff-busy.status"); printf '%s' "$sig" > "$state/.seen-backoff-busy_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text 'Working...')" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  touch -t 200001010000 "$state/backoff-busy.meta"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  n=1
+  while [ "$n" -le 4 ]; do
+    echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+    : > "$out"
+    # The pane renders busy AND its agent is genuinely alive - the exact reading
+    # that backs an idle pane off, and the exact reading this path must refuse.
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=pi \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    wait_for_exit "$pid" 100 || { reap "$pid"; fail "a busy pane past the turn bound stopped escalating on round $n: $(cat "$out")"; }
+    grep -F "escalation $n" "$out" >/dev/null || fail "busy round $n did not report escalation count $n: $(cat "$out")"
+    ack_stopped_cycle "$state" || fail "could not acknowledge busy backoff-refusal round $n"
+    n=$((n + 1))
+  done
+  [ ! -e "$state/.wedge-affirmative-$key" ] \
+    || fail "a pane past the busy-turn bound accumulated an affirmative-liveness count"
+  [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 4 ] \
+    || fail "the busy path stopped counting its escalations"
+  unset FM_FAKE_CREW_STATE
+  pass "a pane past the busy-turn bound is never backed off, because an alive reading is not evidence there"
+}
+
 # --- busy pane duration bound: a completed-turn age gate on top of busy -----
 # 2026-07 hibit-agent-focus-nonsteal-r1 incident: a busy pane (herdr "working"
 # and/or the harness's rendered busy footer) is unconditional, unbounded proof
@@ -3635,6 +3835,11 @@ test_wedge_dead_agent_demands_inspection_at_first_escalation
 test_wedge_missing_endpoint_demands_inspection_at_first_escalation
 test_wedge_alive_agent_does_not_advance_escalation_count
 test_wedge_secondmate_endpoint_is_never_probed
+test_wedge_alive_backoff_stops_escalating_after_three_affirmatives
+test_wedge_backoff_snaps_back_when_the_agent_dies
+test_wedge_backoff_snaps_back_on_an_unknown_reading
+test_wedge_backoff_resurfaces_on_the_bounded_cadence
+test_wedge_busy_turn_bound_pane_is_never_backed_off
 test_busy_pane_below_turn_age_bound_is_absorbed
 test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound

@@ -47,7 +47,13 @@
 #                          FM_WEDGE_DEMAND_INSPECT_COUNT repetition threshold
 #                          (wedge_timer_check owns that contract). Every one of
 #                          those still queues the same stale wake on the same
-#                          cadence. Unless afk is active. A pane whose own task
+#                          cadence, until an endpoint has read alive
+#                          FM_WEDGE_AFFIRMATIVE_BACKOFF_COUNT times in a row on a
+#                          path that admits that reading, after which the pane
+#                          keeps the same liveness read but takes the bounded
+#                          PAUSE_RESURFACE_SECS wake cadence, and the first
+#                          reading that is not alive returns it to the short one.
+#                          Unless afk is active. A pane whose own task
 #                          worktree was written during the quiet window is
 #                          deferred rather than escalated (wedge_defer_writing),
 #                          because files appearing there are liveness the pane and
@@ -294,7 +300,7 @@ window_label() {
 # The ONE derivation of a window's per-window marker key: `:`, `/` and `.` become
 # `_` so a window name is usable as a filename suffix. Every per-window file the
 # watcher keeps is named by it (.hash-, .count-, .stale-, .stale-since-,
-# .wedge-escalations-, .paused-*, .writing-*), and live homes hold those markers on
+# .wedge-escalations-, .wedge-affirmative-*, .paused-*, .writing-*), and live homes hold those markers on
 # disk under the current format, so the format lives here alone: a second copy is
 # how a future change to it silently orphans a window's markers instead of clearing
 # them. The helpers below take the derived key rather than re-deriving it, so one
@@ -335,6 +341,38 @@ recorded_windows() {
 # repetition threshold. Reset wherever a window's pane/hash state resets to
 # genuinely active (see the two rm-on-reset call sites below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
+
+# Consecutive machine-verified affirmative liveness readings a window must produce
+# before its stale recheck moves from STALE_ESCALATE_SECS onto the bounded
+# PAUSE_RESURFACE_SECS cadence. Each of those readings is one escalation that was
+# reported and answered, so the pane costs a full supervision turn every
+# STALE_ESCALATE_SECS while it is provably alive; past this count the reading is no
+# longer telling the supervisor anything the last three did not.
+#
+# ACCEPTED COST, decided 2026-09-07. A worker that stops making progress inside a
+# backed-off window in a way the endpoint read cannot see - the classic case is a
+# hung foreground call, which keeps its agent process alive - is surfaced up to
+# PAUSE_RESURFACE_SECS (3600s) later instead of STALE_ESCALATE_SECS (240s). That
+# was accepted deliberately, on two grounds: the risk is separately covered, since
+# the heartbeat fleet scan and the PR merge poll both keep running against a pane
+# that has gone quiet, while the failure the backoff prevents - a supervisor
+# trained by four-minute affirmative escalations to stop inspecting at all - is
+# recoverable by nothing else in this system. The cost is bounded on both sides:
+# liveness is still READ every STALE_ESCALATE_SECS while backed off, so a pane
+# whose agent actually dies is caught at the next read and snaps back to the fast
+# cadence immediately, and the backoff never applies where an alive reading is not
+# evidence in the first place (see wedge_timer_check's <affirmative-liveness>).
+FM_WEDGE_AFFIRMATIVE_BACKOFF_COUNT=${FM_WEDGE_AFFIRMATIVE_BACKOFF_COUNT:-3}
+
+# Drop a window's affirmative-liveness chain. Called wherever the pane's stale
+# bookkeeping resets to genuinely active, and - the safety property - on the FIRST
+# reading that is not an admitted `alive`, so one non-affirmative reading returns
+# the pane to the STALE_ESCALATE_SECS cadence with nothing left over.
+clear_affirmative_tracking() {  # <window-key>
+  local key=$1
+  rm -f "$STATE/.wedge-affirmative-$key" "$STATE/.wedge-affirmative-since-$key" \
+    "$STATE/.wedge-affirmative-resurfaced-$key"
+}
 
 # One bounded re-surface for a pane the watcher is deliberately absorbing, so no
 # absorb can rot invisibly. <age> is how long the current absorb has held and
@@ -462,10 +500,12 @@ wedge_agent_verdict() {  # <window> -> alive|dead|unknown
 #             every other arm emits, because that grammar is the contract the
 #             away-mode daemon force-escalates a stale wake on; the count it
 #             reports is the stored one, unadvanced, so it reads 0 on a pane whose
-#             every escalation so far has been explained. A bounded
-#             cadence backoff for a pane that keeps reading alive attaches to THIS
-#             arm and owns its own consecutive-affirmative record; it is
-#             deliberately not implemented here.
+#             every escalation so far has been explained. Once this arm has come
+#             back affirmative FM_WEDGE_AFFIRMATIVE_BACKOFF_COUNT times in a row,
+#             the pane keeps the same liveness READ every STALE_ESCALATE_SECS but
+#             moves its WAKE onto the bounded PAUSE_RESURFACE_SECS cadence, so a
+#             pane nothing can learn more about stops costing a supervision turn
+#             every four minutes. That constant carries the accepted cost.
 #   unknown - no evidence either way, so the pre-existing repetition schedule
 #             stands unchanged, exactly as every other absent-evidence outcome in
 #             this file leaves the caller's schedule alone.
@@ -482,7 +522,8 @@ wedge_agent_verdict() {  # <window> -> alive|dead|unknown
 # read: a dead or authoritatively missing endpoint is decisive evidence behind a
 # busy-looking pane too, and that is the case that used to wait out three rounds.
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> <task> <affirmative-liveness>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 task=$5 admit_alive=$6 since age n reason verdict
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 task=$5 admit_alive=$6
+  local since age n reason verdict key affirmed backoff_since backoff_age
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -501,18 +542,51 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         # arithmetic on it under `set -u` would kill the poll loop outright.
         n=$(cat "$escalation_file" 2>/dev/null || true)
         case "$n" in ''|*[!0-9]*) n=0 ;; esac
+        key=$(window_key "$win")
         verdict=$(wedge_agent_verdict "$win")
         [ "$verdict" != alive ] || [ "$admit_alive" = admit-alive ] || verdict=unknown
         case "$verdict" in
           dead)
+            # The snap-back, and the reason it is written before anything else in
+            # this arm: one non-affirmative reading ends the backoff outright, so a
+            # pane that dies while backed off is escalated here AND is back on the
+            # STALE_ESCALATE_SECS cadence from this moment, with no credit carried
+            # over from the readings that came before it.
+            clear_affirmative_tracking "$key"
             n=$(( n + 1 ))
             echo "$n" > "$escalation_file"
             reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: no agent is alive at the recorded endpoint - inspect now, do not re-absorb on the run-step/pane state alone)"
             ;;
           alive)
+            affirmed=$(cat "$STATE/.wedge-affirmative-$key" 2>/dev/null || true)
+            case "$affirmed" in ''|*[!0-9]*) affirmed=0 ;; esac
+            affirmed=$(( affirmed + 1 ))
+            echo "$affirmed" > "$STATE/.wedge-affirmative-$key"
             reason="stale: $win (idle ${age}s, possible wedge, escalation $n unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)"
+            if [ "$affirmed" -gt "$FM_WEDGE_AFFIRMATIVE_BACKOFF_COUNT" ]; then
+              # Past the count, this pane has already spent that many supervision
+              # turns on a reading that came back affirmative every time. Move the
+              # WAKE onto the bounded PAUSE_RESURFACE_SECS cadence and leave the
+              # READ where it was: re-arming the idle timer here is what keeps the
+              # next liveness reading STALE_ESCALATE_SECS away, so a pane that dies
+              # inside the backed-off window reaches the dead arm above on that
+              # reading rather than waiting out the long cadence.
+              backoff_since="$STATE/.wedge-affirmative-since-$key"
+              [ -e "$backoff_since" ] || date +%s > "$backoff_since"
+              backoff_age=$(age_of "$backoff_since")
+              date +%s > "$since_file"
+              clear_write_tracking "$key"
+              resurface_absorbed "$win" "$STATE/.wedge-affirmative-resurfaced-$key" "$backoff_age" \
+                "stale: $win (idle ${age}s, possible wedge, escalation $n unexplained so far, agent alive at the recorded endpoint on $affirmed consecutive checks over ${backoff_age}s, rechecked on a long cadence not every ${STALE_ESCALATE_SECS}s; liveness is still read on the short cadence and a dead endpoint escalates at once; confirm what the worker is waiting on)"
+              triage_log "absorbed $label (agent alive on $affirmed consecutive checks, on the bounded recheck cadence): $win"
+              return 0
+            fi
             ;;
           *)
+            # Unknown is NOT affirmative: an ambiguous, unreadable, or unverified
+            # reading proves nothing about the agent, so it ends the backoff on the
+            # same terms a dead reading does rather than extending it.
+            clear_affirmative_tracking "$key"
             n=$(( n + 1 ))
             echo "$n" > "$escalation_file"
             reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
@@ -523,7 +597,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         esac
         fm_wake_append stale "$win" "$reason" || exit 1
         rm -f "$since_file"
-        clear_write_tracking "$(window_key "$win")"
+        clear_write_tracking "$key"
         wake "$reason"
       fi
       ;;
@@ -586,6 +660,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  clear_affirmative_tracking "$key"
   clear_write_tracking "$key"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
@@ -660,6 +735,7 @@ clear_pause_tracking() {  # <window-key>
   clear_write_tracking "$key"
   clear_reconciled_tracking "$key"
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  clear_affirmative_tracking "$key"
 }
 
 # Reconcile a declared pause or captain-held status with authoritative crew state.
@@ -808,6 +884,7 @@ handle_reconciled_idle_stale() {  # <window> <task> <hash> <parked|done>
   printf '%s' "$h" > "$STATE/.stale-$key"
   date +%s > "$STATE/.stale-since-$key"
   rm -f "$STATE/.wedge-escalations-$key"
+  clear_affirmative_tracking "$key"
   clear_pause_state "$key"
   clear_write_tracking "$key"
   [ -e "$since" ] || date +%s > "$since"
@@ -1635,6 +1712,7 @@ EOF
           busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf"
         else
           rm -f "$ssf" "$ewf"
+          clear_affirmative_tracking "$key"
           clear_write_tracking "$key"
         fi
         # A pane rendering busy is the crew working, not the same wait redrawn, so
@@ -1662,6 +1740,7 @@ EOF
         busy_turn_bound_check "$w" "$task" "$h" "$ssf" "$ewf"
       else
         rm -f "$ssf" "$ewf"
+        clear_affirmative_tracking "$key"
         clear_write_tracking "$key"
       fi
       # Same rule as the unchanged-hash reset above: the busy verdict ends the

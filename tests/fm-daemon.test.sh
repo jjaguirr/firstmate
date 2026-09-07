@@ -142,7 +142,7 @@ test_stale_transient_self_records_marker() {
 
 test_stale_diagnostic_wedge_survives_busy_housekeeping() {
   local case_name dir state fakebin key task win pane reason status_line action_log
-  for case_name in working prior-terminal paused alive-paused; do
+  for case_name in working prior-terminal paused alive-paused alive-backed-off; do
     dir=$(make_supercase "stale-diagnostic-$case_name")
     state="$dir/state"
     fakebin="$dir/fakebin"
@@ -157,11 +157,19 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
     # still escalate here instead of being absorbed onto the pause cadence.
     [ "$case_name" != alive-paused ] \
       || reason="stale: $win (idle 500s, possible wedge, escalation 3 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)"
+    # The bounded recheck a backed-off pane emits carries the most decorated
+    # reason the watcher produces, and it is still one of these wedge wakes. It
+    # must keep the same token sequence, or a pane that went quiet in away mode
+    # would be absorbed by status classification instead of force-escalated -
+    # which is the one way a backed-off pane could rot invisibly.
+    [ "$case_name" != alive-backed-off ] \
+      || reason="stale: $win (idle 500s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint on 4 consecutive checks over 3700s, rechecked on a long cadence not every 240s; liveness is still read on the short cadence and a dead endpoint escalates at once; confirm what the worker is waiting on)"
     fm_write_meta "$state/$task.meta" "window=$win" "backend=tmux"
     case "$case_name" in
       working) status_line='working: building' ;;
       prior-terminal) status_line='done: already surfaced' ;;
       paused|alive-paused) status_line='paused: awaiting an external dependency' ;;
+      alive-backed-off) status_line='working: still validating' ;;
     esac
     printf '%s\n' "$status_line" > "$state/$task.status"
     printf 'Working...\n' > "$pane"
@@ -184,9 +192,11 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
       || fail "$case_name enriched wedge did not produce exactly one escalation"
     grep -F "${reason#stale: }" "$state/.subsuper-escalations" >/dev/null \
       || fail "$case_name enriched wedge lost its wedge detail"
-    [ "$case_name" != alive-paused ] \
-      || ! grep -F "demand-deep-inspection" "$state/.subsuper-escalations" >/dev/null \
-      || fail "an alive-endpoint wedge carried the demand-deep-inspection marker"
+    case "$case_name" in
+      alive-paused|alive-backed-off)
+        ! grep -F "demand-deep-inspection" "$state/.subsuper-escalations" >/dev/null \
+          || fail "an alive-endpoint wedge carried the demand-deep-inspection marker" ;;
+    esac
     [ ! -e "$state/.subsuper-stale-$key" ] \
       || fail "$case_name enriched wedge retained ordinary stale tracking"
     case "$case_name" in
@@ -293,6 +303,9 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
   : > "$state/.paused-$watcher_key"
   : > "$state/.stale-$watcher_key"
   : > "$state/.wedge-escalations-$watcher_key"
+  printf '3\n' > "$state/.wedge-affirmative-$watcher_key"
+  date +%s > "$state/.wedge-affirmative-since-$watcher_key"
+  date +%s > "$state/.wedge-affirmative-resurfaced-$watcher_key"
   # The reconciled expected-idle chain the watcher writes for an undeclared park
   # or an unlanded done. The daemon owns this reset in away mode, and it also
   # removes the .paused-* marker the watcher's own clear keys off, so anything it
@@ -307,6 +320,9 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
   [ ! -e "$state/.paused-$watcher_key" ] || fail "terminal signal retained watcher pause tracking"
   [ ! -e "$state/.stale-$watcher_key" ] || fail "terminal signal retained watcher stale tracking"
   [ ! -e "$state/.wedge-escalations-$watcher_key" ] || fail "terminal signal retained watcher wedge tracking"
+  [ ! -e "$state/.wedge-affirmative-$watcher_key" ] || fail "terminal signal retained the watcher affirmative-liveness count"
+  [ ! -e "$state/.wedge-affirmative-since-$watcher_key" ] || fail "terminal signal retained the watcher affirmative backoff anchor"
+  [ ! -e "$state/.wedge-affirmative-resurfaced-$watcher_key" ] || fail "terminal signal retained the watcher affirmative backoff throttle"
   [ ! -e "$state/.reconciled-$watcher_key" ] || fail "terminal signal retained the watcher reconciled surface record"
   [ ! -e "$state/.reconciled-since-$watcher_key" ] || fail "terminal signal retained the watcher reconciled age anchor"
   [ ! -e "$state/.reconciled-resurfaced-$watcher_key" ] || fail "terminal signal retained the watcher reconciled re-surface throttle"
