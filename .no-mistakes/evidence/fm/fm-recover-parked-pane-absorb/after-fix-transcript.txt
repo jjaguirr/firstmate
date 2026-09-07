@@ -1,0 +1,39 @@
+
+=== PHASE 1 - a no-mistakes run parks at an approval gate it never announced
+first sight of the park -> captain sees:
+  watcher> stale: test:fm-gate
+  captain session receives> 1788755115	1	stale	test:fm-gate	stale: test:fm-gate
+
+=== PHASE 2 - the pane stays frozen and the stale timer expires twice
+expired timer, round 1 -> captain sees NOTHING this round (absorbed)
+expired timer, round 2 -> captain sees NOTHING this round (absorbed)
+triage log:
+  [2026-09-07T04:25:17+0000] absorbed stale (parked, awaiting a decision, age 2s): test:fm-gate
+  [2026-09-07T04:25:30+0000] absorbed stale (parked, awaiting a decision, age 15s): test:fm-gate
+
+=== PHASE 3 - the bounded recheck cadence comes due (never silenced)
+bounded recheck -> captain sees:
+  watcher> stale: test:fm-gate (parked 28s, awaiting a decision - reconciled expected idle, rechecked on a long cadence not a wedge; answer the open decision or restart the work)
+  captain session receives> 1788755143	2	stale	test:fm-gate	stale: test:fm-gate (parked 28s, awaiting a decision - reconciled expected idle, rechecked on a long cadence not a wedge; answer the open decision or restart the work)
+
+=== PHASE 4 - the captain answers; the crew resumes behind a BUSY pane
+reconciled record still held after the busy resume: no - park #2 gets its own surface
+
+=== PHASE 5 - the crew parks at a SECOND gate; status log unchanged since park #1
+second park -> captain sees:
+  watcher> stale: test:fm-gate
+  captain session receives> 1788755151	3	stale	test:fm-gate	stale: test:fm-gate
+
+=== PHASE 6 - the crew genuinely stops while the pane stays frozen
+frozen, no longer parked -> captain sees:
+  watcher> stale: test:fm-gate (idle 501s, possible wedge, escalation 1)
+  captain session receives> 1788755153	4	stale	test:fm-gate	stale: test:fm-gate (idle 501s, possible wedge, escalation 1)
+
+=== PHASE 7 - a crew reconciled as done: one surface, then the reworded recheck
+first sight of done -> captain sees:
+  watcher> stale: test:fm-gate
+  captain session receives> 1788755155	5	stale	test:fm-gate	stale: test:fm-gate
+done bounded recheck -> captain sees:
+  watcher> stale: test:fm-gate (done 2s, finished and not yet cleaned up - reconciled expected idle, rechecked on a long cadence not a wedge; confirm whether this work has landed)
+  captain session receives> 1788755157	6	stale	test:fm-gate	stale: test:fm-gate (done 2s, finished and not yet cleaned up - reconciled expected idle, rechecked on a long cadence not a wedge; confirm whether this work has landed)
+

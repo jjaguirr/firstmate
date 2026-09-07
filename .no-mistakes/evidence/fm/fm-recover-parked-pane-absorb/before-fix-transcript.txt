@@ -1,0 +1,42 @@
+
+=== PHASE 1 - a no-mistakes run parks at an approval gate it never announced
+first sight of the park -> captain sees:
+  watcher> stale: test:fm-gate
+  captain session receives> 1788755094	1	stale	test:fm-gate	stale: test:fm-gate
+
+=== PHASE 2 - the pane stays frozen and the stale timer expires twice
+expired timer, round 1 -> captain sees:
+  watcher> stale: test:fm-gate (idle 501s, possible wedge, escalation 1)
+  captain session receives> 1788755096	2	stale	test:fm-gate	stale: test:fm-gate (idle 501s, possible wedge, escalation 1)
+expired timer, round 2 -> captain sees:
+  watcher> stale: test:fm-gate (idle 501s, possible wedge, escalation 2)
+  captain session receives> 1788755098	3	stale	test:fm-gate	stale: test:fm-gate (idle 501s, possible wedge, escalation 2)
+triage log:
+sed: can't read /tmp/fm-park-demo.kLysx8/park-demo/state/.watch-triage.log: No such file or directory
+
+=== PHASE 3 - the bounded recheck cadence comes due (never silenced)
+bounded recheck -> captain sees:
+  watcher> stale: test:fm-gate (idle 500s, possible wedge, escalation 3, demand-deep-inspection: same pane has wedge-escalated 3 times in a row - do not re-absorb on the run-step/pane state alone)
+  captain session receives> 1788755099	4	stale	test:fm-gate	stale: test:fm-gate (idle 500s, possible wedge, escalation 3, demand-deep-inspection: same pane has wedge-escalated 3 times in a row - do not re-absorb on the run-step/pane state alone)
+
+=== PHASE 4 - the captain answers; the crew resumes behind a BUSY pane
+reconciled record still held after the busy resume: no - park #2 gets its own surface
+
+=== PHASE 5 - the crew parks at a SECOND gate; status log unchanged since park #1
+second park -> captain sees:
+  watcher> stale: test:fm-gate
+  captain session receives> 1788755107	5	stale	test:fm-gate	stale: test:fm-gate
+
+=== PHASE 6 - the crew genuinely stops while the pane stays frozen
+frozen, no longer parked -> captain sees:
+  watcher> stale: test:fm-gate (idle 500s, possible wedge, escalation 1)
+  captain session receives> 1788755108	6	stale	test:fm-gate	stale: test:fm-gate (idle 500s, possible wedge, escalation 1)
+
+=== PHASE 7 - a crew reconciled as done: one surface, then the reworded recheck
+first sight of done -> captain sees:
+  watcher> stale: test:fm-gate (idle 500s, possible wedge, escalation 2)
+  captain session receives> 1788755110	7	stale	test:fm-gate	stale: test:fm-gate (idle 500s, possible wedge, escalation 2)
+done bounded recheck -> captain sees:
+  watcher> stale: test:fm-gate (idle 501s, possible wedge, escalation 3, demand-deep-inspection: same pane has wedge-escalated 3 times in a row - do not re-absorb on the run-step/pane state alone)
+  captain session receives> 1788755112	8	stale	test:fm-gate	stale: test:fm-gate (idle 501s, possible wedge, escalation 3, demand-deep-inspection: same pane has wedge-escalated 3 times in a row - do not re-absorb on the run-step/pane state alone)
+
