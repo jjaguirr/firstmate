@@ -641,8 +641,8 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
           emit_unresolved_head "$COARSE_STATUS"
         elif [ "$coarse_rc" = 0 ] && nm_coarse_word_is_live_or_success "$COARSE_STATUS"; then
           # A newer run owns this branch and did not fail, so the older record's
-          # failure is not this branch's current story. nm_coarse_overrides_
-          # terminal_failure owns which words may say that.
+          # failure is not this branch's current story.
+          # nm_coarse_word_is_live_or_success owns which words may say that.
           RUN_SOURCE=coarse
         else
           COARSE_STATUS=""
