@@ -363,10 +363,13 @@ test_status_is_paused_classifier() {
   pass "status_is_paused: only the leading paused verb matches, paused is not captain-relevant, and the two declared-wait verbs stay separable"
 }
 
-# crew_absorb_class: the single fm-crew-state.sh read that returns BOTH absorb
-# reasons - working (active run/busy pane), paused (declared external wait), or none
-# (surface it) - so the watcher's stale path gets both for one bounded call.
-# crew_is_paused delegates to it exactly as crew_is_provably_working does.
+# crew_absorb_class: the single fm-crew-state.sh read that returns EVERY absorb
+# reason - working (active run/busy pane), paused (declared external wait), parked
+# (held at a decision), done (finished awaiting landing), or none (surface it) - so
+# the watcher's stale path gets all of them for one bounded call.
+# crew_is_paused delegates to it exactly as crew_is_provably_working does, and
+# neither predicate widens: parked and done are expected-idle reasons with their own
+# surface-once absorber, not a working verdict and not a declared pause.
 test_crew_absorb_class_classifier() {
   local dir fakebin
   dir=$(make_case absorb-class); fakebin="$dir/fakebin"
@@ -382,12 +385,33 @@ test_crew_absorb_class_classifier() {
   ! crew_is_provably_working a || fail "a paused crew was treated as provably working"
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
   [ "$(crew_absorb_class a)" = none ] || fail "stale working: status-log classed absorbable"
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting_approval (2 findings)'
+  [ "$(crew_absorb_class a)" = parked ] || fail "a run parked at a gate not classed parked"
+  ! crew_is_provably_working a || fail "a parked crew was treated as provably working"
+  ! crew_is_paused a || fail "a parked crew was treated as a declared external wait"
+  FM_FAKE_CREW_STATE='state: parked · source: status-log · needs-decision: pick A or B'
+  [ "$(crew_absorb_class a)" = parked ] || fail "a needs-decision crew not classed parked"
+  FM_FAKE_CREW_STATE='state: done · source: run-step · checks-passed'
+  [ "$(crew_absorb_class a)" = "done" ] || fail "a finished run not classed done"
+  ! crew_is_provably_working a || fail "a finished crew was treated as provably working"
+  ! crew_is_paused a || fail "a finished crew was treated as a declared external wait"
+  # Run-step precedence: a crew that appended `paused:` and then STARTED a run is
+  # working, never an expected-idle absorb. fm-crew-state.sh resolves that ordering,
+  # and reading it authoritatively rather than tailing the status log is what makes
+  # the widened classifier safe.
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  [ "$(crew_absorb_class a)" = working ] || fail "a run started after a paused: line not classed working"
+  # blocked and failed are stopped states a supervisor must see, never expected idle.
+  FM_FAKE_CREW_STATE='state: blocked · source: status-log · blocked: no credentials'
+  [ "$(crew_absorb_class a)" = none ] || fail "a blocked crew classed absorbable"
+  FM_FAKE_CREW_STATE='state: failed · source: run-step · cancelled'
+  [ "$(crew_absorb_class a)" = none ] || fail "a failed crew classed absorbable"
   FM_FAKE_CREW_STATE='state: unknown · source: none · worktree gone'
   [ "$(crew_absorb_class a)" = none ] || fail "unknown crew classed absorbable"
   ! crew_is_paused a || fail "unknown crew classed paused"
   [ "$(crew_absorb_class "")" = none ] || fail "empty id not classed none"
   unset FM_FAKE_CREW_STATE
-  pass "crew_absorb_class: working/paused/none from one read; crew_is_paused and crew_is_provably_working agree"
+  pass "crew_absorb_class: working/paused/parked/done/none from one read, with run-step precedence and stopped states never absorbable"
 }
 
 # The wedge detector's third liveness input: writes inside the crew's own recorded
@@ -1279,6 +1303,272 @@ test_finished_unlanded_pause_survives_pane_churn() {
   done
   [ "$bare" -ge 2 ] || fail "an undeclared idle pane stopped surfacing across redraws (only $bare bare stale wakes)"
   pass "a finished-but-unlanded declared pause keeps its bounded cadence across pane redraws while an undeclared wedge still surfaces"
+}
+
+
+# --- reconciled expected idle: `done` awaiting landing ----------------------
+# A crew that finished and is waiting for its PR to land has an idle pane BY
+# DESIGN, and it never declares anything - `done:` is a terminal status, not the
+# `paused:` external-wait verb - so the declared-pause cadence never covers it.
+# Before the reconciled absorb, every repaint of that idle pane was a fresh stale
+# hash sitting on a captain-relevant status line, and each one surfaced again: the
+# same finished crew re-alarmed for as long as it waited. The wait itself is real,
+# though, so the fix must not silence it - the first sight of the reconciled state
+# still surfaces, only its redraws are absorbed, and the absorb still comes back on
+# the bounded recheck cadence naming what it is waiting for.
+test_reconciled_done_surfaces_once_then_absorbs_redraws() {
+  local dir state fakebin out capture_file statusf window key sig pid round cycles wakes bare back
+  dir=$(make_case reconciled-done); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/landing.status"
+  window="test:fm-landing"
+  printf 'finished, waiting to land (redraw 0)\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/landing.meta"
+  printf 'done: PR https://example.test/o/r/pull/9 checks green\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-landing_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "finished, waiting to land (redraw 0)")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # Phase A: the reconciled state has never been surfaced, so its first sight
+  # surfaces exactly as it always did. Absorbing here instead would swallow the
+  # only notice this crew ever gets.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: done · source: status-log · done: PR https://example.test/o/r/pull/9 checks green' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a reconciled done crew did not surface on first sight"; }
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "the first sight did not print the stale wake: $(cat "$out")"
+  [ -s "$state/.reconciled-$key" ] || fail "the first sight did not record which reconciled state it was spent on"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional first-sight stop"
+
+  # Phase B: the idle pane repaints. Each repaint is a NEW hash for the SAME
+  # reconciled state, and must not re-alarm.
+  round=1
+  while [ "$round" -le 3 ]; do
+    printf 'finished, waiting to land (redraw %s)\n' "$round" > "$capture_file"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+      FM_FAKE_CREW_STATE='state: done · source: status-log · done: PR https://example.test/o/r/pull/9 checks green' \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    cycles=0
+    while [ "$cycles" -lt 3 ]; do
+      wait_poll_cycle "$state" "$pid" || break
+      cycles=$((cycles + 1))
+    done
+    reap "$pid"
+    round=$((round + 1))
+  done
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null)
+  [ "$wakes" -eq 0 ] || fail "a repainting idle pane under one reconciled done state surfaced $wakes wakes"
+  [ -s "$state/.stale-since-$key" ] || fail "the reconciled absorb dropped the wedge timer instead of re-arming it"
+  [ -s "$state/.reconciled-since-$key" ] || fail "the reconciled absorb did not anchor its bounded re-surface window"
+
+  # A watcher reaped mid-cycle leaves a recovery announcement for its successor.
+  # Deliver and acknowledge it once, so the bounded recheck below is the only
+  # reason the next arm can exit.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: done · source: status-log · done: PR https://example.test/o/r/pull/9 checks green' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  if wait_for_exit "$pid" 100; then
+    ack_stopped_cycle "$state" || fail "could not acknowledge the watcher recovery announcement"
+  else
+    reap "$pid"
+  fi
+
+  # Phase C: absorbed is not silenced. Age the expected-idle window and its
+  # re-surface throttle past a reachable threshold and the same wait comes back
+  # once, named as what it is - never a bare stale and never a wedge.
+  back=$(( $(date +%s) - 500 ))
+  set_mtime "$back" "$state/.reconciled-since-$key"
+  set_mtime "$back" "$state/.reconciled-resurfaced-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: done · source: status-log · done: PR https://example.test/o/r/pull/9 checks green' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=240 FM_STALE_ESCALATE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "an absorbed reconciled done state never came back for its bounded recheck"; }
+  grep -F "awaiting landing" "$state/.wake-queue" >/dev/null \
+    || fail "the bounded recheck did not name the landing wait: $(cat "$state/.wake-queue")"
+  grep -F "possible wedge" "$state/.wake-queue" >/dev/null \
+    && fail "an absorbed reconciled done state came back mislabeled a possible wedge"
+  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null)
+  [ "$bare" -eq 0 ] || fail "the bounded recheck came back as $bare bare stale wakes"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional recheck stop"
+  pass "a crew reconciled as done awaiting landing surfaces once, absorbs its pane repaints, and still returns on the bounded recheck"
+}
+
+# --- reconciled expected idle: `parked` at a gate nobody announced ----------
+# The dangerous half of the same change. A run that parks at a no-mistakes
+# approval gate can leave a NON-terminal status log behind (`working: ...`), so
+# nothing else in the fleet has told anyone about it: no captain-relevant status
+# signal, no open decision record, no PR to poll. If the reconciled absorb
+# swallowed that pane, the park would be the crew's last observable event. It must
+# surface once, and a crew that then genuinely stops - the reconciled state gone,
+# the pane still frozen - must still wedge-escalate on the unchanged schedule.
+test_reconciled_parked_surfaces_once_then_still_wedges_when_it_stops() {
+  local dir state fakebin out capture_file statusf window key sig pid round cycles wakes pane_hash
+  dir=$(make_case reconciled-parked); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/gate.status"
+  window="test:fm-gate"
+  printf 'awaiting approval (redraw 0)\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/gate.meta"
+  # Non-terminal log on purpose: the park was never announced to anyone.
+  printf 'working: implementing the fix\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-gate_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "awaiting approval (redraw 0)")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # Phase A: an unannounced park still reaches firstmate once.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting_approval (2 findings)' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "an unannounced parked gate was swallowed instead of surfaced"; }
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "the parked first sight did not print the stale wake: $(cat "$out")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional parked first-sight stop"
+
+  # Phase B: repaints of the same park are absorbed.
+  round=1
+  while [ "$round" -le 2 ]; do
+    printf 'awaiting approval (redraw %s)\n' "$round" > "$capture_file"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+      FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting_approval (2 findings)' \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    cycles=0
+    while [ "$cycles" -lt 3 ]; do
+      wait_poll_cycle "$state" "$pid" || break
+      cycles=$((cycles + 1))
+    done
+    reap "$pid"
+    round=$((round + 1))
+  done
+  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" 2>/dev/null)
+  [ "$wakes" -eq 0 ] || fail "a repainting idle pane under one reconciled park surfaced $wakes wakes"
+
+  # A watcher reaped mid-cycle leaves a recovery announcement for its successor.
+  # Deliver and acknowledge it once, so the escalation below is the only reason
+  # the next arm can exit.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: parked · source: run-step · awaiting_approval (2 findings)' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=999 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  if wait_for_exit "$pid" 100; then
+    ack_stopped_cycle "$state" || fail "could not acknowledge the watcher recovery announcement"
+  else
+    reap "$pid"
+  fi
+
+  # Phase C: the crew genuinely stops. The reconciled state is gone, the pane is
+  # still frozen, and the timer the absorb kept armed is past its threshold - so
+  # this must escalate as the wedge it now is. Quieting the guard must never
+  # outlive the condition that made the idleness expected.
+  # Pin the already-classified stale bookkeeping to the pane as it now stands, so
+  # this phase exercises the expiring-timer path rather than whichever poll the
+  # previous round happened to be reaped in the middle of.
+  pane_hash=$(hash_text "awaiting approval (redraw 2)")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '%s' "$(( $(date +%s) - 500 ))" > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=240 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a crew that stopped after being absorbed as parked never wedge-escalated"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "the stopped crew did not escalate as a possible wedge: $(cat "$out")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional wedge stop"
+  pass "an unannounced parked gate surfaces once and absorbs its repaints, while a crew that then stops still wedge-escalates"
+}
+
+# --- a run that parks behind a pane that never changes a byte ---------------
+# The absorb above only sees states it classifies on a FRESH stale hash. A
+# no-mistakes run can move from running to an approval gate, or to checks-green,
+# without its rendered pane changing at all - and that pane is already riding the
+# wedge timer armed while the run WAS working. Escalating that transition as a
+# possible wedge is a false alarm about a crew that is doing exactly what it should.
+# The recheck is deliberately spent only at the moment the timer would escalate, so
+# it costs one authoritative read per threshold rather than one per poll.
+test_expiring_wedge_timer_rereads_a_run_that_parked() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid
+  dir=$(make_case wedge-timer-reread); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/switch.status"
+  window="test:fm-switch"
+  printf 'no-mistakes axi run: ...\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/switch.meta"
+  printf 'working: validating\n' > "$statusf"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-switch_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "no-mistakes axi run: ...")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # Already classified as provably working on this exact hash, with the wedge
+  # timer it armed now past its threshold.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  printf '%s' "$(( $(date +%s) - 500 ))" > "$state/.stale-since-$key"
+
+  # The run has since parked at a gate. The pane is byte-identical to the one the
+  # timer was armed on, so nothing but an authoritative re-read can tell the
+  # difference between this and a frozen run.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: parked · source: run-step · fix_review (1 finding)' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=240 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "the expiring timer neither escalated nor reported the park"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    && fail "a run that parked behind an unchanged pane was escalated as a possible wedge: $(cat "$out")"
+  grep -Fx "stale: $window" "$out" >/dev/null \
+    || fail "the newly reconciled park was not reported as itself: $(cat "$out")"
+  [ -s "$state/.reconciled-$key" ] || fail "the reported park did not record its reconciled state"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional park-report stop"
+
+  # Control: the same unchanged pane with no reconciled state left is a frozen run,
+  # and the expiring timer must escalate it exactly as before. The recheck buys the
+  # transition case nothing at the cost of wedge detection.
+  printf '%s' "$(( $(date +%s) - 500 ))" > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=grok \
+    FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available' \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999 FM_STALE_ESCALATE_SECS=240 FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a frozen run behind an unchanged pane stopped escalating"; }
+  grep -F "possible wedge" "$out" >/dev/null \
+    || fail "the frozen run did not escalate as a possible wedge: $(cat "$out")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional control wedge stop"
+  pass "an expiring wedge timer re-reads the crew state, reporting a run that parked as itself while a frozen run still escalates"
 }
 
 # --- a declaration ARMED on a busy pane has still never been surfaced ---------
@@ -3007,6 +3297,9 @@ test_nonterminal_stale_not_working_surfaced
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_finished_unlanded_pause_survives_pane_churn
+test_reconciled_done_surfaces_once_then_absorbs_redraws
+test_reconciled_parked_surfaces_once_then_still_wedges_when_it_stops
+test_expiring_wedge_timer_rereads_a_run_that_parked
 test_busy_armed_declaration_still_surfaces_when_pane_goes_idle
 test_busy_armed_declaration_surfaces_on_a_static_pane
 test_secondmate_paused_resurfaces_in_normal_mode
