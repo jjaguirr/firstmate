@@ -1514,11 +1514,10 @@ EOF
   pass "an unresolvable head keeps a live parked run's own state and detail"
 }
 
-# The other half of the narrowing: a record that has already CONCLUDED is not
-# trusted on a head this copy cannot read, because a wrong `done` ends
-# supervision just as a wrong `failed` starts recovery. A newest attributable
+# The one verdict still withheld on a head this copy cannot read: a terminal
+# FAILURE, because that is the verdict recovery acts on. A newest attributable
 # `running` row is what overrides it.
-test_terminal_record_on_unresolvable_head_defers_to_live_row() {
+test_terminal_failure_on_unresolvable_head_defers_to_live_row() {
   reset_fakes
   local d dead_head live_head out
   d=$(new_case unres-terminal-live)
@@ -1535,15 +1534,15 @@ test_terminal_record_on_unresolvable_head_defers_to_live_row() {
 EOF
 )"
   out=$(run_crew_state "$d" unrest)
-  assert_not_contains "$out" "state: failed" "a concluded record on an unreadable head must not report failed"
-  assert_contains "$out" "state: working" "a live attributable row overrides the untrusted conclusion"
-  pass "a concluded record on an unresolvable head defers to the live row"
+  assert_not_contains "$out" "state: failed" "a terminal failure on an unreadable head must not report failed"
+  assert_contains "$out" "state: working" "a live attributable row overrides the untrusted failure"
+  pass "a terminal failure on an unresolvable head defers to the live row"
 }
 
-# Same concluded record and same unreadable head, but nothing live corroborates
+# Same terminal failure and same unreadable head, but nothing live corroborates
 # it. It must not be believed and must not be talked into a cheerful verdict
 # either: this is where the explicit unknown still earns its place.
-test_terminal_record_on_unresolvable_head_without_live_row_is_unknown() {
+test_terminal_failure_on_unresolvable_head_without_live_row_is_unknown() {
   reset_fakes
   local d dead_head live_head out
   d=$(new_case unres-terminal-dead)
@@ -1561,10 +1560,39 @@ EOF
 )"
   out=$(run_crew_state "$d" unresd)
   assert_not_contains "$out" "state: failed" "an unreadable run head must never be reported as a failure"
-  assert_contains "$out" "state: unknown" "an unconfirmable conclusion is reported as its own state"
+  assert_contains "$out" "state: unknown" "an unconfirmable failure is reported as its own state"
   assert_contains "$out" "${live_head:0:7}" "the unknown verdict names the head it could not read"
   assert_contains "$out" "not in this local copy" "the unknown verdict says why it cannot decide"
-  pass "an unconfirmable concluded record on an unresolvable head reports unknown"
+  pass "an unconfirmable terminal failure on an unresolvable head reports unknown"
+}
+
+# A run that PASSED is trusted on a head this copy cannot read, exactly as a
+# resolvable head would trust it. Withholding this reported `done` as unknown
+# stops the terminal outcome ever being reconciled, so the backlog item stays
+# in flight forever; only a terminal FAILURE is withheld here.
+test_terminal_success_on_unresolvable_head_still_reports_done() {
+  reset_fakes
+  local d dead_head live_head out
+  d=$(new_case unres-terminal-pass)
+  make_stale_local_head_repo "$d/wt" fm/feat-unres-pass absent
+  dead_head=$STALE_DEAD_HEAD
+  live_head=$STALE_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unresp.meta" "window=fm:fm-unresp" "worktree=$d/wt" "kind=ship" "harness=claude"
+  # The run passed, reported on the pushed head this copy has not synced yet.
+  FM_FAKE_RUN_HEAD="${live_head:0:8}"
+  FM_FAKE_AXI_STATUS="$(run_passed fm/feat-unres-pass)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  completed  fm/feat-unres-pass ${live_head:0:8}  2026-09-06 20:49
+  failed     fm/feat-unres-pass $(git -C "$d/wt" rev-parse --short=8 "$dead_head")  2026-09-05 06:01
+EOF
+)"
+  out=$(run_crew_state "$d" unresp)
+  assert_not_contains "$out" "state: unknown" "a passed run must not be withheld as undecidable"
+  assert_contains "$out" "state: done" "a passed run on an unread head still reports done"
+  assert_contains "$out" "source: run-step" "the passed record keeps its run-step source"
+  assert_contains "$out" "PR merged/closed" "the passed record keeps its own detail"
+  pass "a terminal success on an unresolvable head still reports done"
 }
 
 # The reported incident's other path, which the narrowing deliberately keeps:
@@ -1816,8 +1844,9 @@ test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
 test_live_run_beats_dead_run_at_stale_local_head
 test_unresolvable_live_head_keeps_live_parked_detail
-test_terminal_record_on_unresolvable_head_defers_to_live_row
-test_terminal_record_on_unresolvable_head_without_live_row_is_unknown
+test_terminal_failure_on_unresolvable_head_defers_to_live_row
+test_terminal_failure_on_unresolvable_head_without_live_row_is_unknown
+test_terminal_success_on_unresolvable_head_still_reports_done
 test_undecidable_row_without_attributable_record_is_unknown
 test_diverged_head_on_own_branch_is_still_refused
 test_unresolvable_row_stops_terminal_failure_confirmation

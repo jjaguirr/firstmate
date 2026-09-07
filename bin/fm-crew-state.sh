@@ -51,15 +51,16 @@
 #          worker holding an open decision. So the scan never claims an older
 #          row past it, and what it reports depends on how much the undecidable
 #          head actually puts in doubt:
-#            * A detailed record naming THIS branch that is still running keeps
-#              its own state and full step and gate detail. It only claims work
-#              is in progress, which is what an unreadable pushed head supports,
-#              so a healthy worker parked at a gate still reads as parked.
-#            * A detailed record naming THIS branch that has CONCLUDED, by
-#              success or by failure, is not trusted on a head this copy cannot
-#              read: a wrong "done" ends supervision just as a wrong "failed"
-#              starts recovery. Only a newest attributable `running` row
-#              overrides it to working; anything else is an explicit unknown.
+#            * A detailed record naming THIS branch is trusted exactly as a
+#              resolvable head would trust it, keeping its own state and its
+#              full step and gate detail: the run it reports IS this branch's
+#              run, and an unread pushed tip is no reason to discard it. A
+#              healthy worker parked at a gate still reads parked, and a run
+#              that passed still reads done.
+#            * The ONE verdict still withheld is the same one withheld above, a
+#              terminal FAILURE, because that is the verdict recovery acts on.
+#              Only a newest attributable `running` row overrides it to working;
+#              anything else is an explicit unknown.
 #            * Nothing attributes this branch and the newest same-branch row is
 #              itself undecidable: an explicit unknown, the reported incident's
 #              own path, where the older row claimed instead was the bug.
@@ -496,22 +497,6 @@ nm_detailed_run_is_terminal_failure() {
   esac
 }
 
-# 0 when the detailed axi-status record has already concluded, by success or by
-# failure. A concluded record is the one shape that must not be trusted on a
-# head this copy cannot read: a wrong `done` ends supervision just as a wrong
-# `failed` starts recovery, whereas a still-running record only ever claims work
-# is in progress, which is the reading an unreadable pushed head supports.
-nm_detailed_run_is_terminal() {
-  local status outcome
-  status=$(strip_quotes "$(nm_field status)")
-  outcome=$(strip_quotes "$(nm_field outcome)")
-  [ -z "$outcome" ] || return 0
-  case "$status" in
-    completed|failed|cancelled) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 # The one place an undecidable run head becomes a reported state. Never `failed`
 # and never a cheerful `working`: the local copy simply cannot tell a live run
 # from a dead one until it has the run's commit.
@@ -564,12 +549,12 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
     elif [ "$detailed_rc" = "$FM_NM_HEAD_UNRESOLVED" ]; then
       # This crew's own branch is the one the CLI answered about, and only its
       # head could not be read - the routine, benign shape while the pipeline's
-      # own pushed commits are not yet in this copy. A still-running record only
-      # claims work is in progress, which is exactly what an unreadable pushed
-      # head supports, so it keeps its real state and its full step and gate
-      # detail rather than being thrown away for an unknown.
-      if nm_detailed_run_is_terminal; then
-        # A concluded record is not trusted on a head this copy cannot read.
+      # own pushed commits are not yet in this copy. That head is no reason to
+      # throw the record away: the run reported on it is this branch's run. So
+      # the record is trusted exactly as a resolvable head would trust it, and
+      # the ONE verdict still withheld is the same one withheld above, a
+      # terminal failure, because that is what recovery acts on.
+      if nm_detailed_run_is_terminal_failure; then
         COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
         coarse_rc=$?
         if [ "$coarse_rc" = 0 ] && [ "$COARSE_STATUS" = running ]; then
