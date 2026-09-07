@@ -354,6 +354,29 @@ test_oversized_secondmate_summary_survives_argv_limit() {
   pass "an oversized secondmate summary crosses the argv limit and the fleet snapshot still succeeds"
 }
 
+# Regression: scout reports are never pruned, so a long-lived home accumulates
+# them without bound until their {id,path} list crosses MAX_ARG_STRLEN and the
+# final combined --json jq can no longer take them through argv.
+test_oversized_scout_reports_survive_argv_limit() {
+  local home out reports_bytes i
+  home=$(make_home oversized-scout-reports)
+  for i in $(seq 1 1500); do
+    mkdir -p "$home/data/scout-report-$i"
+    printf '# Scout %d\n' "$i" > "$home/data/scout-report-$i/report.md"
+  done
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json 2>&1) \
+    || fail "snapshot must survive a scout report list larger than MAX_ARG_STRLEN: $out"
+  reports_bytes=$(printf '%s' "$out" | jq '.scout_reports | map(del(.kind))' | LC_ALL=C wc -c | tr -d ' ')
+  [ "$reports_bytes" -gt 131072 ] \
+    || fail "fixture scout report list must exceed MAX_ARG_STRLEN to exercise the bug, got $reports_bytes bytes"
+  printf '%s' "$out" | jq -e '
+    (.scout_reports | length) == 1500
+      and (.scout_reports[0].id | startswith("scout-report-"))
+      and all(.scout_reports[]; .kind == "scout")
+  ' >/dev/null || fail "oversized scout report snapshot missing expected pointers: $out"
+  pass "an oversized scout report list crosses the argv limit and the JSON snapshot still succeeds"
+}
+
 test_normalized_roles_and_plural_blocker_readiness() {
   local home fakebin out
   home=$(make_home normalized-records)
@@ -961,6 +984,7 @@ test_main_inventory_orphan_and_unstructured_disclosure
 test_oversized_backlog_survives_argv_limit_json
 test_oversized_backlog_survives_argv_limit_secondmate_summary
 test_oversized_secondmate_summary_survives_argv_limit
+test_oversized_scout_reports_survive_argv_limit
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
