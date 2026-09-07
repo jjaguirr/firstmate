@@ -1,0 +1,41 @@
+--- test_live_rebased_row_beats_older_terminal_row_at_local_head
+not ok - a rebased branch's live row must stop the terminal row underneath it (unexpected: 'state: failed')
+--- output ---
+state: failed · source: run-step · run failed · status-log superseded (run failed)
+
+--- test_rebased_completed_row_beats_older_terminal_row_at_local_head
+not ok - the branch's own dead history must not outrank its newest row (unexpected: 'state: failed')
+--- output ---
+state: failed · source: run-step · run failed
+
+--- test_live_rebased_row_overrides_a_dead_attributable_record
+not ok - a live rebased row must stop the dead record's failed verdict (unexpected: 'state: failed')
+--- output ---
+state: failed · source: run-step · run failed
+
+--- test_completed_rebased_row_overrides_a_dead_attributable_record
+not ok - a completed newest row must stop the dead record's failed verdict (unexpected: 'state: failed')
+--- output ---
+state: failed · source: run-step · run failed
+
+--- test_cancelled_rebased_row_does_not_release_a_real_failure
+ok - a cancelled rebased row does not release a real failure
+
+--- test_rebased_terminal_row_does_not_hide_a_real_failure
+ok - a terminal row on a rewritten head does not hide a real failure
+
+--- test_live_row_below_a_newer_terminal_row_is_not_claimed
+ok - a live row below a newer terminal row is not claimed
+
+--- test_diverged_terminal_row_alone_never_reports_failed
+ok - a diverged terminal row alone never reports failed
+
+--- test_diverged_row_below_a_behind_row_is_not_claimed
+ok - a diverged row below a behind-us row is not claimed
+
+--- test_crew_committed_past_its_failed_run_is_not_claimed
+ok - a crew that committed past its failed run is not claimed
+
+--- test_head_predicate_reports_four_outcomes
+tests/one.test.sh: line 2129: FM_NM_HEAD_DIVERGED: unbound variable
+

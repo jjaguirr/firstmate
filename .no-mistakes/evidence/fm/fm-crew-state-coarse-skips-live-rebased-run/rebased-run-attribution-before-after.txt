@@ -1,0 +1,168 @@
+=== BEFORE the fix (base a868254) - scenario: rebased-live ===
+worktree HEAD      : 82dc4d1c   (the dead run's head)
+pipeline run head  : a5dfb650   (rebased, live parked run)
+relation           : diverged (neither head is an ancestor of the other)
+
+$ no-mistakes axi status
+run:
+  id: "01RUNPERSEA"
+  branch: fm/persea-scheduled-irrigation-inert
+  status: running
+  awaiting_agent: parked 1h36m
+  head: "a5dfb6503d33fc7269151e7e4c8e3db0cab9d785"
+  pr: "https://github.com/kunchenguid/persea/pull/41"
+  findings: none
+gate:
+  step: ci
+  status: awaiting_approval
+steps[4]{step,status,findings,duration_ms}:
+  intent,completed,0,0
+  review,completed,0,0
+  push,completed,0,0
+  ci,running,0,0
+
+$ no-mistakes runs --limit 20
+  running    fm/persea-scheduled-irrigation-inert a5dfb650  2026-09-07 02:02
+  failed     fm/persea-scheduled-irrigation-inert 82dc4d1c  2026-09-06 20:55
+
+$ fm-crew-state.sh persea-scheduled-irrigation-inert
+state: failed · source: run-step · run failed · status-log superseded (run failed)
+
+$ fm-fleet-view.sh   (crew row)
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| persea-scheduled-irrigation-inert | failed / run-step | ship | persea | tmux | present | https://github.com/kunchenguid/persea/pull/41 | /tmp/tmp.O34Ny189YP/worktree | bin/fm-peek.sh fm-persea-scheduled-irrigation-inert |
+
+=== AFTER the fix (17b0d73) - scenario: rebased-live ===
+worktree HEAD      : c88728fa   (the dead run's head)
+pipeline run head  : 0ebe8ca8   (rebased, live parked run)
+relation           : diverged (neither head is an ancestor of the other)
+
+$ no-mistakes axi status
+run:
+  id: "01RUNPERSEA"
+  branch: fm/persea-scheduled-irrigation-inert
+  status: running
+  awaiting_agent: parked 1h36m
+  head: "0ebe8ca89a4e3681e640eaed99f98dd288e6db31"
+  pr: "https://github.com/kunchenguid/persea/pull/41"
+  findings: none
+gate:
+  step: ci
+  status: awaiting_approval
+steps[4]{step,status,findings,duration_ms}:
+  intent,completed,0,0
+  review,completed,0,0
+  push,completed,0,0
+  ci,running,0,0
+
+$ no-mistakes runs --limit 20
+  running    fm/persea-scheduled-irrigation-inert 0ebe8ca8  2026-09-07 02:02
+  failed     fm/persea-scheduled-irrigation-inert c88728fa  2026-09-06 20:55
+
+$ fm-crew-state.sh persea-scheduled-irrigation-inert
+state: working · source: run-step · validating (background run) · status log still open: needs-decision ci gate
+
+$ fm-fleet-view.sh   (crew row)
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| persea-scheduled-irrigation-inert | working / run-step | ship | persea | tmux | present | https://github.com/kunchenguid/persea/pull/41 | /tmp/tmp.SoiYrscMbn/worktree | bin/fm-peek.sh fm-persea-scheduled-irrigation-inert |
+
+=== BEFORE the fix (base a868254) - scenario: genuinely-dead ===
+worktree HEAD      : c88728fa   (the dead run's head)
+pipeline run head  : 0ebe8ca8   (rebased, live parked run)
+relation           : diverged (neither head is an ancestor of the other)
+
+$ no-mistakes axi status
+run:
+  id: "01RUNPERSEA"
+  branch: fm/persea-scheduled-irrigation-inert
+  status: completed
+  head: "c88728fa874072a1e6d82b930909e0879b98d091"
+  pr: ""
+  findings: none
+outcome: failed
+
+$ no-mistakes runs --limit 20
+  failed     fm/persea-scheduled-irrigation-inert 0ebe8ca8  2026-09-07 02:02
+  failed     fm/persea-scheduled-irrigation-inert c88728fa  2026-09-06 20:55
+
+$ fm-crew-state.sh persea-scheduled-irrigation-inert
+state: failed · source: run-step · run failed · status-log superseded (run failed)
+
+$ fm-fleet-view.sh   (crew row)
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| persea-scheduled-irrigation-inert | failed / run-step | ship | persea | tmux | present | https://github.com/kunchenguid/persea/pull/41 | /tmp/tmp.emMcvn6o5p/worktree | bin/fm-peek.sh fm-persea-scheduled-irrigation-inert |
+
+=== AFTER the fix (17b0d73) - scenario: genuinely-dead ===
+worktree HEAD      : d455e126   (the dead run's head)
+pipeline run head  : 38b1eccf   (rebased, live parked run)
+relation           : diverged (neither head is an ancestor of the other)
+
+$ no-mistakes axi status
+run:
+  id: "01RUNPERSEA"
+  branch: fm/persea-scheduled-irrigation-inert
+  status: completed
+  head: "d455e126036fad4d4abf31be7cc449f9cc420f4c"
+  pr: ""
+  findings: none
+outcome: failed
+
+$ no-mistakes runs --limit 20
+  failed     fm/persea-scheduled-irrigation-inert 38b1eccf  2026-09-07 02:02
+  failed     fm/persea-scheduled-irrigation-inert d455e126  2026-09-06 20:55
+
+$ fm-crew-state.sh persea-scheduled-irrigation-inert
+state: failed · source: run-step · run failed · status-log superseded (run failed)
+
+$ fm-fleet-view.sh   (crew row)
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| persea-scheduled-irrigation-inert | failed / run-step | ship | persea | tmux | present | https://github.com/kunchenguid/persea/pull/41 | /tmp/tmp.0p73M9Sxl7/worktree | bin/fm-peek.sh fm-persea-scheduled-irrigation-inert |
+
+=== BEFORE the fix (base a868254) - scenario: diverged-failed-alone ===
+worktree HEAD      : 90b208c8   (the dead run's head)
+pipeline run head  : 3d294564   (rebased, live parked run)
+relation           : diverged (neither head is an ancestor of the other)
+
+$ no-mistakes axi status
+run:
+  id: "01RUNOTHER"
+  branch: fm/some-other-crew
+  status: running
+  head: "3d294564f3afc48b0676ecd33be6cdc9a89bde2a"
+  pr: ""
+  findings: none
+
+$ no-mistakes runs --limit 20
+  failed     fm/persea-scheduled-irrigation-inert 3d294564  2026-09-07 02:02
+
+$ fm-crew-state.sh persea-scheduled-irrigation-inert
+state: working · source: status-log · reworking after the rebased run failed
+
+$ fm-fleet-view.sh   (crew row)
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| persea-scheduled-irrigation-inert | working / status-log | ship | persea | tmux | present | https://github.com/kunchenguid/persea/pull/41 | /tmp/tmp.jDmb1qRn9V/worktree | bin/fm-peek.sh fm-persea-scheduled-irrigation-inert |
+
+=== AFTER the fix (17b0d73) - scenario: diverged-failed-alone ===
+worktree HEAD      : 2fdb50d6   (the dead run's head)
+pipeline run head  : b1cecb48   (rebased, live parked run)
+relation           : diverged (neither head is an ancestor of the other)
+
+$ no-mistakes axi status
+run:
+  id: "01RUNOTHER"
+  branch: fm/some-other-crew
+  status: running
+  head: "b1cecb488be8244f6cb22a70ac0847ed08ebc724"
+  pr: ""
+  findings: none
+
+$ no-mistakes runs --limit 20
+  failed     fm/persea-scheduled-irrigation-inert b1cecb48  2026-09-07 02:02
+
+$ fm-crew-state.sh persea-scheduled-irrigation-inert
+state: working · source: status-log · reworking after the rebased run failed
+
+$ fm-fleet-view.sh   (crew row)
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| persea-scheduled-irrigation-inert | working / status-log | ship | persea | tmux | present | https://github.com/kunchenguid/persea/pull/41 | /tmp/tmp.b1lDaX8eLZ/worktree | bin/fm-peek.sh fm-persea-scheduled-irrigation-inert |
+
