@@ -142,7 +142,7 @@ test_stale_transient_self_records_marker() {
 
 test_stale_diagnostic_wedge_survives_busy_housekeeping() {
   local case_name dir state fakebin key task win pane reason status_line action_log
-  for case_name in working prior-terminal paused; do
+  for case_name in working prior-terminal paused alive-paused; do
     dir=$(make_supercase "stale-diagnostic-$case_name")
     state="$dir/state"
     fakebin="$dir/fakebin"
@@ -151,11 +151,17 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
     pane="$dir/pane.txt"
     action_log="$dir/actions.log"
     reason="stale: $win (idle 500s, possible wedge, escalation 3, demand-deep-inspection: 3 unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)"
+    # The watcher's alive arm reports the SAME escalation-count grammar with an
+    # unadvanced count and no marker. That grammar, not the marker, is what this
+    # override matches, so an alive-endpoint wedge under a paused declaration must
+    # still escalate here instead of being absorbed onto the pause cadence.
+    [ "$case_name" != alive-paused ] \
+      || reason="stale: $win (idle 500s, possible wedge, escalation 3 unchanged, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)"
     fm_write_meta "$state/$task.meta" "window=$win" "backend=tmux"
     case "$case_name" in
       working) status_line='working: building' ;;
       prior-terminal) status_line='done: already surfaced' ;;
-      paused) status_line='paused: awaiting an external dependency' ;;
+      paused|alive-paused) status_line='paused: awaiting an external dependency' ;;
     esac
     printf '%s\n' "$status_line" > "$state/$task.status"
     printf 'Working...\n' > "$pane"
@@ -163,8 +169,9 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
     echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
     [ "$case_name" = prior-terminal ] \
       && printf '%s' "$status_line" > "$state/.subsuper-seen-status-$key"
-    [ "$case_name" = paused ] \
-      && echo $(( $(date +%s) - 500 )) > "$state/.subsuper-paused-$key"
+    case "$case_name" in
+      paused|alive-paused) echo $(( $(date +%s) - 500 )) > "$state/.subsuper-paused-$key" ;;
+    esac
 
     (
       kill() { printf 'kill %s\n' "$*" >> "$action_log"; }
@@ -176,12 +183,15 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
     [ "$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')" = 1 ] \
       || fail "$case_name enriched wedge did not produce exactly one escalation"
     grep -F "${reason#stale: }" "$state/.subsuper-escalations" >/dev/null \
-      || fail "$case_name enriched wedge lost its demand-deep-inspection detail"
+      || fail "$case_name enriched wedge lost its wedge detail"
+    [ "$case_name" != alive-paused ] \
+      || ! grep -F "demand-deep-inspection" "$state/.subsuper-escalations" >/dev/null \
+      || fail "an alive-endpoint wedge carried the demand-deep-inspection marker"
     [ ! -e "$state/.subsuper-stale-$key" ] \
       || fail "$case_name enriched wedge retained ordinary stale tracking"
     case "$case_name" in
-      paused) [ -e "$state/.subsuper-paused-$key" ] \
-        || fail "paused enriched wedge erased ordinary pause tracking" ;;
+      paused|alive-paused) [ -e "$state/.subsuper-paused-$key" ] \
+        || fail "$case_name enriched wedge erased ordinary pause tracking" ;;
       *) [ ! -e "$state/.subsuper-paused-$key" ] \
         || fail "$case_name enriched wedge created pause tracking" ;;
     esac

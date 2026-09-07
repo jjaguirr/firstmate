@@ -448,7 +448,11 @@ wedge_agent_verdict() {  # <window> -> alive|dead|unknown
 #             wake still fires, and still reports an unresolved possible wedge
 #             because a live agent can be hung behind a foreground call, but it
 #             carries the affirmative fact so answering it is cheap - and never
-#             the marker token itself, which must mean one thing only. A bounded
+#             the marker token itself, which must mean one thing only. It keeps
+#             the "idle <age>s, possible wedge, escalation <n>" token sequence
+#             every other arm emits, because that grammar is the contract the
+#             away-mode daemon force-escalates a stale wake on; only the count it
+#             reports is unchanged rather than advanced. A bounded
 #             cadence backoff for a pane that keeps reading alive attaches to THIS
 #             arm and owns its own consecutive-affirmative record; it is
 #             deliberately not implemented here.
@@ -496,7 +500,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
             reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: no agent is alive at the recorded endpoint - inspect now, do not re-absorb on the run-step/pane state alone)"
             ;;
           alive)
-            reason="stale: $win (idle ${age}s, possible wedge, agent alive at the recorded endpoint so this escalation is not counted, unexplained escalations still $n; confirm what the worker is waiting on)"
+            reason="stale: $win (idle ${age}s, possible wedge, escalation $n unchanged, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)"
             ;;
           *)
             n=$(( n + 1 ))
