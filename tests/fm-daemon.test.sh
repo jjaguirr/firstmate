@@ -150,7 +150,7 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
     win="sess:fm-$task"
     pane="$dir/pane.txt"
     action_log="$dir/actions.log"
-    reason="stale: $win (idle 500s, possible wedge, escalation 3, demand-deep-inspection: same pane has wedge-escalated 3 times in a row - do not re-absorb on the run-step/pane state alone)"
+    reason="stale: $win (idle 500s, possible wedge, escalation 3, demand-deep-inspection: 3 unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)"
     fm_write_meta "$state/$task.meta" "window=$win" "backend=tmux"
     case "$case_name" in
       working) status_line='working: building' ;;

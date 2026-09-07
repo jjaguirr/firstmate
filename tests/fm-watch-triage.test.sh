@@ -2325,6 +2325,8 @@ test_wedge_alive_agent_does_not_advance_escalation_count() {
       || fail "round $n stopped reporting an unresolved possible wedge: $(cat "$out")"
     grep -F "agent alive at the recorded endpoint" "$out" >/dev/null \
       || fail "round $n did not carry the affirmative liveness fact: $(cat "$out")"
+    grep -F "unexplained escalations still 3" "$out" >/dev/null \
+      || fail "round $n hid the unchanged unexplained-escalation count from the supervisor: $(cat "$out")"
     grep -F "demand-deep-inspection" "$out" >/dev/null \
       && fail "round $n demanded deep inspection for an agent that is demonstrably alive: $(cat "$out")"
     ack_stopped_cycle "$state" || fail "could not acknowledge alive-agent round $n"
@@ -2537,6 +2539,11 @@ test_busy_pane_turn_end_touch_resets_age() {
   pass "touching a busy worker's completed-turn marker resets the age and prevents an old-age escalation"
 }
 
+# A genuinely busy pane runs its harness in the pane's foreground process group,
+# so the endpoint reads `alive` on essentially every escalation this bound
+# produces. That reading is refused as evidence here - it is the precondition of
+# the hung foreground call this bound exists to catch, not new information - so
+# the counter must still climb and the marker must still fire at the threshold.
 test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
   local dir state fakebin out capture_file window key pane_hash sig pid n
   dir=$(make_case busy-turn-age-demand-inspect); state="$dir/state"; fakebin="$dir/fakebin"
@@ -2556,6 +2563,7 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
   # Priming round: first sighting past the turn-age bound absorbs and starts
   # the wedge timer, mirroring the existing provably-working wedge tests.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=pi \
     FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -2570,11 +2578,14 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
     echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=pi \
       FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
     pid=$!
     wait_for_exit "$pid" 100 || fail "busy turn-age escalation round $n did not escalate: $(cat "$out")"
     grep -F "escalation $n" "$out" >/dev/null || fail "busy turn-age round $n did not report escalation count $n: $(cat "$out")"
+    grep -F "not counted" "$out" >/dev/null \
+      && fail "busy turn-age round $n let a live agent suppress its own escalation count: $(cat "$out")"
     if [ "$n" -lt 3 ]; then
       grep -F "demand-deep-inspection" "$out" >/dev/null && fail "busy turn-age round $n escalated to demand-deep-inspection before the threshold: $(cat "$out")"
     else
@@ -2584,7 +2595,45 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
     n=$((n + 1))
   done
   [ "$(cat "$state/.wedge-escalations-$key" 2>/dev/null || echo 0)" = 3 ] || fail "busy turn-age escalation counter did not persist across consecutive rounds"
-  pass "repeated busy turn-age escalations reuse the existing escalation counter and demand deep inspection at the threshold"
+  pass "a busy pane whose agent reads alive still accumulates escalations and demands deep inspection at the threshold"
+}
+
+# The other half of that scoping: refusing the affirmative reading on this path
+# does not refuse the negative one. A killed agent behind a busy-looking pane is
+# decisive evidence wherever it is read, and it is the case that used to wait out
+# three rounds before reaching a supervisor.
+test_busy_pane_dead_agent_demands_inspection_at_first_escalation() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case busy-turn-age-dead-agent); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="test:fm-busy-dead-agent"
+  printf 'Working...' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=pi\n' "$window" > "$state/busy-dead.meta"
+  record_pi_busy "$state" busy-dead
+  printf 'working: setup complete\n' > "$state/busy-dead.status"
+  sig=$(seen_sig "$state/busy-dead.status"); printf '%s' "$sig" > "$state/.seen-busy-dead_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "Working...")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  touch -t 200001010000 "$state/busy-dead.turn-ended"
+  prime_turnend_seen "$state/busy-dead.turn-ended"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+
+  # A bare shell in the pane's foreground: the busy record still says busy, but
+  # the agent that produced it is gone.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_FAKE_TMUX_CURRENT_COMMAND=zsh \
+    FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 100 || { reap "$pid"; fail "a dead agent behind a busy pane never escalated: $(cat "$out")"; }
+  grep -F "escalation 1" "$out" >/dev/null || fail "the busy dead-agent escalation was not the first one: $(cat "$out")"
+  grep -F "demand-deep-inspection" "$out" >/dev/null \
+    || fail "a dead agent behind a busy pane did not demand deep inspection on its first escalation: $(cat "$out")"
+  grep -F "no agent is alive at the recorded endpoint" "$out" >/dev/null \
+    || fail "the busy dead-agent marker did not name the evidence that triggered it: $(cat "$out")"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional busy dead-agent stop"
+  pass "a dead agent behind a busy pane past the turn bound demands deep inspection on its first escalation"
 }
 
 # --- declared pause + busy pane: the busy-turn bound must honor the declaration
@@ -3591,6 +3640,7 @@ test_busy_pane_stable_hash_escalates_past_turn_age_bound
 test_busy_pane_changing_hash_escalates_past_turn_age_bound
 test_busy_pane_turn_end_touch_resets_age
 test_busy_pane_repeated_escalation_reaches_demand_deep_inspection
+test_busy_pane_dead_agent_demands_inspection_at_first_escalation
 test_busy_pane_default_turn_age_bound_is_3600s
 test_busy_declared_pause_is_rechecked_not_wedge_escalated
 test_nonterminal_stale_not_working_surfaced

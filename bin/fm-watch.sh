@@ -40,7 +40,10 @@
 #                          marker is driven by evidence first and repetition only
 #                          as a fallback: a dead endpoint carries it on the FIRST
 #                          escalation, an endpoint reading alive never counts
-#                          toward it, and an unreadable one keeps the
+#                          toward it on the idle-stale path, and an unreadable one
+#                          (or an alive reading on a pane past the busy-turn
+#                          bound, which is busy and so already known to run an
+#                          agent) keeps the
 #                          FM_WEDGE_DEMAND_INSPECT_COUNT repetition threshold
 #                          (wedge_timer_check owns that contract). Every one of
 #                          those still queues the same stale wake on the same
@@ -317,8 +320,10 @@ recorded_windows() {
 # look instead of another routine supervision resume.
 # Repetition is the fallback trigger, never the only one: wedge_timer_check owns
 # the full contract, including the agent-liveness reading that attaches the marker
-# to a dead endpoint at the FIRST escalation and keeps an affirmative one from
-# counting toward it at all. Reset wherever a window's pane/hash state resets to
+# to a dead endpoint at the FIRST escalation and, on the idle-stale path only,
+# keeps an affirmative one from counting toward it at all. A pane past the
+# busy-turn bound is already known to be running an agent, so it keeps the plain
+# repetition threshold. Reset wherever a window's pane/hash state resets to
 # genuinely active (see the two rm-on-reset call sites below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
@@ -450,8 +455,20 @@ wedge_agent_verdict() {  # <window> -> alive|dead|unknown
 #   unknown - no evidence either way, so the pre-existing repetition schedule
 #             stands unchanged, exactly as every other absent-evidence outcome in
 #             this file leaves the caller's schedule alone.
-wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> <task>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 task=$5 since age n reason verdict
+# <affirmative-liveness> is admit-alive or refuse-alive. The CALLER decides it
+# explicitly; it is never inferred from the human triage label. Only a caller that
+# did not already know the agent process was running admits an alive reading as
+# new evidence, which is the idle-stale path. busy_turn_bound_check refuses it: a
+# pane past the busy-turn bound renders a harness busy footer, so its agent is
+# alive by construction, and process liveness cannot see the hung foreground call
+# that path exists to catch. An alive reading there is treated exactly as unknown,
+# so that path keeps today's schedule - the counter advances on every escalation
+# and the marker still fires at FM_WEDGE_DEMAND_INSPECT_COUNT. The endpoint is
+# still read on the refusing path, because the dead arm applies wherever it is
+# read: a dead or authoritatively missing endpoint is decisive evidence behind a
+# busy-looking pane too, and that is the case that used to wait out three rounds.
+wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> <task> <affirmative-liveness>
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 task=$5 admit_alive=$6 since age n reason verdict
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -471,6 +488,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
         n=$(cat "$escalation_file" 2>/dev/null || true)
         case "$n" in ''|*[!0-9]*) n=0 ;; esac
         verdict=$(wedge_agent_verdict "$win")
+        [ "$verdict" != alive ] || [ "$admit_alive" = admit-alive ] || verdict=unknown
         case "$verdict" in
           dead)
             n=$(( n + 1 ))
@@ -478,14 +496,14 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
             reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: no agent is alive at the recorded endpoint - inspect now, do not re-absorb on the run-step/pane state alone)"
             ;;
           alive)
-            reason="stale: $win (idle ${age}s, possible wedge, agent alive at the recorded endpoint so this escalation is not counted as unexplained; confirm what the worker is waiting on)"
+            reason="stale: $win (idle ${age}s, possible wedge, agent alive at the recorded endpoint so this escalation is not counted, unexplained escalations still $n; confirm what the worker is waiting on)"
             ;;
           *)
             n=$(( n + 1 ))
             echo "$n" > "$escalation_file"
             reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
             if [ "$n" -ge "$FM_WEDGE_DEMAND_INSPECT_COUNT" ]; then
-              reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: same pane has wedge-escalated $n times in a row - do not re-absorb on the run-step/pane state alone)"
+              reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: $n unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)"
             fi
             ;;
         esac
@@ -589,7 +607,9 @@ busy_turn_bound_check() {  # <window> <task> <hash> <since-file> <escalation-fil
     handle_paused_stale "$win" "$task" "$h"
     return 0
   fi
-  wedge_timer_check "$win" "$since_file" "busy (no completed turn)" "$escalation_file" "$task"
+  # refuse-alive: this pane renders busy, so a live agent process is not new
+  # evidence here - it is the precondition of the failure this bound catches.
+  wedge_timer_check "$win" "$since_file" "busy (no completed turn)" "$escalation_file" "$task" refuse-alive
   return 1
 }
 
@@ -807,7 +827,7 @@ wedge_timer_due_check() {  # <window> <task> <hash> <since-file> <escalation-fil
   class=$(crew_absorb_class "$task")
   case "$class" in
     parked|done) handle_reconciled_idle_stale "$win" "$task" "$h" "$class" ;;
-    *)           wedge_timer_check "$win" "$since_file" "$label" "$escalation_file" "$task" ;;
+    *)           wedge_timer_check "$win" "$since_file" "$label" "$escalation_file" "$task" admit-alive ;;
   esac
 }
 
@@ -1482,7 +1502,7 @@ EOF
             # wedge timer is running for it) - keep treating it that way
             # without re-reading the crew state every poll, and without
             # letting the still-captain-relevant log line re-surface it.
-            wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf" "$task"
+            wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf" "$task" admit-alive
           fi
           # else: already surfaced as genuinely terminal on a prior poll of
           # this same hash - nothing left to do (matches the original,
@@ -1571,7 +1591,7 @@ EOF
                 working) clear_pause_state "$key"
                          clear_reconciled_tracking "$key"
                          printf '%s' "$h" > "$sf"
-                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" "$task"
+                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" "$task" admit-alive
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       # A pane whose text never changed across the busy-to-idle
                          # flip reaches its declaration's FIRST idle classification
@@ -1588,7 +1608,7 @@ EOF
             elif [ -e "$ssf" ] && wedge_timer_is_due "$ssf"; then
               wedge_timer_due_check "$w" "$task" "$h" "$ssf" "$ewf" "non-terminal stale"
             else
-              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf" "$task"
+              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf" "$task" admit-alive
             fi
           fi
         fi
