@@ -1,0 +1,188 @@
+Reproduction of the 2026-09-06 report: a live, correctly parked worker read FAILED in the fleet view.
+Each scenario runs twice against the SAME fixture: once with the pre-fix checkout (base 134b34b),
+once with this change (e19a30e). Rendered through the real human fleet view.
+
+================================================================
+  SCENARIO: incident   --   BEFORE (base 134b34b, pre-fix)
+================================================================
+scenario:   incident
+checkout:   /tmp/fm-base.IUshcr
+branch:     fm/fleet-incident
+local HEAD: ef798df1
+live run:   38c1a70d  (running, parked at review - NOT an object this copy has)
+
+$ no-mistakes runs --limit 200
+  running    fm/fleet-incident 38c1a70d  2026-09-06 20:49
+  failed     fm/fleet-incident ef798df1  2026-09-05 06:01
+  cancelled  fm/fleet-incident b8bbab6a  2026-09-04 11:02
+
+$ bin/fm-crew-state.sh crew-1
+state: failed · source: run-step · run failed · status-log superseded (run failed)
+
+$ bin/fm-fleet-view.sh
+## Under Way
+| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crew-1 | failed / run-step | ship | - | tmux | present | - | /tmp/fm-fleet-incident.iMW6cy/wt | bin/fm-peek.sh fm-crew-1 |
+
+
+================================================================
+  SCENARIO: incident   --   AFTER (e19a30e, this change)
+================================================================
+scenario:   incident
+checkout:   /home/ubuntu/.no-mistakes/worktrees/9c45ef16ef2c/01M1WVED80YZ8EVT4J2S52BR92
+branch:     fm/fleet-incident
+local HEAD: 167e80f1
+live run:   dc21686d  (running, parked at review - NOT an object this copy has)
+
+$ no-mistakes runs --limit 200
+  running    fm/fleet-incident dc21686d  2026-09-06 20:49
+  failed     fm/fleet-incident 167e80f1  2026-09-05 06:01
+  cancelled  fm/fleet-incident 66aae52c  2026-09-04 11:02
+
+$ bin/fm-crew-state.sh crew-1
+state: parked · source: run-step · parked at review: 2 finding(s) (ask-user: authority decision)
+
+$ bin/fm-fleet-view.sh
+## Under Way
+| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crew-1 | parked / run-step | ship | - | tmux | present | - | /tmp/fm-fleet-incident.TnQh3U/wt | bin/fm-peek.sh fm-crew-1 |
+
+
+================================================================
+  SCENARIO: unknown   --   BEFORE (base 134b34b, pre-fix)
+================================================================
+scenario:   unknown
+checkout:   /tmp/fm-base.IUshcr
+branch:     fm/fleet-incident
+local HEAD: 167e80f1
+record head: dc21686d  (a CONCLUDED record on a head this copy cannot read; no live row corroborates it)
+
+$ no-mistakes runs --limit 200
+  failed     fm/fleet-incident 167e80f1  2026-09-05 06:01
+  cancelled  fm/fleet-incident 66aae52c  2026-09-04 11:02
+
+$ bin/fm-crew-state.sh crew-1
+state: failed · source: run-step · run failed · status-log superseded (run failed)
+
+$ bin/fm-fleet-view.sh
+## Under Way
+| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crew-1 | failed / run-step | ship | - | tmux | present | - | /tmp/fm-fleet-incident.2ffwN4/wt | bin/fm-peek.sh fm-crew-1 |
+
+
+================================================================
+  SCENARIO: unknown   --   AFTER (e19a30e, this change)
+================================================================
+scenario:   unknown
+checkout:   /home/ubuntu/.no-mistakes/worktrees/9c45ef16ef2c/01M1WVED80YZ8EVT4J2S52BR92
+branch:     fm/fleet-incident
+local HEAD: 3daf041f
+record head: 1c116ac5  (a CONCLUDED record on a head this copy cannot read; no live row corroborates it)
+
+$ no-mistakes runs --limit 200
+  failed     fm/fleet-incident 3daf041f  2026-09-05 06:01
+  cancelled  fm/fleet-incident 57c09caf  2026-09-04 11:02
+
+$ bin/fm-crew-state.sh crew-1
+state: unknown · source: run-step · run head 1c116ac5 is not in this local copy; cannot tell which run owns this branch
+
+$ bin/fm-fleet-view.sh
+## Under Way
+| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crew-1 | unknown / run-step | ship | - | tmux | present | - | /tmp/fm-fleet-incident.j724D9/wt | bin/fm-peek.sh fm-crew-1 |
+
+
+================================================================
+  SCENARIO: diverged   --   BEFORE (base 134b34b, pre-fix)
+================================================================
+scenario:   diverged
+checkout:   /tmp/fm-base.IUshcr
+branch:     fm/fleet-incident
+local HEAD: 0e45c417
+record head: 6a0c8ed2  (resolvable here, provably foreign history)
+
+$ no-mistakes runs --limit 200
+  running    fm/fleet-incident 6a0c8ed2  2026-09-06 20:49
+
+$ bin/fm-crew-state.sh crew-1
+state: working · source: status-log · stage 2 setup complete
+
+$ bin/fm-fleet-view.sh
+## Under Way
+| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crew-1 | working / status-log | ship | - | tmux | present | - | /tmp/fm-fleet-incident.0WniWb/wt | bin/fm-peek.sh fm-crew-1 |
+
+
+================================================================
+  SCENARIO: diverged   --   AFTER (e19a30e, this change)
+================================================================
+scenario:   diverged
+checkout:   /home/ubuntu/.no-mistakes/worktrees/9c45ef16ef2c/01M1WVED80YZ8EVT4J2S52BR92
+branch:     fm/fleet-incident
+local HEAD: 0e45c417
+record head: 6a0c8ed2  (resolvable here, provably foreign history)
+
+$ no-mistakes runs --limit 200
+  running    fm/fleet-incident 6a0c8ed2  2026-09-06 20:49
+
+$ bin/fm-crew-state.sh crew-1
+state: working · source: status-log · stage 2 setup complete
+
+$ bin/fm-fleet-view.sh
+## Under Way
+| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crew-1 | working / status-log | ship | - | tmux | present | - | /tmp/fm-fleet-incident.6ZAVap/wt | bin/fm-peek.sh fm-crew-1 |
+
+
+================================================================
+  SCENARIO: dead   --   BEFORE (base 134b34b, pre-fix)
+================================================================
+scenario:   dead
+checkout:   /tmp/fm-base.IUshcr
+branch:     fm/fleet-incident
+local HEAD: 07d82186
+record head: 07d82186  (the branch's newest attributable run, and it really failed)
+
+$ no-mistakes runs --limit 200
+  failed     fm/fleet-incident 07d82186  2026-09-06 20:49
+  cancelled  fm/fleet-incident a548e57c  2026-09-04 11:02
+
+$ bin/fm-crew-state.sh crew-1
+state: failed · source: run-step · run failed · status-log superseded (run failed)
+
+$ bin/fm-fleet-view.sh
+## Under Way
+| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crew-1 | failed / run-step | ship | - | tmux | present | - | /tmp/fm-fleet-incident.mg86co/wt | bin/fm-peek.sh fm-crew-1 |
+
+
+================================================================
+  SCENARIO: dead   --   AFTER (e19a30e, this change)
+================================================================
+scenario:   dead
+checkout:   /home/ubuntu/.no-mistakes/worktrees/9c45ef16ef2c/01M1WVED80YZ8EVT4J2S52BR92
+branch:     fm/fleet-incident
+local HEAD: e6a82387
+record head: e6a82387  (the branch's newest attributable run, and it really failed)
+
+$ no-mistakes runs --limit 200
+  failed     fm/fleet-incident e6a82387  2026-09-06 20:49
+  cancelled  fm/fleet-incident 9ad35084  2026-09-04 11:02
+
+$ bin/fm-crew-state.sh crew-1
+state: failed · source: run-step · run failed · status-log superseded (run failed)
+
+$ bin/fm-fleet-view.sh
+## Under Way
+| ID | Current | Kind | Repo/Project | Backend | Endpoint | Artifact | Path | Watch / return channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| crew-1 | failed / run-step | ship | - | tmux | present | - | /tmp/fm-fleet-incident.HUIZGo/wt | bin/fm-peek.sh fm-crew-1 |
+
+

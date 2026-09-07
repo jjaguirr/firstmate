@@ -1,0 +1,16 @@
+Non-vacuity check: each NEW regression test in tests/fm-crew-state.test.sh, run in isolation
+against the PRE-FIX code (base 134b34b) and against this change (e19a30e).
+
+TEST                                                           PRE-FIX    THIS CHANGE
+----                                                           -------    -----------
+test_live_run_beats_dead_run_at_stale_local_head               FAIL       PASS      
+test_unresolvable_live_head_keeps_live_parked_detail           FAIL       PASS      
+test_terminal_failure_on_unresolvable_head_defers_to_live_row  PASS       PASS      
+test_terminal_failure_on_unresolvable_head_without_live_row_is_unknown FAIL       PASS      
+test_terminal_success_on_unresolvable_head_still_reports_done  FAIL       PASS      
+test_undecidable_row_without_attributable_record_is_unknown    FAIL       PASS      
+test_diverged_head_on_own_branch_is_still_refused              PASS       PASS      
+test_unresolvable_row_stops_terminal_failure_confirmation      FAIL       PASS      
+test_genuinely_latest_failed_run_stays_failed                  PASS       PASS      
+test_rewritten_row_is_skipped_not_treated_as_undecidable       PASS       PASS      
+test_head_predicate_reports_three_outcomes                     FAIL       PASS      
