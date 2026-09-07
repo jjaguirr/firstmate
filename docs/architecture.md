@@ -55,8 +55,8 @@ The explicit resolution is written by the actor that answers, not the busy worke
 This home's answerer close, pending-reply escalation close, and captain-held transfer use the provenance-guarded append owned by `bin/fm-wake-lib.sh`, so they advance the watcher marker only across their own bytes when all earlier bytes were already announced; pending or interleaved foreign bytes fail toward an ordinary wake.
 A turn-ended-only queue row omits its historical status annotation when that status file exactly matches the same seen marker.
 Any direct or remaining historical annotation prints every status line unread at the presentation cursor instead of replaying only the latest line.
-`bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes a no-mistakes run, active or terminal, only when it matches the crew's branch and current code identity, then keeps that run-step authoritative even if the pane has closed.
-The script header owns the exact run-head ancestry rules.
+`bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes a no-mistakes run, active or terminal, only when it matches the crew's branch and its head is not refuted by the crew's current code identity, then keeps that run-step authoritative even if the pane has closed.
+`bin/fm-nm-run-lib.sh`'s header owns the exact run-head rule and its three outcomes, and the script header owns the run-selection rules built on it.
 One branch can hold several runs, so the newest attributable run owns it, and a run head this local copy does not have yet is never read as a mismatch that would let an older dead run be claimed instead.
 A detailed record for the crew's own branch is trusted on such a head exactly as a resolvable head would trust it, keeping its real state and its full step and gate detail, so a parked run still reads parked and a passed run still reads done.
 The one verdict withheld there is a terminal failure, which resolves to working only when the newest attributable row is itself running.
