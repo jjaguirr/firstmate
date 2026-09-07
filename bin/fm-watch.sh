@@ -33,7 +33,7 @@
 #                          terminal (captain-relevant) or non-terminal (no verb),
 #                          both surfaced at once. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
-#                          count in the reason; the reason also carries a
+#                          count in the reason; that reason can also carry a
 #                          "demand-deep-inspection" marker so the wake payload
 #                          itself, not just repetition, forces a closer look
 #                          instead of another routine supervision resume. That
