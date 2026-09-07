@@ -10,7 +10,7 @@
 # external wait or a verified captain-held transfer, is one separate idle absorb
 # case and re-surfaces only on its long bounded cadence, although its initial
 # no-verb status signal still surfaces in normal mode. A crew bin/fm-crew-state.sh
-# reconciles as parked at a decision or done awaiting landing is the other: its
+# reconciles as parked at a decision or done with its work finished is the other: its
 # pane is idle by design, so after the one surface each distinct reconciled state
 # earns, later redraws of that same state take the same bounded cadence.
 # While state/.afk exists, the daemon owns triage and this watcher queues and exits
@@ -368,10 +368,19 @@ clear_write_tracking() {  # <window-key>
 # working again, so a crew that parks, resumes, and later parks a second time
 # earns its own surface instead of inheriting the first one's, and so the bounded
 # re-surface cadence is measured from the CURRENT expected-idle stretch.
-# Deliberately NOT dropped where a busy or changed-hash reading resets the wedge
-# timer: an idle pane that merely redrew is the same reconciled wait, and dropping
+#
+# Two readings prove the crew left the wait, and both drop this chain: an
+# authoritative working verdict on the stale path, and a pane actually RENDERING
+# BUSY. A changed hash on an idle pane is neither, and deliberately does NOT drop
+# it: an idle pane that merely redrew is the same reconciled wait, and dropping
 # the record there would re-surface it on every redraw - the exact behavior this
-# chain exists to stop.
+# chain exists to stop. Keeping the busy reading in that exempt set was the
+# original mistake, because a crew that parks, is answered, resumes behind a busy
+# pane, and parks again at a SECOND gate appends nothing to its status log while a
+# run owns it (AGENTS.md's sparse status-reporting contract), so the second park
+# produced a digest identical to the first: it inherited the spent surface and the
+# old age anchor, went unreported for up to PAUSE_RESURFACE_SECS, and then printed
+# an age measured from the wrong park.
 clear_reconciled_tracking() {  # <window-key>
   local key=$1
   rm -f "$STATE/.reconciled-$key" "$STATE/.reconciled-since-$key" \
@@ -653,9 +662,9 @@ reconciled_idle_digest() {  # <class> <status-line> <status-mtime>
 
 # Surface-or-absorb a stale pane whose authoritative current state
 # bin/fm-crew-state.sh has reconciled as `parked` (held at a decision) or `done`
-# (finished, awaiting landing). Such a pane is idle BY DESIGN - the decision record
-# and the PR merge poll own what happens next - so its hash carries no wedge
-# evidence at all.
+# (work finished, whether or not it has landed). Such a pane is idle BY DESIGN -
+# the decision record and the PR merge poll own what happens next - so its hash
+# carries no wedge evidence at all.
 #
 # Expected-idle is NOT invisible. The FIRST sight of each distinct reconciled state
 # surfaces exactly as the ordinary stale paths would, because a crew parked at a
@@ -704,8 +713,14 @@ handle_reconciled_idle_stale() {  # <window> <task> <hash> <parked|done>
     detail="parked, awaiting a decision"
     reason="parked ${age}s, awaiting a decision - reconciled expected idle, rechecked on a long cadence not a wedge; answer the open decision or restart the work"
   else
-    detail="done, awaiting landing"
-    reason="done ${age}s, awaiting landing - reconciled expected idle, rechecked on a long cadence not a wedge; confirm the finished work is still on its way to landing"
+    # `done` covers a PR that is merely green and one that already merged
+    # (bin/fm-crew-state.sh maps checks-passed, passed and completed onto the same
+    # token), so this recheck states only what is certainly true - the work is
+    # finished and the crew is still sitting there - and asks which it is. Naming
+    # an unfinished landing would hand the captain the wrong next action for half
+    # the crews that reach it.
+    detail="done, not yet cleaned up"
+    reason="done ${age}s, finished and not yet cleaned up - reconciled expected idle, rechecked on a long cadence not a wedge; confirm whether this work has landed"
   fi
   resurface_absorbed "$win" "$STATE/.reconciled-resurfaced-$key" "$age" "stale: $win ($reason)"
   triage_log "absorbed stale ($detail, age ${age}s): $win"
@@ -1415,7 +1430,7 @@ EOF
           #     liveness evidence each kind of crew must supply), so absorb on the long
           #     PAUSE_RESURFACE_SECS cadence instead of wedge-escalating;
           #   - parked/done: the crew never declared a wait, but its authoritative state
-          #     is held at a decision or finished awaiting landing, so the idleness is
+          #     is held at a decision or finished with its work done, so the idleness is
           #     expected: surface each distinct reconciled state once, then absorb its
           #     redraws onto that same bounded cadence (handle_reconciled_idle_stale);
           #   - none: no running pipeline, no exact busy verdict, no admitted declared wait.
@@ -1519,6 +1534,16 @@ EOF
           rm -f "$ssf" "$ewf"
           clear_write_tracking "$key"
         fi
+        # A pane rendering busy is the crew working, not the same wait redrawn, so
+        # it ends any reconciled expected-idle stretch and the NEXT park earns its
+        # own surface. Unlike the pause bookkeeping below there is no declaration to
+        # weigh against the busy reading: a reconciled state is read from the crew,
+        # never declared by it, so the crew rendering busy is the whole of the
+        # evidence. Keyed to the busy verdict alone, so a merely changed hash on a
+        # still-idle pane is untouched.
+        if [ "$busy_now" -eq 0 ]; then
+          clear_reconciled_tracking "$key"
+        fi
         # Pause bookkeeping is NOT dropped here. A busy reading is one poll's
         # rendered verdict, while the declaration on the log is the crew's own
         # standing statement of why it is idle; dropping the cadence (and with it
@@ -1535,6 +1560,11 @@ EOF
       else
         rm -f "$ssf" "$ewf"
         clear_write_tracking "$key"
+      fi
+      # Same rule as the unchanged-hash reset above: the busy verdict ends the
+      # reconciled stretch, the changed hash on its own does not.
+      if [ "$busy_now" -eq 0 ]; then
+        clear_reconciled_tracking "$key"
       fi
       task=$(window_to_task "$w" "$STATE")
       # A new hash under a standing declaration is reclassified, never cleared on

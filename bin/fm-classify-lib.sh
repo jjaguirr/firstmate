@@ -17,7 +17,7 @@
 # (crew_absorb_class and its working/paused wrappers) is NOT a pure status-file
 # read: it reuses bin/fm-crew-state.sh, which may make a bounded no-mistakes call,
 # to decide whether a crew that just stopped its turn or went stale is working,
-# deliberately paused, idle by design at a decision or awaiting landing, or none of
+# deliberately paused, idle by design at a decision or with its work finished, or none of
 # those. Callers run it ONLY on no-verb signal handling, first sighting of a stale
 # hash, and an already-classified stale hash whose wedge timer has come due, never
 # on every wake, so the per-wake triage stays cheap.
@@ -1631,8 +1631,8 @@ signal_reason_is_actionable() {  # <file> ...
 #   parked  - the crew is held at a decision (a no-mistakes approval or fix-review
 #             gate, or a needs-decision status), so its pane is idle BY DESIGN
 #             while the decision, not the pane, is what has to move;
-#   done    - the crew's work is finished and waiting to land, so its pane is idle
-#             BY DESIGN while the PR poll owns what happens next;
+#   done    - the crew's work is finished, whether or not it has landed, so its
+#             pane is idle BY DESIGN while the PR poll owns what happens next;
 #   none    - none of those, so the wake must surface (a stopped, blocked, failed,
 #             torn-down, or unknown crew, or an unreadable verdict).
 # parked and done say the idleness is EXPECTED, never that there is nothing to
