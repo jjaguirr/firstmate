@@ -282,11 +282,11 @@ test_oversized_backlog_survives_argv_limit_json() {
   local home out backlog_bytes
   home=$(make_home oversized-backlog-json)
   write_oversized_backlog "$home"
-  backlog_bytes=$(FM_HOME="$home" "$SNAPSHOT" --json | jq -c '.backlog' | LC_ALL=C wc -c | tr -d ' ')
-  [ "$backlog_bytes" -gt 131072 ] \
-    || fail "fixture backlog JSON must exceed MAX_ARG_STRLEN to exercise the bug, got $backlog_bytes bytes"
   out=$(FM_HOME="$home" "$SNAPSHOT" --json 2>&1) \
     || fail "snapshot must survive a backlog JSON larger than MAX_ARG_STRLEN: $out"
+  backlog_bytes=$(printf '%s' "$out" | jq -c '.backlog' | LC_ALL=C wc -c | tr -d ' ')
+  [ "$backlog_bytes" -gt 131072 ] \
+    || fail "fixture backlog JSON must exceed MAX_ARG_STRLEN to exercise the bug, got $backlog_bytes bytes"
   printf '%s' "$out" | jq -e '
     .schema == "fm-fleet-snapshot.v1"
       and .main_inventory.valid == true

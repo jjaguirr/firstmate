@@ -71,21 +71,14 @@ set -u
 # Passing large backlog/task JSON straight to jq as --argjson exceeds
 # Linux's per-argv-entry MAX_ARG_STRLEN (131072 bytes) well before the
 # much larger total ARG_MAX, and jq fails with "Argument list too long".
-# json_arg_file writes such a payload to a private temp file so jq can
-# read it with --slurpfile instead, crossing argv only as a short path.
-SNAPSHOT_TMPFILES=""
-json_arg_file() {  # <json-text>
-  local f
-  f=$(mktemp "${TMPDIR:-/tmp}/fm-fleet-snapshot.XXXXXX.json") || return 1
-  SNAPSHOT_TMPFILES="$SNAPSHOT_TMPFILES $f"
-  printf '%s' "$1" >"$f"
-  printf '%s' "$f"
+# The two growing payloads are written once into this run's private temp
+# directory so jq reads them with --slurpfile, crossing argv only as a
+# short path. The directory is removed when the script exits.
+SNAPSHOT_TMPDIR=""
+cleanup_snapshot_tmpdir() {
+  [ -n "$SNAPSHOT_TMPDIR" ] && rm -rf "$SNAPSHOT_TMPDIR"
 }
-cleanup_snapshot_tmpfiles() {
-  # shellcheck disable=SC2086 # word-splitting the tracked path list is intentional
-  [ -n "$SNAPSHOT_TMPFILES" ] && rm -f $SNAPSHOT_TMPFILES
-}
-trap cleanup_snapshot_tmpfiles EXIT
+trap cleanup_snapshot_tmpdir EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -636,13 +629,10 @@ task_json_lines() {
 # used by secondmate_home_summary_json, without inventing live task rows.
 # Meta inventory remains the sole source of live workers; this object only
 # discloses backlog↔task inconsistency for renderers (Bearings omitted/gates).
-main_inventory_json() {  # <backlog-json> <tasks-json>
-  local backlog_file tasks_file
-  backlog_file=$(json_arg_file "$1") || return 1
-  tasks_file=$(json_arg_file "$2") || return 1
+main_inventory_json() {  # <backlog-json-file> <tasks-json-file>
   jq -n \
-    --slurpfile backlog "$backlog_file" \
-    --slurpfile tasks "$tasks_file" '
+    --slurpfile backlog "$1" \
+    --slurpfile tasks "$2" '
     ($backlog[0]) as $backlog
     | ($tasks[0]) as $tasks
     | ([ $backlog.records[]?
@@ -669,10 +659,7 @@ main_inventory_json() {  # <backlog-json> <tasks-json>
 # validated parent read needs.
 # This mode never reads parent events or terminal text and never aggregates
 # nested secondmates.
-secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
-  local backlog_file tasks_file
-  backlog_file=$(json_arg_file "$1") || return 1
-  tasks_file=$(json_arg_file "$2") || return 1
+secondmate_home_summary_json() {  # <backlog-json-file> <tasks-json-file>
   jq -n \
     --arg generated "$SNAPSHOT_NOW" \
     --arg home "$FM_HOME" \
@@ -680,8 +667,8 @@ secondmate_home_summary_json() {  # <backlog-json> <tasks-json>
     --argjson queued_n "$FM_SNAPSHOT_SECONDMATE_QUEUED" \
     --argjson decisions_n "$FM_SNAPSHOT_SECONDMATE_DECISIONS" \
     --argjson landed_n "$FM_SNAPSHOT_SECONDMATE_LANDED_PER_HOME" \
-    --slurpfile backlog "$backlog_file" \
-    --slurpfile tasks "$tasks_file" '
+    --slurpfile backlog "$1" \
+    --slurpfile tasks "$2" '
     ($backlog[0]) as $backlog
     | ($tasks[0]) as $tasks
     | def trunc($n):
@@ -1153,13 +1140,12 @@ parent_evidence_reconciliation_json() {  # <summary-json> <activities-json> <dec
        inconclusive:any(($activity_results + $decision_results)[]; .verdict == "inconclusive")}'
 }
 
-secondmate_current_json() {  # <parent-tasks-json>
-  local tasks=$1 registry union rows total_registered total shown truncated
+secondmate_current_json() {  # <parent-tasks-json-file>
+  local tasks_file=$1 registry union rows total_registered total shown truncated
   local row id home host remote registered registry_error task status_file event_raw event_note event_epoch event_age
   local activity_scan activities decisions reconciliation provenance freshness reason summary summary_rc summary_bytes summary_valid summary_reason summary_invalidity state current_reason terminal terminal_contradiction contradiction
-  local records='[]' seen_homes='' tasks_file
+  local records='[]' seen_homes=''
   registry=$(registry_secondmates_json) || return 1
-  tasks_file=$(json_arg_file "$tasks") || return 1
   union=$(jq -n --argjson registry "$registry" --slurpfile tasks "$tasks_file" '
     ($tasks[0]) as $tasks
     | ($registry.records // []) as $registered
@@ -1392,19 +1378,25 @@ scout_report_lines() {
 
 BACKLOG_JSON=$(backlog_json) || { echo "fm-fleet-snapshot: backlog read failed" >&2; exit 1; }
 TASKS_JSON=$(task_json_lines) || { echo "fm-fleet-snapshot: task snapshot failed" >&2; exit 1; }
-BACKLOG_JSON_FILE=$(json_arg_file "$BACKLOG_JSON") || { echo "fm-fleet-snapshot: backlog temp file failed" >&2; exit 1; }
-TASKS_JSON_FILE=$(json_arg_file "$TASKS_JSON") || { echo "fm-fleet-snapshot: tasks temp file failed" >&2; exit 1; }
+SNAPSHOT_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-fleet-snapshot.XXXXXX") \
+  || { echo "fm-fleet-snapshot: temp directory failed" >&2; exit 1; }
+BACKLOG_JSON_FILE="$SNAPSHOT_TMPDIR/backlog.json"
+TASKS_JSON_FILE="$SNAPSHOT_TMPDIR/tasks.json"
+printf '%s' "$BACKLOG_JSON" >"$BACKLOG_JSON_FILE" \
+  || { echo "fm-fleet-snapshot: backlog temp file failed" >&2; exit 1; }
+printf '%s' "$TASKS_JSON" >"$TASKS_JSON_FILE" \
+  || { echo "fm-fleet-snapshot: tasks temp file failed" >&2; exit 1; }
 
 if [ "$OUTPUT_MODE" = secondmate-home-summary ]; then
-  secondmate_home_summary_json "$BACKLOG_JSON" "$TASKS_JSON" \
+  secondmate_home_summary_json "$BACKLOG_JSON_FILE" "$TASKS_JSON_FILE" \
     || { echo "fm-fleet-snapshot: secondmate home summary failed" >&2; exit 1; }
   exit 0
 fi
 
 SCOUT_REPORTS_JSON=$(scout_report_lines)
-MAIN_INVENTORY_JSON=$(main_inventory_json "$BACKLOG_JSON" "$TASKS_JSON") \
+MAIN_INVENTORY_JSON=$(main_inventory_json "$BACKLOG_JSON_FILE" "$TASKS_JSON_FILE") \
   || { echo "fm-fleet-snapshot: main inventory summary failed" >&2; exit 1; }
-SECONDMATE_CURRENT_JSON=$(secondmate_current_json "$TASKS_JSON") \
+SECONDMATE_CURRENT_JSON=$(secondmate_current_json "$TASKS_JSON_FILE") \
   || { echo "fm-fleet-snapshot: registered secondmate aggregation failed" >&2; exit 1; }
 SECONDMATE_LANDED_JSON=$(secondmate_landed_from_current_json "$SECONDMATE_CURRENT_JSON") \
   || { echo "fm-fleet-snapshot: secondmate landed projection failed" >&2; exit 1; }
