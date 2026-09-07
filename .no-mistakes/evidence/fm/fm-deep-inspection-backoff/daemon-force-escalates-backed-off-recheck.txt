@@ -1,0 +1,16 @@
+==================================================================
+ away-mode daemon receives the backed-off recheck the watcher emits
+==================================================================
+wake reason produced by bin/fm-watch.sh (captured verbatim above):
+    stale: test:fm-ev-resurface (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint on 10 consecutive checks over 5001s, rechecked on a long cadence not every 240s; liveness is still read on the short cadence and a dead endpoint escalates at once; confirm what the worker is waiting on)
+
+crew's own status line says: working: still validating
+(status classification alone would absorb this wake, not escalate it)
+
+daemon decision log:
+    [2026-09-07T22:57:00+0000] escalate: stale: test:fm-ev-resurface (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint on 10 consecutive checks over 5001s, rechecked on a long cadence not every 240s; liveness is still read on the short cadence and a dead endpoint escalates at once; confirm what the worker is waiting on) -> test:fm-ev-resurface (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint on 10 consecutive checks over 5001s, rechecked on a long cadence not every 240s; liveness is still read on the short cadence and a dead endpoint escalates at once; confirm what the worker is waiting on)
+
+escalation queue the captain is handed in away mode:
+    test:fm-ev-resurface (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint on 10 consecutive checks over 5001s, rechecked on a long cadence not every 240s; liveness is still read on the short cadence and a dead endpoint escalates at once; confirm what the worker is waiting on)
+
+ordinary stale tracking left behind: no - the force-escalate path cleared it

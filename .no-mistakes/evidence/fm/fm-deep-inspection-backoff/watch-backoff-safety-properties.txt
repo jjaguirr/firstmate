@@ -1,0 +1,31 @@
+
+==================================================================
+ PROPERTY 1  a backed-off pane still re-surfaces once per bounded cadence
+==================================================================
+pane backed off for 5000s (past FM_PAUSE_RESURFACE_SECS=3600), agent still alive
+  -> WAKE, captain sees:
+       | stale: test:fm-ev-resurface (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint on 10 consecutive checks over 5001s, rechecked on a long cadence not every 240s; liveness is still read on the short cadence and a dead endpoint escalates at once; confirm what the worker is waiting on)
+recheck throttle written: yes
+next round, immediately after that recheck:
+  -> absorbed, no supervision turn spent
+
+==================================================================
+ PROPERTY 2  an unknown endpoint reading is NOT affirmative; it snaps back
+==================================================================
+pane deep in a backed-off stretch, then the endpoint becomes unreadable
+  -> WAKE, captain sees:
+       | stale: test:fm-ev-unknown (idle 501s, possible wedge, escalation 1)
+affirmative chain after the unknown read: cleared - back on the 240s cadence
+
+==================================================================
+ PROPERTY 3  a pane past the busy-turn bound is NEVER backed off
+==================================================================
+busy pane past FM_BUSY_TURN_MAX_SECS, agent genuinely alive - the same
+reading that backs an idle pane off. This is the 2026-07 hung-call case.
+round 1  WAKE  stale: test:fm-ev-busy (idle 501s, possible wedge, escalation 1)
+round 2  WAKE  stale: test:fm-ev-busy (idle 501s, possible wedge, escalation 2)
+round 3  WAKE  stale: test:fm-ev-busy (idle 501s, possible wedge, escalation 3, demand-deep-inspection: 3 unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)
+round 4  WAKE  stale: test:fm-ev-busy (idle 501s, possible wedge, escalation 4, demand-deep-inspection: 4 unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)
+round 5  WAKE  stale: test:fm-ev-busy (idle 501s, possible wedge, escalation 5, demand-deep-inspection: 5 unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)
+round 6  WAKE  stale: test:fm-ev-busy (idle 500s, possible wedge, escalation 6, demand-deep-inspection: 6 unexplained escalations on this pane - do not re-absorb on the run-step/pane state alone)
+affirmative count accumulated on the busy path: none - the alive reading was refused as evidence

@@ -1,0 +1,37 @@
+### AFTER (target commit 1bfbf32)
+==================================================================
+ away-mode daemon reset: crew declared a pause, then resumed
+ window sess:fm-held-w10-terminal
+==================================================================
+watcher markers on disk BEFORE the daemon sees the terminal signal:
+    .paused-sess_fm-held-w10-terminal
+    .stale-sess_fm-held-w10-terminal
+    .wedge-affirmative-resurfaced-sess_fm-held-w10-terminal
+    .wedge-affirmative-sess_fm-held-w10-terminal
+    .wedge-affirmative-since-sess_fm-held-w10-terminal
+    .wedge-escalations-sess_fm-held-w10-terminal
+
+$ fm-supervise-daemon handle_wake "signal: <state>/held-w10-terminal.status"
+
+watcher markers on disk AFTER:
+    (none - the whole chain, affirmative markers included, was cleared)
+
+### BEFORE (base 4b38db8, without the daemon-side clear)
+==================================================================
+ away-mode daemon reset: crew declared a pause, then resumed
+ window sess:fm-held-w10-terminal
+==================================================================
+watcher markers on disk BEFORE the daemon sees the terminal signal:
+    .paused-sess_fm-held-w10-terminal
+    .stale-sess_fm-held-w10-terminal
+    .wedge-affirmative-resurfaced-sess_fm-held-w10-terminal
+    .wedge-affirmative-sess_fm-held-w10-terminal
+    .wedge-affirmative-since-sess_fm-held-w10-terminal
+    .wedge-escalations-sess_fm-held-w10-terminal
+
+$ fm-supervise-daemon handle_wake "signal: <state>/held-w10-terminal.status"
+
+watcher markers on disk AFTER:
+    ORPHANED: .wedge-affirmative-resurfaced-sess_fm-held-w10-terminal
+    ORPHANED: .wedge-affirmative-sess_fm-held-w10-terminal
+    ORPHANED: .wedge-affirmative-since-sess_fm-held-w10-terminal

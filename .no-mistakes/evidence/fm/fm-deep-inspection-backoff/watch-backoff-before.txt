@@ -1,0 +1,31 @@
+==================================================================
+ fm-watch.sh idle-stale supervision transcript  [BEFORE]
+ pane test:fm-evidence-before
+ pane output frozen, run step still reports working,
+ agent process genuinely alive at the recorded endpoint.
+ one round = one FM_STALE_ESCALATE_SECS (240s) idle window
+==================================================================
+round 1  WAKE      captain interrupted:
+            | stale: test:fm-evidence-before (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+round 2  WAKE      captain interrupted:
+            | stale: test:fm-evidence-before (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+round 3  WAKE      captain interrupted:
+            | stale: test:fm-evidence-before (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+round 4  WAKE      captain interrupted:
+            | stale: test:fm-evidence-before (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+round 5  WAKE      captain interrupted:
+            | stale: test:fm-evidence-before (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+round 6  WAKE      captain interrupted:
+            | stale: test:fm-evidence-before (idle 500s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+round 7  WAKE      captain interrupted:
+            | stale: test:fm-evidence-before (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+round 8  WAKE      captain interrupted:
+            | stale: test:fm-evidence-before (idle 501s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+------------------------------------------------------------------
+supervision turns burned over 8 idle windows (~32 min): 8 of 8
+------------------------------------------------------------------
+
+round 9  the agent process now dies; a bare shell holds the pane
+round 9  WAKE      caught on the very next liveness read:
+            | stale: test:fm-evidence-before (idle 501s, possible wedge, escalation 1, demand-deep-inspection: no agent is alive at the recorded endpoint - inspect now, do not re-absorb on the run-step/pane state alone)
+affirmative chain after the dead read: cleared - pane is back on the 240s cadence with no credit carried over
