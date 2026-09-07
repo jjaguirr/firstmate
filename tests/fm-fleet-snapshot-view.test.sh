@@ -266,12 +266,12 @@ EOF
 # MAX_ARG_STRLEN (131072 bytes) must not make jq exec fail with "Argument list
 # too long" at either --argjson call site (main inventory and the secondmate
 # home summary).
-write_oversized_backlog() {  # <home>
-  local home=$1 title
-  title=$(printf 'x%.0s' $(seq 1 2000))
+write_oversized_backlog() {  # <home> [rows] [title-length]
+  local home=$1 rows=${2:-100} title_len=${3:-2000} title i
+  title=$(printf 'x%.0s' $(seq 1 "$title_len"))
   {
     printf '## Queued\n'
-    for i in $(seq 1 100); do
+    for i in $(seq 1 "$rows"); do
       printf -- '- [ ] big-task-%d - %s (repo: alpha) (kind: ship)\n' "$i" "$title"
     done
     printf '\n## Done\n'
@@ -306,6 +306,52 @@ test_oversized_backlog_survives_argv_limit_secondmate_summary() {
       and .counts.queued == 100
   ' >/dev/null || fail "oversized-backlog secondmate summary missing expected records: $out"
   pass "an oversized backlog crosses the argv limit and the secondmate home summary still succeeds"
+}
+
+# Regression: a per-home secondmate summary is accepted up to
+# FM_SNAPSHOT_SECONDMATE_MAX_BYTES (262144), twice the single-argv
+# MAX_ARG_STRLEN, so an accepted summary in that window must not reach jq
+# through argv on the parent's aggregation path either.
+seed_secondmate_home() {  # <home> <id>
+  local sub=$1 id=$2
+  mkdir -p "$sub/state" "$sub/data" "$sub/config" "$sub/projects" "$sub/bin"
+  printf '%s\n' "$id" > "$sub/.fm-secondmate-home"
+  printf '# Agents\n' > "$sub/AGENTS.md"
+}
+
+test_oversized_secondmate_summary_survives_argv_limit() {
+  local home sub sub_resolved out summary summary_bytes
+  home=$(make_home oversized-secondmate-parent)
+  sub=$TMP_ROOT/oversized-secondmate-child
+  seed_secondmate_home "$sub" big-mate
+  write_oversized_backlog "$sub" 400 110
+  sub_resolved=$(cd "$sub" && pwd -P)
+  printf -- '- big-mate (home: %s; scope: delegated; projects: alpha; added 2026-07-07)\n' \
+    "$sub" > "$home/data/secondmates.md"
+
+  summary=$(FM_HOME="$sub" FM_SNAPSHOT_SECONDMATE_QUEUED=400 "$SNAPSHOT" --secondmate-home-summary 2>&1) \
+    || fail "secondmate home summary fixture must succeed: $summary"
+  summary_bytes=$(printf '%s' "$summary" | LC_ALL=C wc -c | tr -d ' ')
+  [ "$summary_bytes" -gt 131072 ] \
+    || fail "fixture summary must exceed MAX_ARG_STRLEN to exercise the bug, got $summary_bytes bytes"
+  [ "$summary_bytes" -le 262144 ] \
+    || fail "fixture summary must stay within FM_SNAPSHOT_SECONDMATE_MAX_BYTES to be accepted, got $summary_bytes bytes"
+
+  out=$(FM_HOME="$home" FM_SNAPSHOT_SECONDMATE_QUEUED=400 FM_SNAPSHOT_SECONDMATE_TIMEOUT=120 \
+    "$SNAPSHOT" --json 2>&1) \
+    || fail "snapshot must survive a secondmate summary larger than MAX_ARG_STRLEN: $out"
+  printf '%s' "$out" | jq -e --arg home "$sub_resolved" '
+    (.secondmate_current.records | length) == 1
+      and (.secondmate_current.records[0]
+           | .id == "big-mate"
+             and .home == $home
+             and .provenance.selected == "structured-home"
+             and .current.state == "no_active_work"
+             and .counts.queued == 400
+             and (.queued | length) == 400)
+      and (.secondmate_landed.unreadable | length) == 0
+  ' >/dev/null || fail "oversized-secondmate snapshot missing expected aggregation: $out"
+  pass "an oversized secondmate summary crosses the argv limit and the fleet snapshot still succeeds"
 }
 
 test_normalized_roles_and_plural_blocker_readiness() {
@@ -914,6 +960,7 @@ test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure
 test_oversized_backlog_survives_argv_limit_json
 test_oversized_backlog_survives_argv_limit_secondmate_summary
+test_oversized_secondmate_summary_survives_argv_limit
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
