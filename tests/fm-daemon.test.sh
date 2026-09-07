@@ -156,7 +156,7 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
     # override matches, so an alive-endpoint wedge under a paused declaration must
     # still escalate here instead of being absorbed onto the pause cadence.
     [ "$case_name" != alive-paused ] \
-      || reason="stale: $win (idle 500s, possible wedge, escalation 3 unchanged, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)"
+      || reason="stale: $win (idle 500s, possible wedge, escalation 3 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)"
     fm_write_meta "$state/$task.meta" "window=$win" "backend=tmux"
     case "$case_name" in
       working) status_line='working: building' ;;

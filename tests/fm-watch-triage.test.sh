@@ -2325,7 +2325,7 @@ test_wedge_alive_agent_does_not_advance_escalation_count() {
       || fail "round $n stopped reporting an unresolved possible wedge: $(cat "$out")"
     grep -F "agent alive at the recorded endpoint" "$out" >/dev/null \
       || fail "round $n did not carry the affirmative liveness fact: $(cat "$out")"
-    grep -F "possible wedge, escalation 3 unchanged" "$out" >/dev/null \
+    grep -F "possible wedge, escalation 3 unexplained so far" "$out" >/dev/null \
       || fail "round $n dropped the escalation-count grammar the daemon escalates on: $(cat "$out")"
     grep -F "demand-deep-inspection" "$out" >/dev/null \
       && fail "round $n demanded deep inspection for an agent that is demonstrably alive: $(cat "$out")"

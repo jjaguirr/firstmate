@@ -61,11 +61,14 @@
 #                          turn completes). Past that bound, a declared external
 #                          wait or verified captain-held transfer uses the long
 #                          pause recheck cadence; every other pane goes through
-#                          the same wedge timer and surfaces with the identical
+#                          the same wedge timer, which refuses an affirmative
+#                          liveness reading there and so keeps the identical
 #                          "stale: ..." reason, escalation count, and
-#                          demand-deep-inspection marker, for human inspection
-#                          only - never an automatic interrupt, signal, or restart
-#                          of the worker or its tool process.
+#                          demand-deep-inspection marker it always had (only the
+#                          idle-stale path admits that reading - see
+#                          wedge_timer_check), for human inspection only - never
+#                          an automatic interrupt, signal, or restart of the
+#                          worker or its tool process.
 #   check: <script>: <out> authenticated check output, always actionable
 #   check: process-event result captured: <keys>
 #                          a durably captured process-to-event result is queued
@@ -181,9 +184,10 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # spawn record) is this old, busy_turn_over_age routes the pane through
 # busy_turn_bound_check, which hands a crossed bound to the same
 # STALE_ESCALATE_SECS-paced wedge_timer_check used for a provably-working
-# non-busy stale - so it escalates via the existing stale reason, escalation
-# counter, and demand-deep-inspection marker for human inspection only, never an
-# automatic interrupt, signal, or restart - unless the crew declared the wait
+# non-busy stale, refusing an affirmative liveness reading there - so it escalates
+# via the existing stale reason, escalation counter, and demand-deep-inspection
+# marker for human inspection only, never an automatic interrupt, signal, or
+# restart - unless the crew declared the wait
 # itself, which takes the long pause cadence instead. A completed turn touches
 # turn-ended and resets the age. Set generously above any legitimate interval
 # between completed turns, including long tool calls, builds, or test runs.
@@ -451,8 +455,9 @@ wedge_agent_verdict() {  # <window> -> alive|dead|unknown
 #             the marker token itself, which must mean one thing only. It keeps
 #             the "idle <age>s, possible wedge, escalation <n>" token sequence
 #             every other arm emits, because that grammar is the contract the
-#             away-mode daemon force-escalates a stale wake on; only the count it
-#             reports is unchanged rather than advanced. A bounded
+#             away-mode daemon force-escalates a stale wake on; the count it
+#             reports is the stored one, unadvanced, so it reads 0 on a pane whose
+#             every escalation so far has been explained. A bounded
 #             cadence backoff for a pane that keeps reading alive attaches to THIS
 #             arm and owns its own consecutive-affirmative record; it is
 #             deliberately not implemented here.
@@ -500,7 +505,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
             reason="stale: $win (idle ${age}s, possible wedge, escalation $n, demand-deep-inspection: no agent is alive at the recorded endpoint - inspect now, do not re-absorb on the run-step/pane state alone)"
             ;;
           alive)
-            reason="stale: $win (idle ${age}s, possible wedge, escalation $n unchanged, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)"
+            reason="stale: $win (idle ${age}s, possible wedge, escalation $n unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)"
             ;;
           *)
             n=$(( n + 1 ))
