@@ -382,28 +382,33 @@ test_oversized_scout_reports_survive_argv_limit() {
 # and must not survive a real signal death, not just normal exit. Kill a
 # slow-running snapshot with SIGTERM and confirm its temp directory is gone.
 test_sigterm_removes_snapshot_tmpdir() {
-  local home tmproot pid waited before after
+  local home tmproot pid waited before after status i
   home=$(make_home signal-cleanup)
-  write_oversized_backlog "$home" 3000 40
+  write_oversized_backlog "$home" 500 40
+  for i in $(seq 1 200); do
+    mkdir -p "$home/data/slow-scout-$i"
+    printf '# Scout %d\n' "$i" > "$home/data/slow-scout-$i/report.md"
+  done
   tmproot=$(fm_test_tmproot fm-fleet-snapshot-signal) \
     || fail "could not create an isolated TMPDIR for the signal test"
   ( export TMPDIR="$tmproot" FM_HOME="$home"; exec "$SNAPSHOT" --json >/dev/null 2>&1 ) &
   pid=$!
   waited=0
   before=""
-  while [ "$waited" -lt 100 ]; do
+  while [ "$waited" -lt 1200 ]; do
     before=$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)
     [ -n "$before" ] && break
-    sleep 0.1
+    kill -0 "$pid" 2>/dev/null \
+      || fail "snapshot finished before its temp directory was observed; make the fixture slower"
+    sleep 0.05
     waited=$((waited + 1))
   done
-  if [ -z "$before" ]; then
-    kill -TERM "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
-    fail "snapshot never created its temp directory, so the signal trap was never exercised"
-  fi
+  [ -n "$before" ] || fail "snapshot never created its temp directory, so the signal trap was never exercised"
   kill -TERM "$pid"
   wait "$pid" 2>/dev/null
+  status=$?
+  [ "$status" -eq 143 ] \
+    || fail "snapshot must die from the SIGTERM it was sent, got exit status $status"
   after=$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)
   [ -z "$after" ] || fail "SIGTERM left the snapshot temp directory behind: $after"
   pass "SIGTERM during a slow snapshot still removes its private temp directory"
