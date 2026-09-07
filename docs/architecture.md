@@ -62,11 +62,19 @@ The explicit resolution is written by the actor that answers, not the busy worke
 This home's answerer close, pending-reply escalation close, and captain-held transfer use the provenance-guarded append owned by `bin/fm-wake-lib.sh`, so they advance the watcher marker only across their own bytes when all earlier bytes were already announced; pending or interleaved foreign bytes fail toward an ordinary wake.
 A turn-ended-only queue row omits its historical status annotation when that status file exactly matches the same seen marker.
 Any direct or remaining historical annotation prints every status line unread at the presentation cursor instead of replaying only the latest line.
-`bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes a no-mistakes run, active or terminal, only when it matches the crew's branch and its head is not refuted by the crew's current code identity, then keeps that run-step authoritative even if the pane has closed.
-`bin/fm-nm-run-lib.sh`'s header owns the exact run-head rule and its three outcomes, and the script header owns the run-selection rules built on it.
+`bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes a no-mistakes run, active or terminal, only when it matches the crew's branch and the run-selection rules below bind it to the crew's current code identity, then keeps that run-step authoritative even if the pane has closed.
+`bin/fm-nm-run-lib.sh`'s header owns the exact run-head rule and its four outcomes, and the script header owns the run-selection rules built on it.
 One branch can hold several runs, so the newest attributable run owns it, and a run head this local copy does not have yet is never read as a mismatch that would let an older dead run be claimed instead.
 A detailed record for the crew's own branch is trusted on such a head exactly as a resolvable head would trust it, keeping its real state and its full step and gate detail, so a parked run still reads parked and a passed run still reads done.
-The one verdict withheld there is a terminal failure, which resolves to working only when the newest attributable row is itself running.
+The one verdict withheld there is a terminal failure, which is released only when the run row that owns the branch did not itself fail.
+A running row resolves it to working and a completed one to done, while a failed or cancelled row never licenses reporting a terminal failure and leaves that verdict corroborated or unknown.
+A rewritten head is likewise no proof that the run belongs to another worktree, because a pipeline that rebases and pushes its own fix commits leaves exactly that shape on the crew's own branch and no row matches the local head again afterwards.
+So the newest same-branch row in the coarse listing is attributed on branch identity alone when its head is diverged from the local head rather than merely behind it, but only when its status word is running or a success.
+Branch identity after a rewrite is not proof, so it never licenses the one verdict recovery acts on: a failed or cancelled word at a diverged head stays history and is reported only where something corroborates it.
+The coarse scan takes that newest diverged row when it has one, otherwise the newest head-proof row.
+A diverged row that is not the newest same-branch row is history that a later run superseded and is still skipped, so a live row below a newer terminal row is never resurrected.
+A run head that is only an ancestor of the local head is a different fact, because the crew committed past that run, so such a row carries no verdict and a crew working on top of its own failed run never reads failed.
+A coarse working verdict may not mark an open needs-decision or blocked status line superseded, because a coarse row cannot tell a run parked at a gate from a working one, so it leaves the crew's open decision visible instead; a coarse terminal verdict supersedes as a detailed one does.
 Where nothing can decide which run owns the branch, the verdict is an explicit unknown, and a head this copy cannot read never reports failed.
 During no-mistakes' `ci` monitor phase, it also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
 The most recent recognized ci log marker wins, so checks-green monitoring reports done while a later re-arm, failed-check, or issue marker returns the crew to working.

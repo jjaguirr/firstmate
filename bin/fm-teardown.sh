@@ -1218,11 +1218,11 @@ task_status_is_own_parked_run() {  # <worktree> <axi-status-output>
   run_branch=$(fm_nm_strip_quotes "$(fm_nm_field "$out" branch)")
   [ -n "$run_branch" ] && [ "$run_branch" = "$branch" ] || return 1
   run_head=$(fm_nm_strip_quotes "$(fm_nm_field "$out" head)")
-  # Boolean on purpose: aborting a run is destructive, so this refuses on BOTH
-  # non-match outcomes, including a head this copy cannot read. Unlike
-  # bin/fm-crew-state.sh, which must report a state and therefore distinguishes
-  # undecidable from refuted, there is nothing to gain here from acting on a
-  # head that cannot be verified.
+  # Boolean on purpose: aborting a run is destructive, so this refuses on ALL
+  # THREE non-match outcomes - a head behind this worktree, a rewritten one, and
+  # a head this copy cannot read. Unlike bin/fm-crew-state.sh, which must report
+  # a state and therefore tells those three apart, there is nothing to gain here
+  # from acting on a head that cannot be verified.
   fm_nm_head_matches_worktree "$wt" "$run_head" || return 1
   outcome=$(fm_nm_strip_quotes "$(fm_nm_field "$out" outcome)")
   [ -z "$outcome" ] || return 1

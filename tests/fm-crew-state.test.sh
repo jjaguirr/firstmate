@@ -1758,17 +1758,341 @@ EOF
   pass "a provably rewritten row is skipped, not read as undecidable"
 }
 
+# A branch whose local head is the DEAD run's head, with the LIVE run's head on
+# a rebased sibling history: resolvable in this copy, and neither an ancestor
+# nor a descendant of the local head. That is what a pipeline that rebases and
+# pushes its own fix commits leaves behind on the branch this crew owns, and it
+# is deliberately the opposite shape to the `absent` fixture above - here every
+# commit is readable, so the head predicate REFUTES rather than abstains. Sets
+# REBASED_LOCAL_HEAD and REBASED_LIVE_HEAD.
+#
+# Call this as a plain command, never in a command substitution: the guards
+# below must be able to end the run, which they cannot do from a subshell.
+make_rebased_live_head_repo() {  # <dir> <branch>
+  local dir=$1 branch=$2 base local_head live_head
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" commit -q --allow-empty -m init
+  base=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" checkout -q -b "$branch"
+  git -C "$dir" commit -q --allow-empty -m 'crew work the earlier run validated'
+  local_head=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" checkout -q -b tmp-rebased "$base"
+  git -C "$dir" commit -q --allow-empty -m 'no-mistakes(document): rebased pipeline commit'
+  live_head=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" checkout -q "$branch"
+  git -C "$dir" rev-parse --verify -q "${live_head}^{commit}" >/dev/null \
+    || fail "fixture live head must stay resolvable, or it tests UNRESOLVED instead"
+  ! git -C "$dir" merge-base --is-ancestor "$live_head" "$local_head" 2>/dev/null \
+    || fail "fixture live head is an ancestor, not a rewrite"
+  ! git -C "$dir" merge-base --is-ancestor "$local_head" "$live_head" 2>/dev/null \
+    || fail "fixture live head is a descendant, not a rewrite"
+  REBASED_LOCAL_HEAD=$local_head
+  REBASED_LIVE_HEAD=$live_head
+}
+
+# The 2026-09-07 report: the pipeline rebased the branch, so the live parked
+# run's head is provably not this worktree's code, the detailed record is
+# refused, and the coarse scan then walks past the branch's own live row to the
+# terminal row underneath it - which sits at exactly the local head, matches by
+# equality, and reports the healthy worker as FAILED.
+test_live_rebased_row_beats_older_terminal_row_at_local_head() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-live-row)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased.meta" "window=fm:fm-rebased" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'needs-decision: ci gate\n' > "$d/state/rebased.status"
+  # The CLI answers with this branch's live parked run, on the rebased head.
+  FM_FAKE_RUN_HEAD="$live_head"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-rebased)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-rebased $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased)
+  assert_not_contains "$out" "state: failed" "a rebased branch's live row must stop the terminal row underneath it"
+  assert_contains "$out" "state: working" "the branch's live row owns it after the rewrite"
+  assert_contains "$out" "source: run-step" "the live row resolution stays run-step sourced"
+  assert_not_contains "$out" "superseded" "a coarse row cannot prove the gate resolved, so it must not bury the decision"
+  assert_contains "$out" "ci gate" "the crew's open decision stays visible behind a coarse verdict"
+  pass "a live rebased row beats the older terminal row at the local head"
+}
+
+# The same skip reached through a terminal word: the newest same-branch row is
+# `completed` on the rebased head, and the row underneath it is the branch's own
+# older failure sitting at exactly the local head. Attribution by equality alone
+# reported that dead row's `failed` over a run that actually completed.
+test_rebased_completed_row_beats_older_terminal_row_at_local_head() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-completed-row)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-done
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-done.meta" "window=fm:fm-rebased-done" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$live_head"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-rebased-done)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  completed  fm/feat-rebased-done $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased-done $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased-done)
+  assert_not_contains "$out" "state: failed" "the branch's own dead history must not outrank its newest row"
+  assert_contains "$out" "state: done" "the newest same-branch row owns the branch after the rewrite"
+  assert_contains "$out" "source: run-step" "the completed row resolution stays run-step sourced"
+  pass "a completed rebased row beats the older terminal row at the local head"
+}
+
+# The same rewrite reached through the terminal-failure corroboration path: the
+# detailed record is attributable by equality with the local head and reports a
+# failure, and the branch's live owner is the rebased row above it.
+test_live_rebased_row_overrides_a_dead_attributable_record() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-live-overrides)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-override
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-ovr.meta" "window=fm:fm-rebased-ovr" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$local_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-rebased-override)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-rebased-override $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased-override $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased-ovr)
+  assert_not_contains "$out" "state: failed" "a live rebased row must stop the dead record's failed verdict"
+  assert_contains "$out" "state: working" "the live rebased row overrides the dead record"
+  pass "a live rebased row overrides a dead but attributable record"
+}
+
+# The corroboration gate releases the withheld failure on SUCCESS as well as on
+# liveness: the dead record sits at the local head and reports failed, while the
+# branch's newest row completed on the rebased head. Reporting the dead run's
+# failure there would contradict the same listing read through the other path.
+test_completed_rebased_row_overrides_a_dead_attributable_record() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-done-overrides)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-done-ovr
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-done-ovr.meta" "window=fm:fm-rebased-done-ovr" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$local_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-rebased-done-ovr)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  completed  fm/feat-rebased-done-ovr $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased-done-ovr $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased-done-ovr)
+  assert_not_contains "$out" "state: failed" "a completed newest row must stop the dead record's failed verdict"
+  assert_contains "$out" "state: done" "the completed rebased row overrides the dead record"
+  pass "a completed rebased row overrides a dead but attributable record"
+}
+
+# The boundary the widened gate must not cross: a coarse CANCELLED word on a
+# rewritten head is itself terminal, so it cannot corroborate anything and must
+# not release the withheld failure. The real failure below it still stands.
+test_cancelled_rebased_row_does_not_release_a_real_failure() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-cancelled)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-cancelled
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-cancelled.meta" "window=fm:fm-rebased-cancelled" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$local_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-rebased-cancelled)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  cancelled  fm/feat-rebased-cancelled $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased-cancelled $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased-cancelled)
+  assert_not_contains "$out" "state: working" "a terminal coarse word must not be read as liveness"
+  assert_not_contains "$out" "state: done" "a cancelled row must not be read as success"
+  assert_contains "$out" "state: failed" "the corroborated failure is still reported"
+  pass "a cancelled rebased row does not release a real failure"
+}
+
+# The other direction, which the liveness rule must not erode: a rewritten head
+# still carries no verdict of its own, so a genuinely dead branch whose newest
+# row is terminal on a rewritten head still reports the real failure below it
+# rather than being talked into working.
+test_rebased_terminal_row_does_not_hide_a_real_failure() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-terminal-row)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-dead
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-dead.meta" "window=fm:fm-rebased-dead" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$local_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-rebased-dead)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-rebased-dead $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased-dead $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased-dead)
+  assert_contains "$out" "state: failed" "a dead run must still be reported as failed"
+  assert_contains "$out" "source: run-step" "the confirmed failure stays run-step sourced"
+  pass "a terminal row on a rewritten head does not hide a real failure"
+}
+
+# The rewrite rule is scoped to the branch's NEWEST row, the only one the
+# newest-owns-the-branch rule can call its current owner. A live row sitting
+# BELOW a newer terminal row is history that a later run already superseded, so
+# it must not be resurrected into a cheerful working verdict: the newest row's
+# own word is what gets reported.
+test_live_row_below_a_newer_terminal_row_is_not_claimed() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-live-below)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-below
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-below.meta" "window=fm:fm-rebased-below" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'blocked: waiting on a credential\n' > "$d/state/rebased-below.status"
+  # Nothing attributes: the CLI answered about another crew's branch.
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-rebased-below $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  running    fm/feat-rebased-below $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-05 06:01
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" rebased-below
+  out=$(run_crew_state "$d" rebased-below)
+  assert_not_contains "$out" "source: run-step" "a superseded live row must not be attributed"
+  assert_not_contains "$out" "state: working" "a superseded live row must not report working"
+  assert_contains "$out" "state: blocked" "the crew's own current state is still read"
+  pass "a live row below a newer terminal row is not claimed"
+}
+
+# The boundary the diverged acceptance must never cross, on the path where
+# nothing corroborates: `axi status` answers about another crew, so the coarse
+# scan alone decides, and the branch's newest row is a terminal word on a
+# rewritten head. Branch identity after a rewrite is not proof, so it cannot
+# manufacture the one verdict recovery acts on - a crew reworking on top of its
+# own rebased failure must not read failed.
+test_diverged_terminal_row_alone_never_reports_failed() {
+  reset_fakes
+  local d live_head out
+  d=$(new_case diverged-terminal-alone)
+  make_rebased_live_head_repo "$d/wt" fm/feat-diverged-terminal
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/div-term.meta" "window=fm:fm-div-term" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: reworking after the rebased run failed\n' > "$d/state/div-term.status"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-diverged-terminal $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" div-term
+  out=$(run_crew_state "$d" div-term)
+  assert_not_contains "$out" "state: failed" "an uncorroborated terminal word at a rewritten head must not report failed"
+  assert_not_contains "$out" "source: run-step" "a terminal word at a rewritten head carries no verdict"
+  assert_contains "$out" "state: working" "the crew's own current state is read instead"
+  pass "a diverged terminal row alone never reports failed"
+}
+
+# Newest-owns-the-branch is scoped to the newest same-branch row whatever that
+# row's outcome, not just a newer DIVERGED one. A row refuted as behind this
+# worktree still owns the branch as its newest row, so an older diverged row
+# below it is history: claiming it reports a crew whose newest run is running as
+# FAILED, the same harm through a lower row.
+test_diverged_row_below_a_behind_row_is_not_claimed() {
+  reset_fakes
+  local d behind live_head out
+  d=$(new_case diverged-below-behind)
+  make_rebased_live_head_repo "$d/wt" fm/feat-diverged-below
+  live_head=$REBASED_LIVE_HEAD
+  behind=$(git -C "$d/wt" rev-parse HEAD~1)
+  git -C "$d/wt" merge-base --is-ancestor "$behind" HEAD \
+    || fail "fixture behind head must be a strict ancestor of the worktree head"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/div-below.meta" "window=fm:fm-div-below" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: stage 2 after committing past the run\n' > "$d/state/div-below.status"
+  # Nothing attributes from the detailed record: the CLI answered about another
+  # crew's branch, so only the coarse scan decides.
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-diverged-below $(git -C "$d/wt" rev-parse --short=8 "$behind")  2026-09-07 02:02
+  failed     fm/feat-diverged-below $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-05 06:01
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" div-below
+  out=$(run_crew_state "$d" div-below)
+  assert_not_contains "$out" "state: failed" "a diverged row below a newer row must not carry the verdict"
+  assert_not_contains "$out" "source: run-step" "no row owns the branch once the newest one is refused"
+  assert_contains "$out" "state: working" "the crew's own current state is read instead"
+  pass "a diverged row below a behind-us row is not claimed"
+}
+
+# The rewrite acceptance must not swallow the OTHER refutation it used to share
+# an exit status with: a run head that is a strict ancestor of the worktree head
+# is a run this crew committed past, not a rebase, and attributing it reports a
+# healthy working crew as FAILED - the same harm, through the opposite fact.
+test_crew_committed_past_its_failed_run_is_not_claimed() {
+  reset_fakes
+  local d run_head out
+  d=$(new_case committed-past-failed)
+  make_repo_on_branch "$d/wt" fm/feat-past-failed
+  run_head=$(git -C "$d/wt" rev-parse HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/past-failed.meta" "window=fm:fm-past-failed" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: reworking the change the run rejected\n' > "$d/state/past-failed.status"
+  # The crew committed its fix on top of the run that failed, so that run's head
+  # is now a strict ancestor of the worktree head.
+  git -C "$d/wt" commit -q --allow-empty -m 'crew fix on top of the failed run'
+  git -C "$d/wt" merge-base --is-ancestor "$run_head" HEAD \
+    || fail "fixture run head must be a strict ancestor of the worktree head"
+  FM_FAKE_RUN_HEAD="$run_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-past-failed)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-past-failed $(git -C "$d/wt" rev-parse --short=8 "$run_head")  2026-09-07 02:02
+EOF
+)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" past-failed
+  out=$(run_crew_state "$d" past-failed)
+  assert_not_contains "$out" "state: failed" "a run the crew committed past must not be attributed"
+  assert_not_contains "$out" "source: run-step" "a head merely behind the worktree carries no verdict"
+  assert_contains "$out" "state: working" "the crew's own current state is read instead"
+  pass "a crew that committed past its failed run is not claimed"
+}
+
 # --- the shared predicate itself (bin/fm-nm-run-lib.sh) ---------------------
 #
-# Three outcomes, not two: attributable, provably not ours, undecidable. The
-# incident above is what happens when the third collapses into the second.
+# Four outcomes, not two: attributable, behind us, rewritten, undecidable. Each
+# collapse cost an incident above - undecidable read as a refutation reported a
+# live parked run as the dead one below it, and a rewrite read as the crew
+# committing past its run reported a rebased branch's live owner as failed.
 head_match_rc() {  # <worktree> <run-head> -> echoes the exit status
   local rc=0
   fm_nm_head_matches_worktree "$1" "$2" || rc=$?
   printf '%s' "$rc"
 }
 
-test_head_predicate_reports_three_outcomes() {
+test_head_predicate_reports_four_outcomes() {
   local d live_head advanced rewritten rc
   d="$TMP_ROOT/head-predicate"
   mkdir -p "$d"
@@ -1790,17 +2114,23 @@ test_head_predicate_reports_three_outcomes() {
   rc=$(head_match_rc "$d" "$advanced")
   [ "$rc" = "$FM_NM_HEAD_MATCH" ] || fail "a descendant run head must attribute (got $rc)"
 
-  # Local work advanced past the run head: provably not this run's code.
+  # Local work advanced past the run head: provably not this run's code, and the
+  # crew moved on from it under its own steam.
   git -C "$d" commit -q --allow-empty -m 'local work after the run'
   rc=$(head_match_rc "$d" "$live_head")
   [ "$rc" = "$FM_NM_HEAD_MISMATCH" ] || fail "local work past the run head must refute (got $rc)"
 
-  # A rewritten (diverged) tip: also provably not ours.
+  # A rewritten (diverged) tip: also provably not ours, but a DIFFERENT fact -
+  # this is what a pipeline rebase leaves on the branch the crew owns.
   git -C "$d" checkout -q --orphan tmp-predicate-rewrite
   git -C "$d" commit -q --allow-empty -m 'rewritten tip'
   rewritten=$(git -C "$d" rev-parse HEAD)
   rc=$(head_match_rc "$d" "$live_head")
-  [ "$rc" = "$FM_NM_HEAD_MISMATCH" ] || fail "a diverged head must refute (got $rc)"
+  [ "$rc" = "$FM_NM_HEAD_DIVERGED" ] || fail "a diverged head must be its own outcome (got $rc)"
+  [ "$FM_NM_HEAD_DIVERGED" != "$FM_NM_HEAD_MISMATCH" ] \
+    || fail "a rewrite and a run the crew committed past must not share an outcome"
+  [ "$FM_NM_HEAD_DIVERGED" != "$FM_NM_HEAD_MATCH" ] \
+    || fail "a diverged head must still refuse a proof-only caller"
   [ -n "$rewritten" ] || fail "rewrite fixture produced no head"
 
   # No head recorded at all: nothing to bind, so a refusal, not a maybe.
@@ -1811,7 +2141,7 @@ test_head_predicate_reports_three_outcomes() {
   rc=$(head_match_rc "$d" 0123456789abcdef0123456789abcdef01234567)
   [ "$rc" = "$FM_NM_HEAD_UNRESOLVED" ] \
     || fail "an unresolvable run head must be its own outcome, not a mismatch (got $rc)"
-  pass "the shared head predicate separates undecidable from provably-not-ours"
+  pass "the shared head predicate reports four distinct outcomes"
 }
 
 test_active_run_is_authoritative
@@ -1878,6 +2208,16 @@ test_diverged_head_on_own_branch_is_still_refused
 test_unresolvable_row_stops_terminal_failure_confirmation
 test_genuinely_latest_failed_run_stays_failed
 test_rewritten_row_is_skipped_not_treated_as_undecidable
-test_head_predicate_reports_three_outcomes
+test_live_rebased_row_beats_older_terminal_row_at_local_head
+test_rebased_completed_row_beats_older_terminal_row_at_local_head
+test_live_rebased_row_overrides_a_dead_attributable_record
+test_completed_rebased_row_overrides_a_dead_attributable_record
+test_cancelled_rebased_row_does_not_release_a_real_failure
+test_rebased_terminal_row_does_not_hide_a_real_failure
+test_live_row_below_a_newer_terminal_row_is_not_claimed
+test_diverged_terminal_row_alone_never_reports_failed
+test_diverged_row_below_a_behind_row_is_not_claimed
+test_crew_committed_past_its_failed_run_is_not_claimed
+test_head_predicate_reports_four_outcomes
 
 echo "all fm-crew-state tests passed"
