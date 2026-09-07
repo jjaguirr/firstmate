@@ -262,6 +262,178 @@ EOF
   pass "main_inventory discloses orphan/unstructured and clears when inventory is consistent"
 }
 
+# Regression: a backlog large enough that its JSON crosses Linux's single-argv
+# MAX_ARG_STRLEN (131072 bytes) must not make jq exec fail with "Argument list
+# too long" at either --argjson call site (main inventory and the secondmate
+# home summary).
+write_oversized_backlog() {  # <home> [rows] [title-length]
+  local home=$1 rows=${2:-100} title_len=${3:-2000} title i
+  title=$(printf 'x%.0s' $(seq 1 "$title_len"))
+  {
+    printf '## Queued\n'
+    for i in $(seq 1 "$rows"); do
+      printf -- '- [ ] big-task-%d - %s (repo: alpha) (kind: ship)\n' "$i" "$title"
+    done
+    printf '\n## Done\n'
+  } > "$home/data/backlog.md"
+}
+
+test_oversized_backlog_survives_argv_limit_json() {
+  local home out backlog_bytes
+  home=$(make_home oversized-backlog-json)
+  write_oversized_backlog "$home"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json 2>&1) \
+    || fail "snapshot must survive a backlog JSON larger than MAX_ARG_STRLEN: $out"
+  backlog_bytes=$(printf '%s' "$out" | jq -c '.backlog' | LC_ALL=C wc -c | tr -d ' ')
+  [ "$backlog_bytes" -gt 131072 ] \
+    || fail "fixture backlog JSON must exceed MAX_ARG_STRLEN to exercise the bug, got $backlog_bytes bytes"
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-fleet-snapshot.v1"
+      and .main_inventory.valid == true
+      and ([.backlog.records[] | select(.state == "queued")] | length) == 100
+  ' >/dev/null || fail "oversized-backlog snapshot missing expected records: $out"
+  pass "an oversized backlog crosses the argv limit and the JSON snapshot still succeeds"
+}
+
+test_oversized_backlog_survives_argv_limit_secondmate_summary() {
+  local home out
+  home=$(make_home oversized-backlog-summary)
+  write_oversized_backlog "$home"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --secondmate-home-summary 2>&1) \
+    || fail "secondmate home summary must survive a backlog JSON larger than MAX_ARG_STRLEN: $out"
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-secondmate-home-summary.v1"
+      and .counts.queued == 100
+  ' >/dev/null || fail "oversized-backlog secondmate summary missing expected records: $out"
+  pass "an oversized backlog crosses the argv limit and the secondmate home summary still succeeds"
+}
+
+# Regression: a per-home secondmate summary is accepted up to
+# FM_SNAPSHOT_SECONDMATE_MAX_BYTES (262144), twice the single-argv
+# MAX_ARG_STRLEN, so an accepted summary in that window must not reach jq
+# through argv on the parent's aggregation path either.
+seed_secondmate_home() {  # <home> <id>
+  local sub=$1 id=$2
+  mkdir -p "$sub/state" "$sub/data" "$sub/config" "$sub/projects" "$sub/bin"
+  printf '%s\n' "$id" > "$sub/.fm-secondmate-home"
+  printf '# Agents\n' > "$sub/AGENTS.md"
+}
+
+test_oversized_secondmate_summary_survives_argv_limit() {
+  local home sub sub_resolved out summary summary_bytes
+  home=$(make_home oversized-secondmate-parent)
+  sub=$TMP_ROOT/oversized-secondmate-child
+  seed_secondmate_home "$sub" big-mate
+  write_oversized_backlog "$sub" 400 110
+  sub_resolved=$(cd "$sub" && pwd -P)
+  printf -- '- big-mate (home: %s; scope: delegated; projects: alpha; added 2026-07-07)\n' \
+    "$sub" > "$home/data/secondmates.md"
+
+  summary=$(FM_HOME="$sub" FM_SNAPSHOT_SECONDMATE_QUEUED=400 "$SNAPSHOT" --secondmate-home-summary 2>&1) \
+    || fail "secondmate home summary fixture must succeed: $summary"
+  summary_bytes=$(printf '%s' "$summary" | LC_ALL=C wc -c | tr -d ' ')
+  [ "$summary_bytes" -gt 131072 ] \
+    || fail "fixture summary must exceed MAX_ARG_STRLEN to exercise the bug, got $summary_bytes bytes"
+  [ "$summary_bytes" -le 262144 ] \
+    || fail "fixture summary must stay within FM_SNAPSHOT_SECONDMATE_MAX_BYTES to be accepted, got $summary_bytes bytes"
+
+  out=$(FM_HOME="$home" FM_SNAPSHOT_SECONDMATE_QUEUED=400 FM_SNAPSHOT_SECONDMATE_TIMEOUT=120 \
+    "$SNAPSHOT" --json 2>&1) \
+    || fail "snapshot must survive a secondmate summary larger than MAX_ARG_STRLEN: $out"
+  printf '%s' "$out" | jq -e --arg home "$sub_resolved" '
+    (.secondmate_current.records | length) == 1
+      and (.secondmate_current.records[0]
+           | .id == "big-mate"
+             and .home == $home
+             and .provenance.selected == "structured-home"
+             and .current.state == "no_active_work"
+             and .counts.queued == 400
+             and (.queued | length) == 400)
+      and (.secondmate_landed.unreadable | length) == 0
+  ' >/dev/null || fail "oversized-secondmate snapshot missing expected aggregation: $out"
+  pass "an oversized secondmate summary crosses the argv limit and the fleet snapshot still succeeds"
+}
+
+# Regression: scout reports are never pruned, so a long-lived home accumulates
+# them without bound until their {id,path} list crosses MAX_ARG_STRLEN and the
+# final combined --json jq can no longer take them through argv.
+test_oversized_scout_reports_survive_argv_limit() {
+  local home out reports_bytes pad i
+  home=$(make_home oversized-scout-reports)
+  pad=$(printf 'r%.0s' $(seq 1 200))
+  for i in $(seq 1 300); do
+    mkdir -p "$home/data/scout-report-$i-$pad"
+    printf '# Scout %d\n' "$i" > "$home/data/scout-report-$i-$pad/report.md"
+  done
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json 2>&1) \
+    || fail "snapshot must survive a scout report list larger than MAX_ARG_STRLEN: $out"
+  reports_bytes=$(printf '%s' "$out" | jq '.scout_reports | map(del(.kind))' | LC_ALL=C wc -c | tr -d ' ')
+  [ "$reports_bytes" -gt 131072 ] \
+    || fail "fixture scout report list must exceed MAX_ARG_STRLEN to exercise the bug, got $reports_bytes bytes"
+  printf '%s' "$out" | jq -e '
+    (.scout_reports | length) == 300
+      and (.scout_reports[0].id | startswith("scout-report-"))
+      and all(.scout_reports[]; .kind == "scout")
+  ' >/dev/null || fail "oversized scout report snapshot missing expected pointers: $out"
+  pass "an oversized scout report list crosses the argv limit and the JSON snapshot still succeeds"
+}
+
+# Regression: SNAPSHOT_TMPDIR holds backlog/task JSON (task titles, PR URLs)
+# and must not survive a real signal death, not just normal exit. Kill a
+# slow-running snapshot with a real signal and confirm it died from that signal
+# and left no temp directory behind.
+#
+# SIGINT is checked alongside SIGTERM because Ctrl-C through
+# bin/fm-fleet-view.sh, which runs the snapshot in the foreground, is the
+# ordinary way a real run is interrupted.
+signal_kills_snapshot_and_removes_tmpdir() {  # <signal> <expected-status>
+  local sig=$1 expected=$2 home tmproot pid waited before after status i
+  home=$(make_home "signal-cleanup-$sig")
+  write_oversized_backlog "$home" 500 40
+  for i in $(seq 1 200); do
+    mkdir -p "$home/data/slow-scout-$i"
+    printf '# Scout %d\n' "$i" > "$home/data/slow-scout-$i/report.md"
+  done
+  tmproot=$(fm_test_tmproot "fm-fleet-snapshot-signal-$sig") \
+    || fail "could not create an isolated TMPDIR for the signal test"
+  # A background command started by a shell without job control inherits
+  # SIGINT/SIGQUIT set to SIG_IGN, and a Bash that starts with a signal already
+  # ignored refuses to trap it (Bash 3.2 keeps that POSIX rule, so the snapshot
+  # ignored SIGINT and exited 0 there). That disposition is an artifact of the
+  # harness, not of the interactive Ctrl-C path being tested, so reset the two
+  # signals to their default disposition before exec'ing the snapshot.
+  TMPDIR="$tmproot" FM_HOME="$home" perl -e '
+    $SIG{INT} = "DEFAULT";
+    $SIG{QUIT} = "DEFAULT";
+    exec @ARGV or die "exec failed: $!";
+  ' "$SNAPSHOT" --json >/dev/null 2>&1 &
+  pid=$!
+  waited=0
+  before=""
+  while [ "$waited" -lt 1200 ]; do
+    before=$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)
+    [ -n "$before" ] && break
+    kill -0 "$pid" 2>/dev/null \
+      || fail "snapshot finished before its temp directory was observed; make the fixture slower"
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  [ -n "$before" ] || fail "snapshot never created its temp directory, so the signal trap was never exercised"
+  kill -"$sig" "$pid"
+  wait "$pid" 2>/dev/null
+  status=$?
+  [ "$status" -eq "$expected" ] \
+    || fail "snapshot must die from the SIG$sig it was sent (expected $expected), got exit status $status"
+  after=$(find "$tmproot" -maxdepth 1 -name 'fm-fleet-snapshot.*' 2>/dev/null)
+  [ -z "$after" ] || fail "SIG$sig left the snapshot temp directory behind: $after"
+}
+
+test_signal_removes_snapshot_tmpdir() {
+  signal_kills_snapshot_and_removes_tmpdir TERM 143
+  signal_kills_snapshot_and_removes_tmpdir INT 130
+  pass "SIGTERM and SIGINT during a slow snapshot kill it and remove its private temp directory"
+}
+
 test_normalized_roles_and_plural_blocker_readiness() {
   local home fakebin out
   home=$(make_home normalized-records)
@@ -866,6 +1038,11 @@ test_parked_scout_decision_stays_pending() {
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure
+test_oversized_backlog_survives_argv_limit_json
+test_oversized_backlog_survives_argv_limit_secondmate_summary
+test_oversized_secondmate_summary_survives_argv_limit
+test_oversized_scout_reports_survive_argv_limit
+test_signal_removes_snapshot_tmpdir
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
