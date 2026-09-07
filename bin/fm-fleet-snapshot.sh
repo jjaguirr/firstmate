@@ -78,15 +78,11 @@ set -u
 # accumulated secondmate record lines, and the combined secondmate_current
 # and secondmate_landed objects. The directory holds task titles and PR
 # URLs, so it is removed on normal exit and on SIGINT/SIGTERM/SIGHUP alike.
-# The signal traps also decide whether an interrupt stops this script at all:
-# with an EXIT-only trap a non-interactive bash defers a SIGINT it receives
-# while waiting on a foreground jq and then discards it, so the snapshot ran
-# to completion with status 0 instead of stopping - and Ctrl-C is the
-# ordinary way this script is interrupted, because bin/fm-fleet-view.sh
-# shells out to it in the foreground. Each handler restores the signal's
-# default disposition and re-raises it after cleanup, so callers still see a
-# real signal death (130 for INT, 143 for TERM) rather than a status this
-# script invented.
+# Ctrl-C is the ordinary way this script is interrupted, because
+# bin/fm-fleet-view.sh shells out to it in the foreground. Each handler
+# restores the signal's default disposition and re-raises it after cleanup, so
+# callers still see a real signal death (130 for INT, 143 for TERM) rather than
+# a status this script invented.
 SNAPSHOT_TMPDIR=""
 cleanup_snapshot_tmpdir() {
   [ -n "$SNAPSHOT_TMPDIR" ] && rm -rf "$SNAPSHOT_TMPDIR"

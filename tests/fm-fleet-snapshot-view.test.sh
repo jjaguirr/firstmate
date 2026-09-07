@@ -383,11 +383,9 @@ test_oversized_scout_reports_survive_argv_limit() {
 # slow-running snapshot with a real signal and confirm it died from that signal
 # and left no temp directory behind.
 #
-# SIGINT is checked alongside SIGTERM because it is the discriminating case: an
-# EXIT-only trap still cleans up on SIGTERM on Linux (bash defers the fatal
-# signal until the foreground jq it is waiting on exits, then runs the EXIT
-# trap), but it swallows SIGINT entirely and the snapshot runs to completion
-# with status 0 - so Ctrl-C through bin/fm-fleet-view.sh never stopped it.
+# SIGINT is checked alongside SIGTERM because Ctrl-C through
+# bin/fm-fleet-view.sh, which runs the snapshot in the foreground, is the
+# ordinary way a real run is interrupted.
 signal_kills_snapshot_and_removes_tmpdir() {  # <signal> <expected-status>
   local sig=$1 expected=$2 home tmproot pid waited before after status i
   home=$(make_home "signal-cleanup-$sig")
@@ -398,7 +396,17 @@ signal_kills_snapshot_and_removes_tmpdir() {  # <signal> <expected-status>
   done
   tmproot=$(fm_test_tmproot "fm-fleet-snapshot-signal-$sig") \
     || fail "could not create an isolated TMPDIR for the signal test"
-  ( export TMPDIR="$tmproot" FM_HOME="$home"; exec "$SNAPSHOT" --json >/dev/null 2>&1 ) &
+  # A background command started by a shell without job control inherits
+  # SIGINT/SIGQUIT set to SIG_IGN, and a Bash that starts with a signal already
+  # ignored refuses to trap it (Bash 3.2 keeps that POSIX rule, so the snapshot
+  # ignored SIGINT and exited 0 there). That disposition is an artifact of the
+  # harness, not of the interactive Ctrl-C path being tested, so reset the two
+  # signals to their default disposition before exec'ing the snapshot.
+  TMPDIR="$tmproot" FM_HOME="$home" perl -e '
+    $SIG{INT} = "DEFAULT";
+    $SIG{QUIT} = "DEFAULT";
+    exec @ARGV or die "exec failed: $!";
+  ' "$SNAPSHOT" --json >/dev/null 2>&1 &
   pid=$!
   waited=0
   before=""
