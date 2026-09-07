@@ -31,10 +31,43 @@
 #      active or terminal (from `axi status`, or the coarse `no-mistakes runs`
 #      fallback)? Branch name alone is not enough: a historical run on a reused
 #      branch whose head was rewritten or diverged must not be attributed.
-#      A run matches when its head equals the worktree HEAD, or the worktree HEAD
-#      is an ancestor of the run head (pipeline fix commits advanced the run on
-#      the same line of history). Local work that advanced past the run head, or
-#      diverged from it, invalidates attribution.
+#      bin/fm-nm-run-lib.sh's fm_nm_head_matches_worktree owns that rule and its
+#      three outcomes (attributable / provably not ours / undecidable); the two
+#      selection rules built on top of it live here:
+#        - One branch can hold several runs, so the newest ATTRIBUTABLE run owns
+#          it. A dead run parked at the stale local head matches by equality
+#          exactly as well as the live run above it matches by ancestry, so a
+#          detailed terminal-failure record is confirmed against the newest
+#          attributable row before it is reported: a live run wins over a dead
+#          one whenever both are attributable. Nothing else about the detailed
+#          record is second-guessed, so step and gate detail is never lost.
+#        - An undecidable head is NOT a mismatch and is never silently skipped.
+#          Its routine cause is benign - the pipeline pushes its own fix commits
+#          from its own copy of the branch, so until the crew syncs, the run tip
+#          is simply not an object this worktree has - but from here it is
+#          indistinguishable from a foreign rewrite. Reading it as "does not
+#          match" is what let a live parked run be reported as the FAILED run
+#          underneath it (2026-09-06), which invites recovery against a healthy
+#          worker holding an open decision. So the scan never claims an older
+#          row past it, and what it reports depends on how much the undecidable
+#          head actually puts in doubt:
+#            * A detailed record naming THIS branch is trusted exactly as a
+#              resolvable head would trust it, keeping its own state and its
+#              full step and gate detail: the run it reports IS this branch's
+#              run, and an unread pushed tip is no reason to discard it. A
+#              healthy worker parked at a gate still reads parked, and a run
+#              that passed still reads done.
+#            * The ONE verdict still withheld is the same one withheld above, a
+#              terminal FAILURE, because that is the verdict recovery acts on.
+#              Only a newest attributable `running` row overrides it to working;
+#              anything else is an explicit unknown.
+#            * Nothing attributes this branch and the newest same-branch row is
+#              itself undecidable: an explicit unknown, the reported incident's
+#              own path, where the older row claimed instead was the bug.
+#          A run head this copy cannot read therefore never reports failed, and
+#          the unknown verdict is reserved for where the evidence really cannot
+#          decide: a wrong "alive" hides a genuinely dead worker and is worse
+#          than a wrong "failed", and both are worse than saying so.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -81,7 +114,7 @@ META="$STATE/$ID.meta"
 LOG="$STATE/$ID.status"
 NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-10}
 case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
-# How many of the most recent `no-mistakes runs` rows the cross-branch fallback
+# How many of the most recent `no-mistakes runs` rows the run selector
 # (nm_runs_status_for_branch, below) scans. Generous enough to still find a
 # branch's own run on a busy multi-crew fleet without listing the entire
 # history every call.
@@ -380,13 +413,25 @@ nm_ci_checks_state() {
 # "<status> <branch> <short-sha> <date> [<pr-url>]" separated by runs of
 # spaces (verified: no quoting, so splitting on the first two whitespace runs
 # is exact) - but branch + coarse status is exactly what this predicate needs:
-# is a run for THIS branch active right now. Echoes the first (most recent)
-# matching row's status word (running/completed/cancelled/failed), or empty
-# when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
+# is a run for THIS branch active right now. The list is newest-first, so the
+# newest attributable row is the branch's current owner and older rows below it
+# are history.
+#
+# Three outcomes, mirroring fm_nm_head_matches_worktree's three:
+#   0 - echoes that row's status word (running/completed/cancelled/failed; the
+#       only words the installed CLI emits here, verified against the real
+#       listing - a parked run reads `running`)
+#   1 - no attributable row within FM_CREW_STATE_RUNS_LIMIT rows, including
+#       when the listing itself is empty or the call did not answer
+#   2 - the newest same-branch row cannot be decided, because its head is not an
+#       object this local copy has. Echoes that head instead of a status word
+#       and stops: a proven mismatch is history that can be skipped past, but an
+#       undecidable row might BE the branch's live owner, and claiming an older
+#       row past it is exactly how a live run gets reported as a dead one.
 nm_runs_status_for_branch() {  # <branch>
-  local branch=$1 out row st rest br sha
+  local branch=$1 out row st rest br sha rc
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
-  [ -n "$out" ] || return 0
+  [ -n "$out" ] || return 1
   while IFS= read -r row; do
     row=$(trim "$row")
     [ -n "$row" ] || continue
@@ -398,36 +443,66 @@ nm_runs_status_for_branch() {  # <branch>
     rest=$(trim "$rest")
     sha=${rest%% *}
     if [ "$br" = "$branch" ]; then
-      # Same code-identity rule as axi status: skip a same-branch row whose
-      # short-sha does not match this worktree (rewritten or advanced tip).
-      if ! nm_coarse_head_matches_worktree "$sha"; then
-        continue
-      fi
-      printf '%s' "$st"
-      return 0
+      # Same code-identity rule as axi status.
+      nm_coarse_head_matches_worktree "$sha"
+      rc=$?
+      case "$rc" in
+        "$FM_NM_HEAD_MATCH")
+          printf '%s' "$st"
+          return 0
+          ;;
+        "$FM_NM_HEAD_UNRESOLVED")
+          printf '%s' "$sha"
+          return 2
+          ;;
+        *) continue ;;
+      esac
     fi
   done <<< "$out"
-  return 0
+  return 1
 }
 
 # CREW_BRANCH is empty at detached HEAD (a just-spawned crew, or a scout's
 # scratch worktree); with no branch there is no run to attribute to this crew.
 CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 
-# 0 if the active axi-status run's head field matches this worktree's code
-# identity. Branch match is a precondition (caller). Rule owned by
-# fm_nm_head_matches_worktree in bin/fm-nm-run-lib.sh.
+# Does the active axi-status run's head field match this worktree's code
+# identity? Branch match is a precondition (caller). Rule and its three exit
+# statuses owned by fm_nm_head_matches_worktree in bin/fm-nm-run-lib.sh, and
+# passed through unchanged: callers here must tell an undecidable head from a
+# refuted one.
 nm_run_head_matches_worktree() {
   local run_head
   run_head=$(strip_quotes "$(nm_field head)")
   fm_nm_head_matches_worktree "$WT" "$run_head"
 }
 
-# Coarse runs-list rows are "<status> <branch> <short-sha> ...". 0 if the short
-# sha for this branch row matches the worktree head under the same rules as
-# nm_run_head_matches_worktree (equal, or local is ancestor of run tip).
+# Coarse runs-list rows are "<status> <branch> <short-sha> ...". Applies the
+# same rule, and returns the same three statuses, to the short sha of a row
+# already matched by branch.
 nm_coarse_head_matches_worktree() {  # <short-sha>
   fm_nm_head_matches_worktree "$WT" "$1"
+}
+
+# 0 when the detailed axi-status record reads as a terminal failure. That is the
+# one detailed verdict that invites recovery against a worker, so it is the one
+# verdict corroborated against the newest attributable row before it is trusted.
+nm_detailed_run_is_terminal_failure() {
+  local status outcome
+  status=$(strip_quotes "$(nm_field status)")
+  outcome=$(strip_quotes "$(nm_field outcome)")
+  case "$outcome:$status" in
+    failed:*|cancelled:*|*:failed|*:cancelled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The one place an undecidable run head becomes a reported state. Never `failed`
+# and never a cheerful `working`: the local copy simply cannot tell a live run
+# from a dead one until it has the run's commit.
+emit_unresolved_head() {  # <head>
+  emit unknown run-step \
+    "run head ${1:-?} is not in this local copy; cannot tell which run owns this branch"
 }
 
 HAVE_RUN=0
@@ -443,18 +518,69 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
   RUN_OUT=$(nm_run axi status)
   if [ -n "$RUN_OUT" ]; then
     run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_head_matches_worktree; then
+    detailed_rc=$FM_NM_HEAD_MISMATCH
+    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
+      nm_run_head_matches_worktree
+      detailed_rc=$?
+    fi
+    if [ "$detailed_rc" = "$FM_NM_HEAD_MATCH" ]; then
       HAVE_RUN=1
+      # The detailed record is attributable, so it is normally authoritative and
+      # keeps its step and gate detail. The one exception is a terminal failure,
+      # because that is the verdict recovery acts on: a dead run sitting at the
+      # stale local head satisfies attribution by equality just as well as the
+      # live run above it does by ancestry, so confirm no newer attributable run
+      # already owns this branch before reporting the worker as failed.
+      if nm_detailed_run_is_terminal_failure; then
+        COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
+        coarse_rc=$?
+        if [ "$coarse_rc" = 2 ]; then
+          emit_unresolved_head "$COARSE_STATUS"
+        elif [ "$coarse_rc" = 0 ] && [ "$COARSE_STATUS" = running ]; then
+          # A live run owns this branch at code this worktree is on. Only a
+          # live row overrides: every other word is itself terminal, so it
+          # would trade one terminal verdict for another rather than stop a
+          # false failure.
+          RUN_SOURCE=coarse
+        else
+          COARSE_STATUS=""
+        fi
+      fi
+    elif [ "$detailed_rc" = "$FM_NM_HEAD_UNRESOLVED" ]; then
+      # This crew's own branch is the one the CLI answered about, and only its
+      # head could not be read - the routine, benign shape while the pipeline's
+      # own pushed commits are not yet in this copy. That head is no reason to
+      # throw the record away: the run reported on it is this branch's run. So
+      # the record is trusted exactly as a resolvable head would trust it, and
+      # the ONE verdict still withheld is the same one withheld above, a
+      # terminal failure, because that is what recovery acts on.
+      if nm_detailed_run_is_terminal_failure; then
+        COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
+        coarse_rc=$?
+        if [ "$coarse_rc" = 0 ] && [ "$COARSE_STATUS" = running ]; then
+          HAVE_RUN=1
+          RUN_SOURCE=coarse
+        elif [ "$coarse_rc" = 2 ]; then
+          emit_unresolved_head "$COARSE_STATUS"
+        else
+          emit_unresolved_head "$(strip_quotes "$(nm_field head)")"
+        fi
+      else
+        HAVE_RUN=1
+      fi
     else
       # The active-or-most-recent run is for another branch, or same branch with
-      # a rewritten/diverged head (the CLI is alive and answered; only the
-      # attribution missed) - try the coarse fallback.
+      # a rewritten/diverged head (provably not this worktree's, so never
+      # attributed) - try the coarse fallback.
       # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
       # for no better answer.
       COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
-      if [ -n "$COARSE_STATUS" ]; then
+      coarse_rc=$?
+      if [ "$coarse_rc" = 2 ]; then
+        emit_unresolved_head "$COARSE_STATUS"
+      elif [ "$coarse_rc" = 0 ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse
       fi

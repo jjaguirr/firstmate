@@ -29,6 +29,10 @@ Recover a genuinely stuck remote mate only through `bin/fm-spawn.sh <id> --secon
 Treat the digest's endpoint result as a presence signal, not proof that the task's work or validation run is gone.
 Read the targeted current state with `bin/fm-crew-state.sh <id>` before deciding to relaunch.
 A no-mistakes run matched to the crew's branch and current code remains authoritative when the endpoint is dead: handle a terminal or parked run through the normal lifecycle, and keep supervising an active run instead of creating a duplicate worker.
+An `unknown` read whose detail says a run head is not in this local copy means the evidence could not decide which run owns the branch, never that the work failed: it is a reason to ask the pipeline directly rather than to recover a worker that may be alive and parked at a gate.
+Such a read does not tell you whether that run is still going or already over, so do not infer either.
+A crew keeps its real state and gate detail on an unread head only when `axi status` answers about that crew's own branch; because bare `axi status` returns the single active run, a crew whose run is live can still read `unknown` while another crew is the active one.
+No run head this copy cannot read is ever reported as failed.
 
 When no authoritative run accounts for the task, inspect only its recorded backend and worktree inventory.
 Use `treehouse status` for treehouse-backed tmux, herdr, zellij, or cmux tasks, and use the recorded `orca_worktree_id=` and `terminal=` for Orca tasks.

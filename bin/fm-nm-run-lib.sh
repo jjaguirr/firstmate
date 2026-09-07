@@ -55,19 +55,43 @@ fm_nm_field() {  # <toon-output> <key>
   printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*\(.*\)/\1/p" | head -1
 }
 
-# 0 if run head $2 matches worktree $1's code identity, per the same rule
-# everywhere this attribution is needed:
-#   - missing/empty head: cannot bind; reject
-#   - equal commits (short or full SHA): match
-#   - worktree HEAD is an ancestor of run head: match (pipeline fix commits on
-#     the same history advanced the run tip past local HEAD)
-#   - run head is a strict ancestor of worktree HEAD, or diverged: no match
-#     (local work advanced outside the run, or the branch tip was rewritten)
+# Does run head $2 match worktree $1's code identity? Three outcomes, because
+# "this run is provably not ours" and "we cannot tell whose run this is" are
+# different facts and collapsing them is what let a live run be misread as a
+# dead one (see the incident note in bin/fm-crew-state.sh's header):
+#
+#   $FM_NM_HEAD_MATCH (0)      attributable to this worktree
+#     - equal commits (short or full SHA), or
+#     - worktree HEAD is an ancestor of the run head, i.e. pipeline fix commits
+#       on the same history advanced the run tip past local HEAD
+#   $FM_NM_HEAD_MISMATCH (1)   provably NOT this worktree's code
+#     - run head is a strict ancestor of worktree HEAD (local work advanced
+#       outside the run), or the two diverged (the branch tip was rewritten)
+#     - no head recorded at all, so there is nothing to bind
+#   $FM_NM_HEAD_UNRESOLVED (2) undecidable, NOT a refutation
+#     - the run head is not an object this worktree has, so neither the equality
+#       nor the ancestry test can run. The routine cause is benign and expected:
+#       the pipeline keeps its own copy of the branch, so between its first
+#       pushed commit and the crew's next sync the run tip simply is not here
+#       yet. A rewritten foreign branch looks identical from here, so this is
+#       never evidence either way.
+#     - the worktree's own HEAD cannot be read
+#
+# Callers that only ever attribute on proof can keep testing the exit status as
+# a boolean: both non-match outcomes are non-zero, so `... || return 1` still
+# refuses. A caller that reports state must branch on 2 explicitly rather than
+# reading it as a mismatch.
+FM_NM_HEAD_MATCH=0
+FM_NM_HEAD_MISMATCH=1
+FM_NM_HEAD_UNRESOLVED=2
 fm_nm_head_matches_worktree() {  # <worktree> <run_head>
   local wt=$1 run_head=$2 local_full run_full
-  [ -n "$run_head" ] || return 1
-  local_full=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || return 1
-  run_full=$(git -C "$wt" rev-parse --verify "${run_head}^{commit}" 2>/dev/null) || return 1
-  [ "$run_full" = "$local_full" ] && return 0
-  git -C "$wt" merge-base --is-ancestor "$local_full" "$run_full" 2>/dev/null
+  [ -n "$run_head" ] || return "$FM_NM_HEAD_MISMATCH"
+  local_full=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || return "$FM_NM_HEAD_UNRESOLVED"
+  run_full=$(git -C "$wt" rev-parse --verify "${run_head}^{commit}" 2>/dev/null) \
+    || return "$FM_NM_HEAD_UNRESOLVED"
+  [ "$run_full" = "$local_full" ] && return "$FM_NM_HEAD_MATCH"
+  git -C "$wt" merge-base --is-ancestor "$local_full" "$run_full" 2>/dev/null \
+    && return "$FM_NM_HEAD_MATCH"
+  return "$FM_NM_HEAD_MISMATCH"
 }
