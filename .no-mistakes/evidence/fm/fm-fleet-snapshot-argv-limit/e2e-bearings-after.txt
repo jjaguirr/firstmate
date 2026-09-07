@@ -1,0 +1,38 @@
+=== AFTER the fix (target commit 89dfff7) ===
+$ FM_HOME=<same home, 204811-byte backlog> bin/fm-bearings-snapshot.sh
+schema: fm-bearings.v1
+home: fm-e2e.L2SuAz/home
+generated: "2026-09-07T22:52:14Z"
+prs: "not_requested (run: /bearings include PRs)"
+in_flight: []
+secondmates: []
+decisions_open: []
+landed: []
+gates[20]{id,title,blocked_by,reason,owner}:
+  big-task-1,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-2,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-3,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-4,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-5,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-6,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-7,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-8,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-9,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-10,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-11,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-12,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-13,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-14,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-15,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-16,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-17,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-18,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-19,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+  big-task-20,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…,"-","-",(main)
+reports: []
+exit status: 0
+
+$ FM_HOME=<same home> bin/fm-fleet-snapshot.sh --json | jq "{schema, queued: ([.backlog.records[]|select(.state==\"queued\")]|length), backlog_json_bytes: 0}"
+exit status: 0
+{"schema":"fm-fleet-snapshot.v1","main_inventory_valid":true,"queued":100}
+backlog JSON payload bytes: 463654 (MAX_ARG_STRLEN = 131072)

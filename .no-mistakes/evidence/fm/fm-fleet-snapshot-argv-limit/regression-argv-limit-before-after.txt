@@ -1,0 +1,20 @@
+=== Regression proof for the argv-size fix: same tests, pre-fix (4b38db8) vs post-fix (89dfff7) script ===
+
+--- test_oversized_backlog_survives_argv_limit_json ---
+BEFORE: not ok - snapshot must survive a backlog JSON larger than MAX_ARG_STRLEN: /tmp/fm-e2e.L2SuAz/basetree/bin/fm-fleet-snapshot.sh: line 621: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+fm-fleet-snapshot: main inventory summary failed
+AFTER:  ok - an oversized backlog crosses the argv limit and the JSON snapshot still succeeds
+
+--- test_oversized_backlog_survives_argv_limit_secondmate_summary ---
+BEFORE: not ok - secondmate home summary must survive a backlog JSON larger than MAX_ARG_STRLEN: /tmp/fm-e2e.L2SuAz/basetree/bin/fm-fleet-snapshot.sh: line 649: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+fm-fleet-snapshot: secondmate home summary failed
+AFTER:  ok - an oversized backlog crosses the argv limit and the secondmate home summary still succeeds
+
+--- test_oversized_secondmate_summary_survives_argv_limit ---
+BEFORE: not ok - secondmate home summary fixture must succeed: /tmp/fm-e2e.L2SuAz/basetree/bin/fm-fleet-snapshot.sh: line 649: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+fm-fleet-snapshot: secondmate home summary failed
+AFTER:  ok - an oversized secondmate summary crosses the argv limit and the fleet snapshot still succeeds
+
+--- test_oversized_scout_reports_survive_argv_limit ---
+BEFORE: not ok - snapshot must survive a scout report list larger than MAX_ARG_STRLEN: /tmp/fm-e2e.L2SuAz/basetree/bin/fm-fleet-snapshot.sh: line 1379: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+AFTER:  ok - an oversized scout report list crosses the argv limit and the JSON snapshot still succeeds

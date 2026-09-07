@@ -1,0 +1,8 @@
+$ wc -c "$FM_HOME/data/backlog.md"
+204811 backlog.md
+
+=== BEFORE the fix (base commit 4b38db8 bin/fm-fleet-snapshot.sh) ===
+$ FM_HOME=<home-with-large-backlog> bin/fm-bearings-snapshot.sh
+/tmp/fm-e2e.L2SuAz/basetree/bin/fm-fleet-snapshot.sh: line 621: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+fm-fleet-snapshot: main inventory summary failed
+exit status: 1

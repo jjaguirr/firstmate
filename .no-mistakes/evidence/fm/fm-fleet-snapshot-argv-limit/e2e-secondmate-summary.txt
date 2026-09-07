@@ -1,0 +1,17 @@
+=== Oversized registered-secondmate home summary (per-home blob > MAX_ARG_STRLEN, still under FM_SNAPSHOT_SECONDMATE_MAX_BYTES=262144) ===
+child home summary bytes: 190415
+
+$ FM_HOME=<parent> bin/fm-fleet-snapshot.sh --json   # base commit 4b38db8
+exit status: 0   (exits 0, but silently loses the home: the child summary jq died
+                  with "Argument list too long", so the parent recorded the home as
+                  unreadable with zero queued rows)
+  {"records":1,"total":1,"unreadable":["<child home>"],
+   "rec0":{"id":"big-mate","provenance":"unknown","queued":0}}
+
+$ FM_HOME=<parent> bin/fm-fleet-snapshot.sh --json   # target commit 89dfff7
+exit status: 0
+{"records":1,"total":1,"shown":1,"id":"big-mate","selected":"structured-home","queued_count":400,"queued_rows":400,"unreadable":0}
+
+$ FM_HOME=<parent> bin/fm-fleet-view.sh | sed -n "/## Secondmates/,+8p"   # human renderer, target commit
+## Secondmates
+For kind=secondmate, bearings selects validated structured state from that registered home; parent events and bounded terminal evidence are fallback-only supplements and never current-state authority.

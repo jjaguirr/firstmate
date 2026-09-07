@@ -1,0 +1,9 @@
+=== Regression proof for the signal trap: same test, pre-fix vs post-fix script ===
+
+$ bash tests/fm-fleet-snapshot-view.test.sh::test_signal_removes_snapshot_tmpdir   # against f52d22c (EXIT-only trap)
+not ok - snapshot must die from the SIGINT it was sent (expected 130), got exit status 0
+exit status: 1
+
+$ same test                                                                        # against 89dfff7 (EXIT + INT/TERM/HUP traps)
+ok - SIGTERM and SIGINT during a slow snapshot kill it and remove its private temp directory
+exit status: 0

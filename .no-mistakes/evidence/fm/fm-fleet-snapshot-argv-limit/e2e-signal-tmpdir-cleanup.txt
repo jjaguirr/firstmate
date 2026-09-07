@@ -1,0 +1,42 @@
+=== SIGTERM/SIGINT cleanup of the snapshot temp directory (holds task titles + PR URLs) ===
+home: 500-row backlog + 200 scout reports; TMPDIR isolated per run
+
+--- BEFORE this round's fix: commit f52d22c, EXIT-only trap ---
+[EXIT-only TERM] tmpdir while running: /tmp/fm-e2e.L2SuAz/tmproot.qPPDxJ/fm-fleet-snapshot.hW3OFL
+[EXIT-only TERM] contents: backlog.json scout-reports.json tasks.json 
+[EXIT-only TERM] sent SIGTERM; child exit status: 143 (128+signal means killed by that signal)
+[EXIT-only TERM] temp directory removed after signal: none left under $TMPDIR
+
+[EXIT-only INT] tmpdir while running: /tmp/fm-e2e.L2SuAz/tmproot.YY4Vxc/fm-fleet-snapshot.vv7RWh
+[EXIT-only INT] contents: backlog.json scout-reports.json tasks.json 
+[EXIT-only INT] sent SIGINT; child exit status: 0 (128+signal means killed by that signal)
+[EXIT-only INT] temp directory removed after signal: none left under $TMPDIR
+
+--- AFTER: target commit 89dfff7, EXIT + INT/TERM/HUP traps ---
+[fixed TERM] tmpdir while running: /tmp/fm-e2e.L2SuAz/tmproot.2Aggin/fm-fleet-snapshot.b9vQu1
+[fixed TERM] contents: 
+[fixed TERM] sent SIGTERM; child exit status: 143 (128+signal means killed by that signal)
+[fixed TERM] temp directory removed after signal: none left under $TMPDIR
+
+[fixed INT] tmpdir while running: /tmp/fm-e2e.L2SuAz/tmproot.mi23gm/fm-fleet-snapshot.N6UUnm
+[fixed INT] contents: backlog.json scout-reports.json tasks.json 
+[fixed INT] sent SIGINT; child exit status: 130 (128+signal means killed by that signal)
+[fixed INT] temp directory removed after signal: none left under $TMPDIR
+
+[fixed HUP] tmpdir while running: /tmp/fm-e2e.L2SuAz/tmproot.Gtn3nI/fm-fleet-snapshot.IzbWiz
+[fixed HUP] contents: backlog.json scout-reports.json tasks.json 
+[fixed HUP] sent SIGHUP; child exit status: 129 (128+signal means killed by that signal)
+[fixed HUP] temp directory removed after signal: none left under $TMPDIR
+
+
+--- Note on the EXIT-only baseline above (Linux, bash 5.1.16) ---
+On this platform the EXIT-only build still removed the directory: bash defers a
+fatal signal that arrives while it waits on a foreground child (jq), then runs
+the EXIT trap. The user-visible difference the fix makes on this platform is the
+death itself. Repeated twice for SIGINT against the EXIT-only build:
+  EXIT-only run 1: SIGINT -> status 0; leftover: <none>
+  EXIT-only run 2: SIGINT -> status 0; leftover: <none>
+The EXIT-only build swallows SIGINT and runs to completion (status 0), so
+Ctrl-C through bin/fm-fleet-view.sh did not stop the snapshot. The fixed build
+dies by the signal it was sent: 130 (INT), 143 (TERM), 129 (HUP), and removes
+the temp directory on each.

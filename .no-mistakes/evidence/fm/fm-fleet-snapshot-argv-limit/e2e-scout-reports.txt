@@ -1,0 +1,28 @@
+=== Oversized scout report list (300 reports, serialized pointer list > MAX_ARG_STRLEN) ===
+$ FM_HOME=<home> bin/fm-fleet-snapshot.sh --json   # base commit 4b38db8
+exit status: 126
+/tmp/fm-e2e.L2SuAz/basetree/bin/fm-fleet-snapshot.sh: line 1379: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+
+
+$ FM_HOME=<home> bin/fm-fleet-snapshot.sh --json   # target commit 89dfff7
+exit status: 0
+{"scout_reports":300,"first_id":"scout-report-1-rrrrrrrrr","kinds":["scout"]}
+scout_reports payload bytes: 154587 (MAX_ARG_STRLEN = 131072)
+
+$ FM_HOME=<home> bin/fm-fleet-view.sh | head -20   # human renderer, target commit
+# Fleet View
+
+Schema: fm-fleet-snapshot.v1
+Home: /tmp/fm-e2e.L2SuAz/scouthome
+
+## Under Way
+No live task metadata found.
+
+## Queued
+No queued backlog records found.
+
+## Done
+No done backlog records found.
+
+## Secondmates
+For kind=secondmate, bearings selects validated structured state from that registered home; parent events and bounded terminal evidence are fallback-only supplements and never current-state authority.
