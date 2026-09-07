@@ -1818,7 +1818,36 @@ EOF
   assert_not_contains "$out" "state: failed" "a rebased branch's live row must stop the terminal row underneath it"
   assert_contains "$out" "state: working" "the branch's live row owns it after the rewrite"
   assert_contains "$out" "source: run-step" "the live row resolution stays run-step sourced"
+  assert_not_contains "$out" "superseded" "a coarse row cannot prove the gate resolved, so it must not bury the decision"
+  assert_contains "$out" "ci gate" "the crew's open decision stays visible behind a coarse verdict"
   pass "a live rebased row beats the older terminal row at the local head"
+}
+
+# The same skip reached through a terminal word: the newest same-branch row is
+# `completed` on the rebased head, and the row underneath it is the branch's own
+# older failure sitting at exactly the local head. Attribution by equality alone
+# reported that dead row's `failed` over a run that actually completed.
+test_rebased_completed_row_beats_older_terminal_row_at_local_head() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-completed-row)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-done
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-done.meta" "window=fm:fm-rebased-done" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$live_head"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-rebased-done)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  completed  fm/feat-rebased-done $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased-done $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased-done)
+  assert_not_contains "$out" "state: failed" "the branch's own dead history must not outrank its newest row"
+  assert_contains "$out" "state: done" "the newest same-branch row owns the branch after the rewrite"
+  assert_contains "$out" "source: run-step" "the completed row resolution stays run-step sourced"
+  pass "a completed rebased row beats the older terminal row at the local head"
 }
 
 # The same rewrite reached through the terminal-failure corroboration path: the
@@ -1872,10 +1901,11 @@ EOF
   pass "a terminal row on a rewritten head does not hide a real failure"
 }
 
-# The liveness rule is scoped to the branch's NEWEST row, the only one the
+# The rewrite rule is scoped to the branch's NEWEST row, the only one the
 # newest-owns-the-branch rule can call its current owner. A live row sitting
 # BELOW a newer terminal row is history that a later run already superseded, so
-# it must not be resurrected into a cheerful working verdict.
+# it must not be resurrected into a cheerful working verdict: the newest row's
+# own word is what gets reported.
 test_live_row_below_a_newer_terminal_row_is_not_claimed() {
   reset_fakes
   local d local_head live_head out
@@ -1896,9 +1926,11 @@ EOF
   FM_FAKE_BUSY=0
   arm_idle_record "$d/state" rebased-below
   out=$(run_crew_state "$d" rebased-below)
-  assert_not_contains "$out" "source: run-step" "a superseded live row must not be attributed"
   assert_not_contains "$out" "state: working" "a superseded live row must not report working"
-  assert_contains "$out" "state: blocked" "the crew's own current state is still read"
+  assert_contains "$out" "state: failed" "the newest same-branch row's own word is reported"
+  assert_contains "$out" "source: run-step" "the newest row's verdict stays run-step sourced"
+  assert_not_contains "$out" "superseded" "a coarse verdict must not bury the crew's open blocker"
+  assert_contains "$out" "waiting on a credential" "the crew's recorded blocker stays visible"
   pass "a live row below a newer terminal row is not claimed"
 }
 
@@ -2023,6 +2055,7 @@ test_unresolvable_row_stops_terminal_failure_confirmation
 test_genuinely_latest_failed_run_stays_failed
 test_rewritten_row_is_skipped_not_treated_as_undecidable
 test_live_rebased_row_beats_older_terminal_row_at_local_head
+test_rebased_completed_row_beats_older_terminal_row_at_local_head
 test_live_rebased_row_overrides_a_dead_attributable_record
 test_rebased_terminal_row_does_not_hide_a_real_failure
 test_live_row_below_a_newer_terminal_row_is_not_claimed
