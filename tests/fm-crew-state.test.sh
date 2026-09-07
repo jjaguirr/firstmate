@@ -1482,9 +1482,11 @@ EOF
 }
 
 # The reported incident itself: the live run's head is not in this local copy,
-# and the dead run's head IS. The undecidable row must stop the scan, so the
-# dead run below it is never claimed.
-test_unresolvable_live_head_reports_unknown_not_failed() {
+# and the dead run's head IS. The dead run below must never be claimed - and
+# because a still-running record only claims work is in progress, which an
+# unreadable pushed head supports, the healthy parked worker keeps its own
+# state and its full gate detail rather than being thrown away for an unknown.
+test_unresolvable_live_head_keeps_live_parked_detail() {
   reset_fakes
   local d dead_head live_head out
   d=$(new_case unresolvable-live-head)
@@ -1504,10 +1506,129 @@ EOF
 )"
   out=$(run_crew_state "$d" unres)
   assert_not_contains "$out" "state: failed" "an unreadable run head must never be reported as a failure"
-  assert_contains "$out" "state: unknown" "an undecidable head is reported as its own state"
+  assert_not_contains "$out" "state: unknown" "a live run's own record still decides its state"
+  assert_contains "$out" "state: parked" "the healthy parked worker reads parked, not unknown"
+  assert_contains "$out" "parked at review" "the live record keeps its gate detail"
+  assert_contains "$out" "2 finding(s)" "the live record keeps its finding count"
+  assert_contains "$out" "source: run-step" "the live record stays run-step sourced"
+  pass "an unresolvable head keeps a live parked run's own state and detail"
+}
+
+# The other half of the narrowing: a record that has already CONCLUDED is not
+# trusted on a head this copy cannot read, because a wrong `done` ends
+# supervision just as a wrong `failed` starts recovery. A newest attributable
+# `running` row is what overrides it.
+test_terminal_record_on_unresolvable_head_defers_to_live_row() {
+  reset_fakes
+  local d dead_head live_head out
+  d=$(new_case unres-terminal-live)
+  make_stale_local_head_repo "$d/wt" fm/feat-unres-terminal absent
+  dead_head=$STALE_DEAD_HEAD
+  live_head=$STALE_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unrest.meta" "window=fm:fm-unrest" "worktree=$d/wt" "kind=ship" "harness=claude"
+  # A concluded record, reported on the head this copy cannot read.
+  FM_FAKE_RUN_HEAD="${live_head:0:8}"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-unres-terminal)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-unres-terminal $(git -C "$d/wt" rev-parse --short=8 "$dead_head")  2026-09-06 20:49
+EOF
+)"
+  out=$(run_crew_state "$d" unrest)
+  assert_not_contains "$out" "state: failed" "a concluded record on an unreadable head must not report failed"
+  assert_contains "$out" "state: working" "a live attributable row overrides the untrusted conclusion"
+  pass "a concluded record on an unresolvable head defers to the live row"
+}
+
+# Same concluded record and same unreadable head, but nothing live corroborates
+# it. It must not be believed and must not be talked into a cheerful verdict
+# either: this is where the explicit unknown still earns its place.
+test_terminal_record_on_unresolvable_head_without_live_row_is_unknown() {
+  reset_fakes
+  local d dead_head live_head out
+  d=$(new_case unres-terminal-dead)
+  make_stale_local_head_repo "$d/wt" fm/feat-unres-dead absent
+  dead_head=$STALE_DEAD_HEAD
+  live_head=$STALE_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unresd.meta" "window=fm:fm-unresd" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: still going\n' > "$d/state/unresd.status"
+  FM_FAKE_RUN_HEAD="${live_head:0:8}"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-unres-dead)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-unres-dead $(git -C "$d/wt" rev-parse --short=8 "$dead_head")  2026-09-05 06:01
+EOF
+)"
+  out=$(run_crew_state "$d" unresd)
+  assert_not_contains "$out" "state: failed" "an unreadable run head must never be reported as a failure"
+  assert_contains "$out" "state: unknown" "an unconfirmable conclusion is reported as its own state"
   assert_contains "$out" "${live_head:0:7}" "the unknown verdict names the head it could not read"
   assert_contains "$out" "not in this local copy" "the unknown verdict says why it cannot decide"
-  pass "an unresolvable run head reports unknown, never the dead run underneath it"
+  pass "an unconfirmable concluded record on an unresolvable head reports unknown"
+}
+
+# The reported incident's other path, which the narrowing deliberately keeps:
+# no detailed record attributes this branch at all, and the newest same-branch
+# row is itself undecidable. Claiming an older row past it was the bug.
+test_undecidable_row_without_attributable_record_is_unknown() {
+  reset_fakes
+  local d dead_head live_head out
+  d=$(new_case unres-no-record)
+  make_stale_local_head_repo "$d/wt" fm/feat-unres-norec absent
+  dead_head=$STALE_DEAD_HEAD
+  live_head=$STALE_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unresn.meta" "window=fm:fm-unresn" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: still going\n' > "$d/state/unresn.status"
+  # The CLI answered about a different crew's branch, so nothing attributes.
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-unres-norec ${live_head:0:8}  2026-09-06 20:49
+  failed     fm/feat-unres-norec $(git -C "$d/wt" rev-parse --short=8 "$dead_head")  2026-09-05 06:01
+EOF
+)"
+  out=$(run_crew_state "$d" unresn)
+  assert_not_contains "$out" "state: failed" "the dead row underneath must never be claimed"
+  assert_contains "$out" "state: unknown" "an undecidable newest row stops the scan"
+  assert_contains "$out" "${live_head:0:7}" "the unknown verdict names the head it could not read"
+  pass "an undecidable newest row with no attributable record reports unknown"
+}
+
+# The exact boundary the narrowing could erode: keeping a live record on an
+# UNRESOLVED head must not leak into MISMATCH. A diverged head is resolvable
+# and provably not this worktree's history, so it is still never attributed
+# even though the record names this crew's own branch.
+test_diverged_head_on_own_branch_is_still_refused() {
+  reset_fakes
+  local d diverged out
+  d=$(new_case diverged-own-branch)
+  local base
+  make_repo_on_branch "$d/wt" fm/feat-diverged
+  base=$(git -C "$d/wt" rev-parse HEAD)
+  git -C "$d/wt" commit -q --allow-empty -m 'crew work'
+  git -C "$d/wt" checkout -q -b tmp-diverge "$base"
+  git -C "$d/wt" commit -q --allow-empty -m 'sibling history the crew never had'
+  diverged=$(git -C "$d/wt" rev-parse HEAD)
+  git -C "$d/wt" checkout -q fm/feat-diverged
+  # Genuinely diverged, not merely unreadable: resolvable here, and neither an
+  # ancestor nor a descendant of this worktree's HEAD.
+  git -C "$d/wt" rev-parse --verify -q "${diverged}^{commit}" >/dev/null || fail "fixture diverged head must stay resolvable, or it tests UNRESOLVED instead"
+  ! git -C "$d/wt" merge-base --is-ancestor "$diverged" HEAD 2>/dev/null || fail "fixture head is an ancestor, not diverged"
+  ! git -C "$d/wt" merge-base --is-ancestor HEAD "$diverged" 2>/dev/null || fail "fixture head is a descendant, not diverged"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/diverged.meta" "window=fm:fm-diverged" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'working: stage 2 setup complete\n' > "$d/state/diverged.status"
+  # A live parked record on this crew's own branch, at a diverged head.
+  FM_FAKE_RUN_HEAD="$diverged"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-diverged)"
+  FM_FAKE_BUSY=0
+  arm_idle_record "$d/state" diverged
+  out=$(run_crew_state "$d" diverged)
+  assert_not_contains "$out" "source: run-step" "a diverged head must not be attributed"
+  assert_not_contains "$out" "parked at" "a diverged run's gate detail must not be shown as current"
+  assert_contains "$out" "source: status-log" "falls back to status-log after the refusal"
+  assert_contains "$out" "state: working" "status-log working: remains current"
+  pass "a diverged head on the crew's own branch is still refused"
 }
 
 # Same undecidable newest row, but with the detailed record already terminal:
@@ -1694,7 +1815,11 @@ test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
 test_live_run_beats_dead_run_at_stale_local_head
-test_unresolvable_live_head_reports_unknown_not_failed
+test_unresolvable_live_head_keeps_live_parked_detail
+test_terminal_record_on_unresolvable_head_defers_to_live_row
+test_terminal_record_on_unresolvable_head_without_live_row_is_unknown
+test_undecidable_row_without_attributable_record_is_unknown
+test_diverged_head_on_own_branch_is_still_refused
 test_unresolvable_row_stops_terminal_failure_confirmation
 test_genuinely_latest_failed_run_stays_failed
 test_rewritten_row_is_skipped_not_treated_as_undecidable

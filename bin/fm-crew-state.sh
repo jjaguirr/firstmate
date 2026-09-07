@@ -48,10 +48,25 @@
 #          indistinguishable from a foreign rewrite. Reading it as "does not
 #          match" is what let a live parked run be reported as the FAILED run
 #          underneath it (2026-09-06), which invites recovery against a healthy
-#          worker holding an open decision. So the scan stops there and the
-#          verdict is an explicit unknown: a wrong "alive" hides a genuinely
-#          dead worker and is worse than a wrong "failed", and both are worse
-#          than saying the evidence cannot decide.
+#          worker holding an open decision. So the scan never claims an older
+#          row past it, and what it reports depends on how much the undecidable
+#          head actually puts in doubt:
+#            * A detailed record naming THIS branch that is still running keeps
+#              its own state and full step and gate detail. It only claims work
+#              is in progress, which is what an unreadable pushed head supports,
+#              so a healthy worker parked at a gate still reads as parked.
+#            * A detailed record naming THIS branch that has CONCLUDED, by
+#              success or by failure, is not trusted on a head this copy cannot
+#              read: a wrong "done" ends supervision just as a wrong "failed"
+#              starts recovery. Only a newest attributable `running` row
+#              overrides it to working; anything else is an explicit unknown.
+#            * Nothing attributes this branch and the newest same-branch row is
+#              itself undecidable: an explicit unknown, the reported incident's
+#              own path, where the older row claimed instead was the bug.
+#          A run head this copy cannot read therefore never reports failed, and
+#          the unknown verdict is reserved for where the evidence really cannot
+#          decide: a wrong "alive" hides a genuinely dead worker and is worse
+#          than a wrong "failed", and both are worse than saying so.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -481,6 +496,22 @@ nm_detailed_run_is_terminal_failure() {
   esac
 }
 
+# 0 when the detailed axi-status record has already concluded, by success or by
+# failure. A concluded record is the one shape that must not be trusted on a
+# head this copy cannot read: a wrong `done` ends supervision just as a wrong
+# `failed` starts recovery, whereas a still-running record only ever claims work
+# is in progress, which is the reading an unreadable pushed head supports.
+nm_detailed_run_is_terminal() {
+  local status outcome
+  status=$(strip_quotes "$(nm_field status)")
+  outcome=$(strip_quotes "$(nm_field outcome)")
+  [ -z "$outcome" ] || return 0
+  case "$status" in
+    completed|failed|cancelled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # The one place an undecidable run head becomes a reported state. Never `failed`
 # and never a cheerful `working`: the local copy simply cannot tell a live run
 # from a dead one until it has the run's commit.
@@ -530,11 +561,32 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
           COARSE_STATUS=""
         fi
       fi
+    elif [ "$detailed_rc" = "$FM_NM_HEAD_UNRESOLVED" ]; then
+      # This crew's own branch is the one the CLI answered about, and only its
+      # head could not be read - the routine, benign shape while the pipeline's
+      # own pushed commits are not yet in this copy. A still-running record only
+      # claims work is in progress, which is exactly what an unreadable pushed
+      # head supports, so it keeps its real state and its full step and gate
+      # detail rather than being thrown away for an unknown.
+      if nm_detailed_run_is_terminal; then
+        # A concluded record is not trusted on a head this copy cannot read.
+        COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
+        coarse_rc=$?
+        if [ "$coarse_rc" = 0 ] && [ "$COARSE_STATUS" = running ]; then
+          HAVE_RUN=1
+          RUN_SOURCE=coarse
+        elif [ "$coarse_rc" = 2 ]; then
+          emit_unresolved_head "$COARSE_STATUS"
+        else
+          emit_unresolved_head "$(strip_quotes "$(nm_field head)")"
+        fi
+      else
+        HAVE_RUN=1
+      fi
     else
       # The active-or-most-recent run is for another branch, or same branch with
-      # a rewritten/diverged head, or same branch at a head this local copy does
-      # not have (the CLI is alive and answered; only the attribution missed) -
-      # try the coarse fallback.
+      # a rewritten/diverged head (provably not this worktree's, so never
+      # attributed) - try the coarse fallback.
       # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
@@ -543,12 +595,6 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       coarse_rc=$?
       if [ "$coarse_rc" = 2 ]; then
         emit_unresolved_head "$COARSE_STATUS"
-      elif [ "$detailed_rc" = "$FM_NM_HEAD_UNRESOLVED" ] && [ "$coarse_rc" != 0 ]; then
-        # This crew's own branch is the one the CLI answered about, and its head
-        # is not here. With no attributable row to fall back on there is nothing
-        # left that can tell a live run from a dead one, so say so rather than
-        # reading a pane or a stale log as if no run existed.
-        emit_unresolved_head "$(strip_quotes "$(nm_field head)")"
       elif [ "$coarse_rc" = 0 ]; then
         HAVE_RUN=1
         RUN_SOURCE=coarse
