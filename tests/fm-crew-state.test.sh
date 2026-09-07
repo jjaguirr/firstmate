@@ -1875,6 +1875,58 @@ EOF
   pass "a live rebased row overrides a dead but attributable record"
 }
 
+# The corroboration gate releases the withheld failure on SUCCESS as well as on
+# liveness: the dead record sits at the local head and reports failed, while the
+# branch's newest row completed on the rebased head. Reporting the dead run's
+# failure there would contradict the same listing read through the other path.
+test_completed_rebased_row_overrides_a_dead_attributable_record() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-done-overrides)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-done-ovr
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-done-ovr.meta" "window=fm:fm-rebased-done-ovr" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$local_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-rebased-done-ovr)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  completed  fm/feat-rebased-done-ovr $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased-done-ovr $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased-done-ovr)
+  assert_not_contains "$out" "state: failed" "a completed newest row must stop the dead record's failed verdict"
+  assert_contains "$out" "state: done" "the completed rebased row overrides the dead record"
+  pass "a completed rebased row overrides a dead but attributable record"
+}
+
+# The boundary the widened gate must not cross: a coarse CANCELLED word on a
+# rewritten head is itself terminal, so it cannot corroborate anything and must
+# not release the withheld failure. The real failure below it still stands.
+test_cancelled_rebased_row_does_not_release_a_real_failure() {
+  reset_fakes
+  local d local_head live_head out
+  d=$(new_case rebased-cancelled)
+  make_rebased_live_head_repo "$d/wt" fm/feat-rebased-cancelled
+  local_head=$REBASED_LOCAL_HEAD
+  live_head=$REBASED_LIVE_HEAD
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rebased-cancelled.meta" "window=fm:fm-rebased-cancelled" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$local_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-rebased-cancelled)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  cancelled  fm/feat-rebased-cancelled $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-07 02:02
+  failed     fm/feat-rebased-cancelled $(git -C "$d/wt" rev-parse --short=8 "$local_head")  2026-09-06 20:55
+EOF
+)"
+  out=$(run_crew_state "$d" rebased-cancelled)
+  assert_not_contains "$out" "state: working" "a terminal coarse word must not be read as liveness"
+  assert_not_contains "$out" "state: done" "a cancelled row must not be read as success"
+  assert_contains "$out" "state: failed" "the corroborated failure is still reported"
+  pass "a cancelled rebased row does not release a real failure"
+}
+
 # The other direction, which the liveness rule must not erode: a rewritten head
 # still carries no verdict of its own, so a genuinely dead branch whose newest
 # row is terminal on a rewritten head still reports the real failure below it
@@ -2131,6 +2183,8 @@ test_rewritten_row_is_skipped_not_treated_as_undecidable
 test_live_rebased_row_beats_older_terminal_row_at_local_head
 test_rebased_completed_row_beats_older_terminal_row_at_local_head
 test_live_rebased_row_overrides_a_dead_attributable_record
+test_completed_rebased_row_overrides_a_dead_attributable_record
+test_cancelled_rebased_row_does_not_release_a_real_failure
 test_rebased_terminal_row_does_not_hide_a_real_failure
 test_live_row_below_a_newer_terminal_row_is_not_claimed
 test_diverged_row_below_a_behind_row_is_not_claimed

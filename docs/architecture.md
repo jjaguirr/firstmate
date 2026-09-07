@@ -66,7 +66,8 @@ Any direct or remaining historical annotation prints every status line unread at
 `bin/fm-nm-run-lib.sh`'s header owns the exact run-head rule and its four outcomes, and the script header owns the run-selection rules built on it.
 One branch can hold several runs, so the newest attributable run owns it, and a run head this local copy does not have yet is never read as a mismatch that would let an older dead run be claimed instead.
 A detailed record for the crew's own branch is trusted on such a head exactly as a resolvable head would trust it, keeping its real state and its full step and gate detail, so a parked run still reads parked and a passed run still reads done.
-The one verdict withheld there is a terminal failure, which resolves to working only when the newest attributable row is itself running.
+The one verdict withheld there is a terminal failure, which is released only when the run row that owns the branch did not itself fail.
+A running row resolves it to working and a completed one to done, while a failed or cancelled row never licenses reporting a terminal failure and leaves that verdict corroborated or unknown.
 A rewritten head is likewise no proof that the run belongs to another worktree, because a pipeline that rebases and pushes its own fix commits leaves exactly that shape on the crew's own branch and no row matches the local head again afterwards.
 So the newest same-branch row in the coarse listing is attributed on branch identity alone, whatever its status word, when its head is diverged from the local head rather than merely behind it.
 The coarse scan orders its evidence strongest first: a row proven to be on this worktree's own code and still running wins outright, otherwise that newest diverged row wins, otherwise the newest head-proof row wins.

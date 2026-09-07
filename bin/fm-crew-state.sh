@@ -29,8 +29,9 @@
 #      gone/dead.
 #   2. Matching no-mistakes run for this crew's branch AND current code identity,
 #      active or terminal (from `axi status`, or the coarse `no-mistakes runs`
-#      fallback)? Branch name alone is not enough: a historical run on a reused
-#      branch whose head was rewritten or diverged must not be attributed.
+#      fallback)? Branch name alone is not enough: a historical run the crew has
+#      since committed past must not be attributed, and no detailed record is
+#      ever attributed on a head this worktree cannot prove is its own.
 #      bin/fm-nm-run-lib.sh's fm_nm_head_matches_worktree owns that rule and its
 #      four outcomes (attributable / behind us / rewritten / undecidable); the
 #      selection rules built on top of it live here:
@@ -444,9 +445,9 @@ nm_ci_checks_state() {
 #       row. A row refuted as behind the worktree carries no verdict at all.
 #   1 - no attributable row within FM_CREW_STATE_RUNS_LIMIT rows, including
 #       when the listing itself is empty or the call did not answer
-#   2 - the newest same-branch row cannot be decided, because its head is not an
-#       object this local copy has, and no newer same-branch row already decided
-#       the question. Echoes that head instead of a status word and stops: an
+#   2 - a same-branch row cannot be decided, because its head is not an object
+#       this local copy has, and no newer diverged row is already held as the
+#       branch's verdict. Echoes that head instead of a status word and stops: an
 #       undecidable row might BE the branch's live owner, and claiming an older
 #       row past it is exactly how a live run gets reported as a dead one.
 nm_runs_status_for_branch() {  # <branch>
@@ -572,6 +573,35 @@ emit_unresolved_head() {  # <head>
     "run head ${1:-?} is not in this local copy; cannot tell which run owns this branch"
 }
 
+# The coarse runs-list vocabulary and what each word reports. ONE owner for that
+# list: the run-step block reads its state and detail from here, and the
+# terminal-failure gate decides on the same words, so the two cannot drift.
+nm_coarse_run_verdict() {  # <coarse-status> -> "<state> <detail>"
+  case "$1" in
+    running)   printf 'working validating (background run)' ;;
+    completed) printf 'done run completed' ;;
+    failed)    printf 'failed run failed' ;;
+    cancelled) printf 'failed run cancelled' ;;
+    *)         printf 'unknown runs list status: %s' "$1" ;;
+  esac
+}
+
+# Does a coarse word license overriding a detailed record's terminal FAILURE?
+# The gate is asymmetric on purpose, and that asymmetry is the whole point of it:
+# a live or successful newest row is evidence the failure being reported is not
+# the branch's current story, while a coarse `failed` or `cancelled` word would
+# only trade one terminal verdict for another and cannot corroborate a failure on
+# its own (PR 6). So success and liveness override; failure never does, and stays
+# corroborated or unknown.
+nm_coarse_overrides_terminal_failure() {  # <coarse-status>
+  local verdict
+  verdict=$(nm_coarse_run_verdict "$1")
+  case "${verdict%% *}" in
+    working|done) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 HAVE_RUN=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
 # $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
@@ -603,11 +633,10 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
         coarse_rc=$?
         if [ "$coarse_rc" = 2 ]; then
           emit_unresolved_head "$COARSE_STATUS"
-        elif [ "$coarse_rc" = 0 ] && [ "$COARSE_STATUS" = running ]; then
-          # A live run owns this branch at code this worktree is on. Only a
-          # live row overrides: every other word is itself terminal, so it
-          # would trade one terminal verdict for another rather than stop a
-          # false failure.
+        elif [ "$coarse_rc" = 0 ] && nm_coarse_overrides_terminal_failure "$COARSE_STATUS"; then
+          # A newer run owns this branch and did not fail, so the older record's
+          # failure is not this branch's current story. nm_coarse_overrides_
+          # terminal_failure owns which words may say that.
           RUN_SOURCE=coarse
         else
           COARSE_STATUS=""
@@ -620,11 +649,12 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       # throw the record away: the run reported on it is this branch's run. So
       # the record is trusted exactly as a resolvable head would trust it, and
       # the ONE verdict still withheld is the same one withheld above, a
-      # terminal failure, because that is what recovery acts on.
+      # terminal failure, because that is what recovery acts on, and it is
+      # released on the same words (nm_coarse_overrides_terminal_failure).
       if nm_detailed_run_is_terminal_failure; then
         COARSE_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
         coarse_rc=$?
-        if [ "$coarse_rc" = 0 ] && [ "$COARSE_STATUS" = running ]; then
+        if [ "$coarse_rc" = 0 ] && nm_coarse_overrides_terminal_failure "$COARSE_STATUS"; then
           HAVE_RUN=1
           RUN_SOURCE=coarse
         elif [ "$coarse_rc" = 2 ]; then
@@ -636,9 +666,10 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
         HAVE_RUN=1
       fi
     else
-      # The active-or-most-recent run is for another branch, or same branch with
-      # a rewritten/diverged head (provably not this worktree's, so never
-      # attributed) - try the coarse fallback.
+      # The active-or-most-recent run is for another branch, or same branch on a
+      # head this record cannot prove is ours - never attributed from the
+      # detailed record, though the coarse fallback below may still bind a
+      # rewritten head to this branch (see the run-selection rules above).
       # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
       # primary call means the CLI itself did not respond, so retrying it
       # immediately with a second bounded call would just double the wait
@@ -671,13 +702,9 @@ if [ "$HAVE_RUN" = 1 ]; then
     # needs-decision/blocked status-log append (a captain-relevant VERB) is
     # surfaced through signal_reason_is_actionable regardless of this
     # coarse-vs-full distinction, so a real gate is never silently missed.
-    case "$COARSE_STATUS" in
-      running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
-      completed) RUN_STATE="done";  RUN_DETAIL="run completed" ;;
-      failed)    RUN_STATE=failed;  RUN_DETAIL="run failed" ;;
-      cancelled) RUN_STATE=failed;  RUN_DETAIL="run cancelled" ;;
-      *)         RUN_STATE=unknown; RUN_DETAIL="runs list status: $COARSE_STATUS" ;;
-    esac
+    coarse_verdict=$(nm_coarse_run_verdict "$COARSE_STATUS")
+    RUN_STATE=${coarse_verdict%% *}
+    RUN_DETAIL=${coarse_verdict#* }
   else
     status=$(strip_quotes "$(nm_field status)")
     RUN_STATUS=$status
