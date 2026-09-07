@@ -31,6 +31,9 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-classify-lib.sh"
+# The shared run-attribution predicate, exercised directly below as well as
+# through the helper. shellcheck source=/dev/null
+. "$ROOT/bin/fm-nm-run-lib.sh"
 
 CREW_STATE="$ROOT/bin/fm-crew-state.sh"
 TMP_ROOT=$(fm_test_tmproot fm-crew-state)
@@ -1408,6 +1411,231 @@ test_missing_run_head_falls_back_to_current_state() {
   pass "missing run head falls back instead of matching by branch"
 }
 
+# ---------------------------------------------------------------------------
+# Run attribution when ONE branch holds SEVERAL runs.
+#
+# Regression set for the 2026-09-06 report: a worker read FAILED in the fleet
+# view while its run was alive and parked at a gate. The pipeline keeps its own
+# copy of the branch, so its pushed fix commits were not yet objects the crew's
+# local copy had; the live run's head therefore could not be resolved there, was
+# read as a plain mismatch, and the scan walked past it to an EARLIER run that
+# had died at exactly the stale local head. A false FAILED is what recovery acts
+# on, so this direction of error stops a healthy worker holding an open decision.
+#
+# These cases pin both halves of the rule and, deliberately alongside them, the
+# refusals that must NOT widen as a result.
+
+# A branch at <branch> whose local head is the DEAD run's head, with the live
+# run one commit further on. Echoes "<dead-head> <live-head>". With `absent` the
+# live commit is removed from the local object store, reproducing the local copy
+# that has not yet synced the pipeline's pushed commits; with `present` it is
+# still resolvable, the same shape once that sync has happened.
+make_stale_local_head_repo() {  # <dir> <branch> <present|absent>
+  local dir=$1 branch=$2 live=$3 dead_head live_head
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" commit -q --allow-empty -m init
+  git -C "$dir" checkout -q -b "$branch"
+  git -C "$dir" commit -q --allow-empty -m 'crew work the earlier run validated'
+  dead_head=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" commit -q --allow-empty -m 'no-mistakes(document): pipeline housekeeping'
+  live_head=$(git -C "$dir" rev-parse HEAD)
+  git -C "$dir" reset -q --hard "$dead_head"
+  if [ "$live" = absent ]; then
+    git -C "$dir" reflog expire --expire=now --all
+    git -C "$dir" gc -q --prune=now 2>/dev/null || true
+    git -C "$dir" rev-parse --verify -q "${live_head}^{commit}" >/dev/null 2>&1 \
+      && fail "fixture did not remove the live run head from the local object store"
+  fi
+  printf '%s %s\n' "$dead_head" "$live_head"
+}
+
+# Both runs are attributable - the dead one by equality with the stale local
+# head, the live one by ancestry - so the live run must win.
+test_live_run_beats_dead_run_at_stale_local_head() {
+  reset_fakes
+  local d heads dead_head live_head out
+  d=$(new_case live-beats-dead)
+  heads=$(make_stale_local_head_repo "$d/wt" fm/feat-live-dead present)
+  dead_head=${heads%% *}
+  live_head=${heads##* }
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/live-dead.meta" "window=fm:fm-live-dead" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'needs-decision: review gate\n' > "$d/state/live-dead.status"
+  # The detailed record is the run that died on the stale local head.
+  FM_FAKE_RUN_HEAD="$dead_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-live-dead)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-live-dead $(git -C "$d/wt" rev-parse --short=8 "$live_head")  2026-09-06 20:49
+  failed     fm/feat-live-dead $(git -C "$d/wt" rev-parse --short=8 "$dead_head")  2026-09-05 06:01
+EOF
+)"
+  out=$(run_crew_state "$d" live-dead)
+  assert_not_contains "$out" "state: failed" "a live run on the branch must stop the dead run's failed verdict"
+  assert_contains "$out" "state: working" "the live run owns the branch"
+  assert_contains "$out" "source: run-step" "live-run resolution stays run-step sourced"
+  pass "a live run beats a dead run sitting at the stale local head"
+}
+
+# The reported incident itself: the live run's head is not in this local copy,
+# and the dead run's head IS. The undecidable row must stop the scan, so the
+# dead run below it is never claimed.
+test_unresolvable_live_head_reports_unknown_not_failed() {
+  reset_fakes
+  local d heads dead_head live_head out
+  d=$(new_case unresolvable-live-head)
+  heads=$(make_stale_local_head_repo "$d/wt" fm/feat-unresolvable absent)
+  dead_head=${heads%% *}
+  live_head=${heads##* }
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unres.meta" "window=fm:fm-unres" "worktree=$d/wt" "kind=ship" "harness=claude"
+  printf 'needs-decision: review gate\n' > "$d/state/unres.status"
+  # The CLI answers with the live run, at a head this local copy does not have.
+  FM_FAKE_RUN_HEAD="${live_head:0:8}"
+  FM_FAKE_AXI_STATUS="$(run_parked fm/feat-unresolvable)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-unresolvable ${live_head:0:8}  2026-09-06 20:49
+  failed     fm/feat-unresolvable $(git -C "$d/wt" rev-parse --short=8 "$dead_head")  2026-09-05 06:01
+EOF
+)"
+  out=$(run_crew_state "$d" unres)
+  assert_not_contains "$out" "state: failed" "an unreadable run head must never be reported as a failure"
+  assert_contains "$out" "state: unknown" "an undecidable head is reported as its own state"
+  assert_contains "$out" "${live_head:0:7}" "the unknown verdict names the head it could not read"
+  assert_contains "$out" "not in this local copy" "the unknown verdict says why it cannot decide"
+  pass "an unresolvable run head reports unknown, never the dead run underneath it"
+}
+
+# Same undecidable newest row, but with the detailed record already terminal:
+# the corroboration path must reach the same explicit unknown rather than
+# confirming the failure it set out to check.
+test_unresolvable_row_stops_terminal_failure_confirmation() {
+  reset_fakes
+  local d heads dead_head live_head out
+  d=$(new_case unresolvable-confirm)
+  heads=$(make_stale_local_head_repo "$d/wt" fm/feat-unres-confirm absent)
+  dead_head=${heads%% *}
+  live_head=${heads##* }
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unresc.meta" "window=fm:fm-unresc" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_RUN_HEAD="$dead_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-unres-confirm)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-unres-confirm ${live_head:0:8}  2026-09-06 20:49
+  failed     fm/feat-unres-confirm $(git -C "$d/wt" rev-parse --short=8 "$dead_head")  2026-09-05 06:01
+EOF
+)"
+  out=$(run_crew_state "$d" unresc)
+  assert_not_contains "$out" "state: failed" "an undecidable newer row must not be read as confirming the failure"
+  assert_contains "$out" "state: unknown" "the corroboration path reports the undecidable head honestly"
+  pass "an undecidable newer row stops a terminal-failure confirmation"
+}
+
+# The other direction of the same rule: when the failed run genuinely IS the
+# branch's newest attributable run, it stays failed. Confirming a failure must
+# not become a way to talk any failure away.
+test_genuinely_latest_failed_run_stays_failed() {
+  reset_fakes
+  local d short out
+  d=$(new_case latest-failed-stays)
+  make_repo_on_branch "$d/wt" fm/feat-latest-failed
+  short=$(git -C "$d/wt" rev-parse --short=8 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/latest-failed.meta" "window=fm:fm-latest-failed" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-latest-failed)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-latest-failed ${short}  2026-09-06 20:49
+  completed  fm/feat-latest-failed ${short}  2026-09-05 06:01
+EOF
+)"
+  out=$(run_crew_state "$d" latest-failed)
+  assert_contains "$out" "state: failed" "the branch's newest attributable run is still a real failure"
+  assert_contains "$out" "source: run-step" "a confirmed failure stays run-step sourced"
+  pass "a genuinely latest failed run stays failed"
+}
+
+# A run listed for this branch on a head that is a REWRITE - resolvable, and
+# provably not this worktree's history - is still refused, and refused without
+# stopping the scan, so the branch's own attributable row is still found.
+test_rewritten_row_is_skipped_not_treated_as_undecidable() {
+  reset_fakes
+  local d rewritten out
+  d=$(new_case rewritten-row)
+  make_repo_on_branch "$d/wt" fm/feat-rewritten-row
+  git -C "$d/wt" checkout -q --orphan tmp-rewrite-row
+  git -C "$d/wt" commit -q --allow-empty -m 'foreign rewritten tip'
+  rewritten=$(git -C "$d/wt" rev-parse --short=8 HEAD)
+  git -C "$d/wt" checkout -q fm/feat-rewritten-row
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/rewritten-row.meta" "window=fm:fm-rewritten-row" "worktree=$d/wt" "kind=ship" "harness=claude"
+  FM_FAKE_AXI_STATUS="$(run_running fm/other-crew)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  failed     fm/feat-rewritten-row ${rewritten}  2026-09-06 20:49
+  running    fm/feat-rewritten-row $(git -C "$d/wt" rev-parse --short=8 HEAD)  2026-09-05 06:01
+EOF
+)"
+  out=$(run_crew_state "$d" rewritten-row)
+  assert_not_contains "$out" "state: failed" "a provably foreign row must not be attributed"
+  assert_contains "$out" "state: working" "the branch's own attributable row is still found past it"
+  pass "a provably rewritten row is skipped, not read as undecidable"
+}
+
+# --- the shared predicate itself (bin/fm-nm-run-lib.sh) ---------------------
+#
+# Three outcomes, not two: attributable, provably not ours, undecidable. The
+# incident above is what happens when the third collapses into the second.
+head_match_rc() {  # <worktree> <run-head> -> echoes the exit status
+  local rc=0
+  fm_nm_head_matches_worktree "$1" "$2" || rc=$?
+  printf '%s' "$rc"
+}
+
+test_head_predicate_reports_three_outcomes() {
+  local d live_head advanced rewritten rc
+  d="$TMP_ROOT/head-predicate"
+  mkdir -p "$d"
+  git -C "$d" init -q
+  git -C "$d" commit -q --allow-empty -m init
+  git -C "$d" checkout -q -b fm/feat-predicate
+  git -C "$d" commit -q --allow-empty -m 'run head'
+  live_head=$(git -C "$d" rev-parse HEAD)
+
+  rc=$(head_match_rc "$d" "$live_head")
+  [ "$rc" = "$FM_NM_HEAD_MATCH" ] || fail "equal head must attribute (got $rc)"
+  rc=$(head_match_rc "$d" "$(git -C "$d" rev-parse --short=8 HEAD)")
+  [ "$rc" = "$FM_NM_HEAD_MATCH" ] || fail "equal head as a short sha must attribute (got $rc)"
+
+  # Pipeline fix commits advanced the run tip past local HEAD: still ours.
+  git -C "$d" commit -q --allow-empty -m 'no-mistakes(document): pipeline commit'
+  advanced=$(git -C "$d" rev-parse HEAD)
+  git -C "$d" reset -q --hard "$live_head"
+  rc=$(head_match_rc "$d" "$advanced")
+  [ "$rc" = "$FM_NM_HEAD_MATCH" ] || fail "a descendant run head must attribute (got $rc)"
+
+  # Local work advanced past the run head: provably not this run's code.
+  git -C "$d" commit -q --allow-empty -m 'local work after the run'
+  rc=$(head_match_rc "$d" "$live_head")
+  [ "$rc" = "$FM_NM_HEAD_MISMATCH" ] || fail "local work past the run head must refute (got $rc)"
+
+  # A rewritten (diverged) tip: also provably not ours.
+  git -C "$d" checkout -q --orphan tmp-predicate-rewrite
+  git -C "$d" commit -q --allow-empty -m 'rewritten tip'
+  rewritten=$(git -C "$d" rev-parse HEAD)
+  rc=$(head_match_rc "$d" "$live_head")
+  [ "$rc" = "$FM_NM_HEAD_MISMATCH" ] || fail "a diverged head must refute (got $rc)"
+  [ -n "$rewritten" ] || fail "rewrite fixture produced no head"
+
+  # No head recorded at all: nothing to bind, so a refusal, not a maybe.
+  rc=$(head_match_rc "$d" "")
+  [ "$rc" = "$FM_NM_HEAD_MISMATCH" ] || fail "an empty run head must refute (got $rc)"
+
+  # A head this worktree simply does not have: undecidable, NOT a refutation.
+  rc=$(head_match_rc "$d" 0123456789abcdef0123456789abcdef01234567)
+  [ "$rc" = "$FM_NM_HEAD_UNRESOLVED" ] \
+    || fail "an unresolvable run head must be its own outcome, not a mismatch (got $rc)"
+  pass "the shared head predicate separates undecidable from provably-not-ours"
+}
+
 test_active_run_is_authoritative
 test_stale_needs_decision_superseded
 test_stale_blocked_superseded
@@ -1461,5 +1689,11 @@ test_historical_same_branch_rewritten_head_not_current
 test_active_run_descendant_fix_head_remains_current
 test_local_advanced_past_run_head_invalidates
 test_missing_run_head_falls_back_to_current_state
+test_live_run_beats_dead_run_at_stale_local_head
+test_unresolvable_live_head_reports_unknown_not_failed
+test_unresolvable_row_stops_terminal_failure_confirmation
+test_genuinely_latest_failed_run_stays_failed
+test_rewritten_row_is_skipped_not_treated_as_undecidable
+test_head_predicate_reports_three_outcomes
 
 echo "all fm-crew-state tests passed"
