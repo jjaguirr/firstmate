@@ -1,0 +1,20 @@
+Fixture: parent home with 900-row backlog (137503 bytes of backlog.md), one registered
+secondmate home with a 400-row backlog, and 1500 accumulated scout reports.
+
+==============================================================
+BEFORE - base commit 3a4a733 (pre-fix code)
+==============================================================
+$ bin/fm-bearings-snapshot.sh
+/tmp/fm-e2e.bM5CD8/oldbin/fm-fleet-snapshot.sh: line 621: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+fm-fleet-snapshot: main inventory summary failed
+exit=1
+
+$ bin/fm-fleet-view.sh
+/tmp/fm-e2e.bM5CD8/oldbin/fm-fleet-snapshot.sh: line 621: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+fm-fleet-snapshot: main inventory summary failed
+exit=1
+
+$ bin/fm-fleet-snapshot.sh --secondmate-home-summary   (run inside the secondmate home)
+/tmp/fm-e2e.bM5CD8/oldbin/fm-fleet-snapshot.sh: line 649: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+fm-fleet-snapshot: secondmate home summary failed
+exit=1

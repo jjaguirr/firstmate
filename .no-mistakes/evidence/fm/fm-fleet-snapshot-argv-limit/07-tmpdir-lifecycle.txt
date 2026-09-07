@@ -1,0 +1,19 @@
+Temp-directory lifecycle (the payloads now on disk hold task titles and PR URLs).
+TMPDIR points at a private directory so any leftover is visible.
+
+--json normal exit:                   exit=0  leftover=0
+--secondmate-home-summary early exit: exit=0  leftover=0
+unknown flag:                         exit=2  leftover=0
+
+signal death mid-run (large fleet home, killed while the temp files exist):
+  SIGTERM: temp files present before signal=3  exit=143  leftover dirs after death=0
+  SIGINT: temp files present before signal=3  exit=0  leftover dirs after death=0
+  SIGHUP: temp files present before signal=3  exit=129  leftover dirs after death=0
+
+TMPDIR at end:
+  (empty - nothing leaked)
+
+Re-checked SIGINT with a default (non-ignored) disposition by spawning the script
+from python instead of as a bash background job, since non-interactive bash sets
+SIGINT to ignore for asynchronous commands:
+  SIGINT (default disposition): temp files present before signal=3 leftover dirs=0

@@ -1,0 +1,14 @@
+MAX_ARG_STRLEN on Linux = 131072 bytes per single argv entry.
+Payload sizes in this fixture's snapshot (each was previously one --argjson argv entry):
+  backlog                761839 bytes  OVER LIMIT
+  tasks                       3 bytes  under limit
+  scout_reports          161288 bytes  OVER LIMIT
+  secondmate_current       8217 bytes  under limit
+  secondmate_landed          59 bytes  under limit
+  main_inventory             82 bytes  under limit
+
+Snapshot content integrity after the file-based rewrite:
+{"schema":"fm-fleet-snapshot.v1","queued_backlog_records":900,"scout_reports":1500,"scout_kind_all_scout":true,"main_inventory_valid":true,"secondmate_total":1,"secondmate_shown":1,"secondmate_truncated":0,"secondmate_records":1,"mate_id":"big-mate","mate_state":"no_active_work","mate_queued":400,"mate_provenance":"structured-home"}
+
+stderr from the run:
+(empty above means no warnings)

@@ -1,0 +1,19 @@
+Secondmate aggregation path with a per-home summary above MAX_ARG_STRLEN
+(FM_SNAPSHOT_SECONDMATE_QUEUED=400 keeps the whole child queue in the summary).
+
+child summary size: 172309 bytes (limit 131072, accept cap FM_SNAPSHOT_SECONDMATE_MAX_BYTES=262144)
+
+BEFORE - base commit 3a4a733:
+$ bin/fm-bearings-snapshot.sh
+/tmp/fm-e2e.bM5CD8/oldbin/fm-fleet-snapshot.sh: line 621: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+fm-fleet-snapshot: main inventory summary failed
+
+AFTER - b2e0815:
+$ bin/fm-fleet-snapshot.sh --json  (secondmate section)
+exit=0
+secondmate_current payload size: 128107 bytes
+{"total":1,"shown":1,"truncated":0,"records":1,"id":"big-mate","queued_rows":400,"landed_unreadable":0}
+
+$ bin/fm-bearings-snapshot.sh (secondmate line)
+secondmates[1]{id,state,doing,provenance,freshness,age_seconds,contradiction,reason}:
+  big-mate,no_active_work,No active child work,structured-home,fresh,0,false,"-"

@@ -1,0 +1,20 @@
+Isolated scout-report path: small backlog, 1500 accumulated scout reports
+(scout reports are never pruned, so a long-lived home reaches this).
+
+BEFORE - commit b9d4dfc (scout_reports still passed through argv):
+exit=126
+/tmp/fm-e2e.bM5CD8/oldbin3/fm-fleet-snapshot.sh: line 1413: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+
+AFTER - b2e0815:
+exit=0
+scout_reports payload size: 168788 bytes
+{"count":1500,"first":{"id":"scout-report-1","path":"/tmp/fm-e2e.bM5CD8/scout-home/data/scout-report-1/report.md","kind":"scout"},"all_kind_scout":true}
+
+$ bin/fm-bearings-snapshot.sh with the same home (after fix)
+schema: fm-bearings.v1
+home: fm-e2e.bM5CD8/scout-home
+generated: "2026-09-07T20:52:26Z"
+prs: "not_requested (run: /bearings include PRs)"
+in_flight: []
+secondmates: []
+exit=0

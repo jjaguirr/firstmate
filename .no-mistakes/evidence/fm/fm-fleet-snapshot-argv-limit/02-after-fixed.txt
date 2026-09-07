@@ -1,0 +1,40 @@
+==============================================================
+AFTER - b2e0815 (fixed code), same fixture
+==============================================================
+$ bin/fm-bearings-snapshot.sh   (the command E2BIG killed)
+exit=0
+schema: fm-bearings.v1
+home: fm-e2e.bM5CD8/fleet
+generated: "2026-09-07T20:48:53Z"
+prs: "not_requested (run: /bearings include PRs)"
+in_flight: []
+secondmates[1]{id,state,doing,provenance,freshness,age_seconds,contradiction,reason}:
+  big-mate,no_active_work,No active child work,structured-home,fresh,0,false,"-"
+decisions_open: []
+landed: []
+gates[20]{id,title,blocked_by,reason,owner}:
+  task-1,Ship the 1-th thing that has a fairly long descriptive title…,"-","-",(main)
+  task-2,Ship the 2-th thing that has a fairly long descriptive title…,"-","-",(main)
+  task-3,Ship the 3-th thing that has a fairly long descriptive title…,"-","-",(main)
+  task-4,Ship the 4-th thing that has a fairly long descriptive title…,"-","-",(main)
+  ... (41 lines total)
+
+$ bin/fm-fleet-view.sh | head
+exit=0
+# Fleet View
+
+Schema: fm-fleet-snapshot.v1
+Home: /tmp/fm-e2e.bM5CD8/fleet
+
+## Under Way
+No live task metadata found.
+
+  ...
+6:## Under Way
+9:## Queued
+913:## Done
+916:## Secondmates
+
+$ bin/fm-fleet-snapshot.sh --secondmate-home-summary   (inside the secondmate home)
+exit=0
+{"schema":"fm-secondmate-home-summary.v1","home":"/tmp/fm-e2e.bM5CD8/fleet-child","state":"no_active_work","counts":{"active_children":0,"decisions_open":0,"holds":0,"queued":400,"landed":0,"endpoints":0}}

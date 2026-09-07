@@ -1,0 +1,20 @@
+Isolated secondmate path: small parent backlog, one registered child home whose
+summary serializes to 172309 bytes (over MAX_ARG_STRLEN 131072, under the
+FM_SNAPSHOT_SECONDMATE_MAX_BYTES=262144 accept cap).
+
+base 3a4a733 - child's own summary dies E2BIG, parent degrades the record silently:
+{"id":"big-mate","state":"unknown","reason":"structured home snapshot failed","provenance":"unknown"}
+
+commit 68a7c68 (backlog/tasks fixed, secondmate summary still on argv) - parent aborts:
+exit=1
+/tmp/fm-e2e.bM5CD8/oldbin2/fm-fleet-snapshot.sh: line 1097: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+/tmp/fm-e2e.bM5CD8/oldbin2/fm-fleet-snapshot.sh: line 1318: /home/ubuntu/.nix-profile/bin/jq: Argument list too long
+jq: invalid JSON text passed to --argjson
+
+AFTER b2e0815 - full structured record, nothing degraded:
+exit=0
+{"total":1,"shown":1,"truncated":0,"records":1,"id":"big-mate","state":"no_active_work","provenance":"structured-home","queued_rows":400}
+
+$ bin/fm-bearings-snapshot.sh (after fix)
+secondmates[1]{id,state,doing,provenance,freshness,age_seconds,contradiction,reason}:
+  big-mate,no_active_work,No active child work,structured-home,fresh,0,false,"-"

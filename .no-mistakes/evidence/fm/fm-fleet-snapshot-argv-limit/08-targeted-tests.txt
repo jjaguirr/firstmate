@@ -1,0 +1,8 @@
+Targeted test runs
+
+$ bash tests/fm-fleet-snapshot-view.test.sh   (4 new regression cases, last 4 of the first 7 lines)
+ok - an oversized backlog crosses the argv limit and the JSON snapshot still succeeds
+ok - an oversized backlog crosses the argv limit and the secondmate home summary still succeeds
+ok - an oversized secondmate summary crosses the argv limit and the fleet snapshot still succeeds
+ok - an oversized scout report list crosses the argv limit and the JSON snapshot still succeeds
+ok lines: 20  (ci.yml asserts 20)
