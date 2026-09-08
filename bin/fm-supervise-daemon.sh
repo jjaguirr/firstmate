@@ -375,38 +375,16 @@ classify_signal() {  # <reason-after-colon> <state>
   fi
 }
 
-# 0 when a status line belongs to the terminal escalate/dedupe path below, so a
-# quota wait never stands in front of it. A quota-parked worker was refused a
-# turn and could not write anything new; whatever its last line says therefore
-# still describes work this daemon owes the digest, and a wait that swallowed a
-# blocked: or done: would be exactly the quieter alarm this change forbids. The
-# nonterminal progress verbs need no arm of their own: fm-classify-lib.sh's own
-# captain-relevant predicate already refuses working, resolved, captain-held and
-# paused before any free-text matching, and those are the ordinary shape of a
-# worker that simply stopped mid-task, which is what a quota refusal looks like.
-status_owns_terminal_path() {  # <status-line>
-  local last=$1
-  [ -n "$last" ] || return 1
-  status_is_terminal_verb "$last" && return 0
-  status_is_captain_relevant "$last"
-}
-
 # The reason one recorded provider quota refusal is reported with, in the wake
-# and in the housekeeping recheck alike. `unattributed` is an internal token for
-# a worker whose provider could not be established, never a vendor name, and a
-# wait whose reset nobody could read is never resumed automatically - so neither
-# may be stated as if it were otherwise.
+# and in the housekeeping recheck alike. bin/fm-quota-lib.sh owns both rules the
+# sentence rests on, so this daemon and the watcher cannot drift apart on what a
+# wait is called or on what it promises.
 quota_wait_reason() {  # <state> <task>
-  local state=$1 task=$2 provider reset name outcome
-  provider=$(fm_quota_wait_field "$state" "$task" provider)
-  reset=$(fm_quota_wait_field "$state" "$task" reset)
-  case "$provider" in ''|unattributed) name="provider" ;; *) name="$provider" ;; esac
-  case "$reset" in
-    ''|*[!0-9]*) outcome="no reset time could be read, so this worker is NOT resumed automatically" ;;
-    *) outcome="this worker is resumed automatically when that limit resets" ;;
-  esac
+  local state=$1 task=$2
   printf 'waiting on the %s usage limit to reset %s; %s' \
-    "$name" "$(fm_quota_format_reset "$reset")" "$outcome"
+    "$(fm_quota_wait_provider_name "$state" "$task")" \
+    "$(fm_quota_format_reset "$(fm_quota_wait_field "$state" "$task" reset)")" \
+    "$(fm_quota_wait_resume_outcome "$state" "$task")"
 }
 
 # 0 when an idle pane's idleness is DECLARED rather than suspicious: the worker's
@@ -419,8 +397,7 @@ stale_is_declared_wait() {  # <window> <state> <last-status-line>
   local win=$1 state=$2 last=$3 task
   status_is_paused_or_captain_held "$last" && return 0
   task=$(window_to_task "$win" "$state")
-  [ -n "$task" ] || return 1
-  fm_quota_wait_active "$state" "$task"
+  fm_quota_wait_suppresses "$state" "$task" "$last" unknown
 }
 
 # classify_stale decides the WAKE itself (one-shot per distinct hash). On a
@@ -430,8 +407,7 @@ classify_stale() {  # <window> <state>
   local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
-  if [ -n "$task" ] && ! status_owns_terminal_path "$last" &&
-    fm_quota_wait_active "$state" "$task"; then
+  if fm_quota_wait_suppresses "$state" "$task" "$last" unknown; then
     # A recorded provider quota refusal is a declared external wait the worker
     # could not declare for itself: it was refused service, so it never got a
     # turn in which to write a status line. It takes the same long recheck
@@ -1136,7 +1112,7 @@ housekeeping() {  # <state>
         elif [ -n "$last" ] && status_is_paused "$last"; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
           _now > "$marker"
-        elif [ -n "$task" ] && fm_quota_wait_active "$state" "$task"; then
+        elif fm_quota_wait_suppresses "$state" "$task" "$last" unknown; then
           escalate_add "$state" "paused ${age}s ($(quota_wait_reason "$state" "$task")): $win"
           _now > "$marker"
         else

@@ -539,6 +539,69 @@ fm_quota_wait_active() {  # <state-dir> <id>
   [ "$(date +%s)" -lt "$deadline" ]
 }
 
+# THE one owner of the question "may this recorded wait stand in front of a
+# supervision reading". Every suppression site asks this and composes no
+# preconditions of its own, so a later caller cannot take the record's benefit
+# while quietly dropping one of its guards. fm_quota_wait_active stays the
+# deadline predicate underneath it, for this owner and for the non-suppression
+# readers - the scan and the resume path - that only ask whether a record is
+# still current.
+#
+# <admission> is the caller's own liveness evidence, in bin/fm-watch.sh's
+# vocabulary, and is explicit precisely because the daemon has none where the
+# watcher does:
+#   admit-alive   the idle-stale path, which reads the endpoint and admits an
+#                 alive reading as new evidence.
+#   refuse-alive  the busy-turn-bound path. A pane past that bound renders a
+#                 harness busy footer, so a hung foreground call there looks
+#                 exactly like a worker still being served, and absorbing it is
+#                 how a long hang hides. Never suppressed.
+#   unknown       the away-mode daemon, which takes no liveness reading at all.
+#                 It is not the busy-hang path either, so the record and the
+#                 status line carry the decision alone.
+#
+# A terminal or captain-relevant status line is never suppressed at any site: a
+# worker that reported blocked: or done: still owes the captain that reading,
+# and a wait that swallowed it would be exactly the quieter alarm without a
+# rarer condition this contract forbids. The status predicates come from
+# bin/fm-classify-lib.sh, which every driver of this file already sources.
+fm_quota_wait_suppresses() {  # <state-dir> <id> <last-status-line> <admission>
+  local state=$1 id=$2 last=$3 admission=$4
+  [ -n "$id" ] || return 1
+  case "$admission" in
+    admit-alive|unknown) ;;
+    *) return 1 ;;
+  esac
+  if [ -n "$last" ]; then
+    status_is_terminal_verb "$last" && return 1
+    status_is_captain_relevant "$last" && return 1
+  fi
+  fm_quota_wait_active "$state" "$id"
+}
+
+# The provider a recorded wait names, as a human reads it. `unattributed` is an
+# internal token for a worker whose provider could not be established, never a
+# vendor name, so no surface may print it as one. Lives here rather than in one
+# caller for the same reason fm_quota_format_reset does: the watcher's stale
+# recheck and the away-mode daemon report the same record.
+fm_quota_wait_provider_name() {  # <state-dir> <id>
+  local provider
+  provider=$(fm_quota_wait_field "$1" "$2" provider)
+  case "$provider" in
+    ''|unattributed) printf 'provider' ;;
+    *) printf '%s' "$provider" ;;
+  esac
+}
+
+# What a reader must expect of a recorded wait. A wait whose reset nobody could
+# read is never resumed automatically, so no surface may promise otherwise.
+fm_quota_wait_resume_outcome() {  # <state-dir> <id>
+  case "$(fm_quota_wait_field "$1" "$2" reset)" in
+    ''|*[!0-9]*) printf 'no reset time could be read, so this worker is NOT resumed automatically' ;;
+    *) printf 'this worker is resumed automatically when that limit resets' ;;
+  esac
+}
+
 # 0 when a recorded wait's reset time has arrived and a resume is therefore due.
 # A wait with no readable reset is never due: it expires instead, because a
 # resume time nobody could read is a guess, and guessing is how a nudge lands in

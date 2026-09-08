@@ -275,7 +275,44 @@ test_stale_quota_wait_never_swallows_a_terminal_status() {
   out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9t" "$state")
   case "$out" in pause\|*) fail "a recorded quota wait swallowed a terminal status: $out" ;; esac
   case "$out" in *"cannot reach the staging DB"*) ;; *) fail "the terminal status never reached the digest: $out" ;; esac
+
+  # The marker boundary reads the same owner, so a blocked worker never earns the
+  # declared-wait cadence there either - its wedge marker has to age instead.
+  reconcile_pause_tracking "sess:fm-quota-w9t" "$state" "blocked: cannot reach the staging DB"
+  [ ! -e "$state/.subsuper-paused-$(_stale_key quota-w9t)" ] ||
+    fail "a blocked worker behind a quota wait was given a declared-wait pause marker"
   pass "a recorded quota wait never stands in front of a terminal status"
+}
+
+# The housekeeping recheck reads the same owner as the wake and the marker
+# boundary. A blocked worker that happens to carry a quota wait must never be
+# re-labelled as a provider pause, and must never be promised a resume.
+test_housekeeping_never_rechecks_a_terminal_status_as_a_quota_pause() {
+  local dir state fakebin win key
+  dir=$(make_supercase quota-terminal-recheck)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  win="sess:fm-quota-w9r"
+  printf 'window=%s\nbackend=tmux\nkind=ship\n' "$win" > "$state/quota-w9r.meta"
+  printf 'blocked: cannot reach the staging DB\n' > "$state/quota-w9r.status"
+  printf 'Idle.\n' > "$dir/pane.txt"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9r claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the quota wait record"
+  key=$(_stale_key quota-w9r)
+  # A marker already aged past the declared-wait recheck window, which is the
+  # state the recheck arm fires from.
+  echo $(( $(date +%s) - 99999 )) > "$state/.subsuper-paused-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 housekeeping "$state"
+
+  if [ -e "$state/.subsuper-escalations" ]; then
+    ! grep -F "usage limit" "$state/.subsuper-escalations" >/dev/null ||
+      fail "a blocked worker was rechecked as a provider quota pause"
+  fi
+  [ ! -e "$state/.subsuper-paused-$key" ] ||
+    fail "a blocked worker behind a quota wait kept a declared-wait pause marker"
+  pass "the housekeeping recheck never re-labels a terminal status as a provider quota pause"
 }
 
 # The record a human has to pick up: a matched notice that stated no reset time.
@@ -2060,6 +2097,7 @@ test_stale_quota_wait_classifies_pause
 test_stale_quota_wait_never_swallows_a_terminal_status
 test_stale_quota_wait_with_no_reset_is_reported_as_needing_a_human
 test_stale_quota_wait_pause_marker_survives_housekeeping
+test_housekeeping_never_rechecks_a_terminal_status_as_a_quota_pause
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking

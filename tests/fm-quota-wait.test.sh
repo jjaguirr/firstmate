@@ -35,6 +35,10 @@ set -u
 # for the same reason every production driver of that file sources it.
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-backend.sh"
+# The status predicates the suppression owner reads, sourced here for the same
+# reason every production driver sources them.
+# shellcheck source=/dev/null
+. "$ROOT/bin/fm-classify-lib.sh"
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-quota-lib.sh"
 
@@ -268,6 +272,44 @@ SH
   chmod +x "$1/fakebin/fm-crew-state.sh"
 }
 
+# --- the suppression owner --------------------------------------------------
+
+# bin/fm-quota-lib.sh owns one decision - may this recorded wait stand in front
+# of a supervision reading - and every site asks it rather than composing its own
+# preconditions. These cases pin the two guards that decision carries, so a site
+# that stopped asking would take the record's benefit without them.
+test_the_suppression_owner_honours_both_guards() {
+  local dir id
+  dir=$(make_case suppression "the worker stopped mid-task")
+  id=$(case_id suppression)
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) + 3600 ))" structural ||
+    fail "suppression: could not write the wait record"
+
+  fm_quota_wait_suppresses "$dir/state" "$id" 'working: implementing the fix' admit-alive ||
+    fail "suppression: a current wait behind a nonterminal status was not suppressed on the idle-stale path"
+  fm_quota_wait_suppresses "$dir/state" "$id" 'working: implementing the fix' unknown ||
+    fail "suppression: a current wait was not suppressed where no liveness reading exists"
+
+  # A pane past the busy-turn bound renders a harness busy footer, so a hung
+  # foreground call there looks like a worker still being served.
+  ! fm_quota_wait_suppresses "$dir/state" "$id" 'working: implementing the fix' refuse-alive ||
+    fail "suppression: a wait suppressed the busy-turn-bound path, which is how a long hang hides"
+
+  # A worker that reported a terminal state still owes the captain that reading.
+  local line
+  for line in 'blocked: cannot reach the staging DB' 'done: opened the PR' 'failed: the build will not run'; do
+    ! fm_quota_wait_suppresses "$dir/state" "$id" "$line" admit-alive ||
+      fail "suppression: a wait swallowed the terminal status '$line' on the idle-stale path"
+    ! fm_quota_wait_suppresses "$dir/state" "$id" "$line" unknown ||
+      fail "suppression: a wait swallowed the terminal status '$line' where no liveness reading exists"
+  done
+
+  fm_quota_wait_clear "$dir/state" "$id"
+  ! fm_quota_wait_suppresses "$dir/state" "$id" 'working: implementing the fix' admit-alive ||
+    fail "suppression: a retired wait still suppressed a supervision reading"
+  pass "suppression: the one owner refuses a terminal status and refuses the busy-turn-bound path"
+}
+
 # --- provider attribution ---------------------------------------------------
 
 test_provider_attribution() {
@@ -495,16 +537,19 @@ test_a_still_refused_account_is_not_resumed() {
   make_fake_crew_state "$dir" "state: unknown · source: none · idle"
   fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) - 600 ))" structural ||
     fail "stillrefused: could not write the wait record"
-  # The window slipped: the vendor now names a LATER reset for the same refusal.
+  # The account is still refusing at this wait's own stated reset, and names a
+  # later window. One record carries ONE deadline: it retires here rather than
+  # moving that deadline forward, or a vendor that keeps restating a later reset
+  # would hold the pane out of wedge aging indefinitely.
   write_quota_json "$dir/quota.json" claude exhausted_now "$(iso_in 1800)"
 
   out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
   [ ! -s "$dir/sent.log" ] || fail "stillrefused: a resume was sent into an account still out of headroom"
-  assert_present "$dir/state/$id.quota-wait" "stillrefused: the corrected wait was dropped"
-  [ "$(fm_quota_wait_field "$dir/state" "$id" reset)" -gt "$(date +%s)" ] ||
-    fail "stillrefused: the wait's reset time was not corrected to the vendor's newer one"
+  assert_absent "$dir/state/$id.quota-wait" \
+    "stillrefused: a wait outlived its own deadline instead of returning the pane to ordinary escalation"
+  assert_contains "$out" "is still refused" "stillrefused: the retirement was not reported"
   assert_not_contains "$out" "was resumed automatically" "stillrefused: a resume was reported"
-  pass "stillrefused: a slipped reset corrects the same wait rather than spending its one resume"
+  pass "stillrefused: an account still refusing at the wait's own deadline retires it rather than extending it"
 }
 
 test_a_wait_with_no_readable_reset_expires_itself() {
@@ -970,6 +1015,37 @@ test_watcher_absorbs_a_recorded_wait_instead_of_escalating() {
   pass "absorb: a recorded quota wait is rechecked on the bounded cadence, never escalated as a wedge"
 }
 
+test_the_watcher_never_absorbs_a_terminal_status_behind_a_wait() {
+  local dir id out round
+  dir=$(make_case absorbterminal "the worker stopped mid-task")
+  id=$(case_id absorbterminal)
+  set_busy_state "$dir" "$id" idle || fail "absorbterminal: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # The worker reported blocked BEFORE the account was exhausted. It is still
+  # blocked, and the wait explains an idle pane, never a reading the captain is
+  # still owed.
+  printf 'blocked: cannot reach the staging DB\n' > "$dir/state/$id.status"
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) + 7200 ))" structural ||
+    fail "absorbterminal: could not write the wait record"
+  write_quota_json "$dir/quota.json" claude exhausted_now "$(iso_in 7200)"
+  out="$dir/watch.out"
+  : > "$out"
+
+  round=0
+  while [ "$round" -lt 8 ]; do
+    watch_round "$dir" "$out" || break
+    grep -q 'usage limit to reset' "$out" && break
+    grep -q "stale: quota:fm-$id" "$out" && break
+    round=$((round + 1))
+  done
+
+  assert_no_grep "usage limit to reset" "$out" \
+    "absorbterminal: the watcher absorbed a blocked worker behind its quota wait"
+  assert_grep "stale: quota:fm-$id" "$out" \
+    "absorbterminal: a blocked worker behind a quota wait never reached the ordinary stale path"
+  pass "absorbterminal: the watcher's absorb refuses a terminal status exactly as the owner does"
+}
+
 test_a_wait_with_no_reset_is_never_reported_as_self_resuming() {
   local dir id out round
   dir=$(make_case absorbunknown "the worker stopped mid-task")
@@ -1003,6 +1079,7 @@ test_a_wait_with_no_reset_is_never_reported_as_self_resuming() {
   pass "absorbunknown: a wait with no readable reset is surfaced as one nothing will resume"
 }
 
+test_the_suppression_owner_honours_both_guards
 test_provider_attribution
 test_structural_detection_without_a_banner
 test_banner_detection_without_quota_axi
@@ -1028,3 +1105,4 @@ test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged
 test_watcher_absorbs_a_recorded_wait_instead_of_escalating
 test_a_wait_with_no_reset_is_never_reported_as_self_resuming
+test_the_watcher_never_absorbs_a_terminal_status_behind_a_wait

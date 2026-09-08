@@ -241,12 +241,12 @@ end_wait() {  # <id>
 }
 
 resume_task() {  # <id> <meta> <reset-epoch>
-  local id=$1 meta=$2 reset=$3 provider probe_dir status current_status current_reset refusal rc
+  local id=$1 meta=$2 reset=$3 provider probe_dir status current_status refusal rc
   provider=$(fm_quota_wait_field "$STATE" "$id" provider)
-  # Re-read the account before resuming. A window that slipped is a corrected
-  # deadline for the SAME wait, never a second nudge: the record is updated and
-  # nothing is sent. A slip that is not actually later would leave the wait
-  # unable to progress, so it retires and escalates instead.
+  # Re-read the account before resuming. An account still refusing at its own
+  # stated reset ends this wait rather than moving its deadline: a record carries
+  # ONE deadline and retires at it whether or not anything improved, and if the
+  # refusal is real the next detection records a new wait on fresh evidence.
   if [ -n "$provider" ] && [ "$provider" != unattributed ]; then
     # The one moment where a cached headroom reading is not good enough. Every
     # other caller can tolerate an answer up to FM_QUOTA_PROBE_TTL old, but this
@@ -266,20 +266,7 @@ resume_task() {  # <id> <meta> <reset-epoch>
       rm -rf "$probe_dir"
     fi
     current_status=$(printf '%s' "$status" | cut -f1)
-    current_reset=$(printf '%s' "$status" | cut -f2)
     if [ "$current_status" = exhausted ]; then
-      case "$current_reset" in
-        ''|unknown|*[!0-9]*) ;;
-        *)
-          if [ "$current_reset" -gt "$reset" ]; then
-            fm_quota_wait_write "$STATE" "$id" "$provider" \
-              "$(fm_quota_wait_field "$STATE" "$id" harness)" "$current_reset" \
-              "$(fm_quota_wait_field "$STATE" "$id" evidence)" \
-              "$(fm_quota_fingerprint structural "$provider" "$current_reset")" || true
-            return 0
-          fi
-          ;;
-      esac
       end_wait "$id"
       printf 'quota-limit: %s is still refused by %s after its stated reset; the ordinary check is back on this worker\n' \
         "$id" "$provider"

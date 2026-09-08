@@ -452,19 +452,12 @@ wedge_defer_writing() {  # <window> <since-file> <triage-label> <idle-age>
 # directions, which is the same leave-the-schedule-alone treatment every other
 # absent-evidence outcome in this file gets.
 wedge_absorb_quota_wait() {  # <window> <task> <since-file> <idle-age>
-  local win=$1 task=$2 since_file=$3 age=$4 wait_file wage provider reset name outcome
+  local win=$1 task=$2 since_file=$3 age=$4 wait_file wage reset name outcome
   wait_file=$(fm_quota_wait_path "$STATE" "$task")
   wage=$(age_of "$wait_file")
-  provider=$(fm_quota_wait_field "$STATE" "$task" provider)
   reset=$(fm_quota_wait_field "$STATE" "$task" reset)
-  case "$provider" in ''|unattributed) name="provider" ;; *) name="$provider" ;; esac
-  # A wait whose reset time nobody could read is never resumed automatically, so
-  # it must not be reported as one that will be: that record is exactly the one a
-  # human has to pick up before its bound expires.
-  case "$reset" in
-    ''|*[!0-9]*) outcome="no reset time could be read, so this worker is NOT resumed automatically" ;;
-    *) outcome="this worker is resumed automatically when that limit resets" ;;
-  esac
+  name=$(fm_quota_wait_provider_name "$STATE" "$task")
+  outcome=$(fm_quota_wait_resume_outcome "$STATE" "$task")
   date +%s > "$since_file"
   clear_write_tracking "$(window_key "$win")"
   resurface_absorbed "$win" "$(fm_quota_resurfaced_path "$STATE" "$task")" "$wage" \
@@ -589,12 +582,11 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
-        # Only on the idle-stale path. A pane past the busy-turn bound renders a
-        # harness busy footer, so a hung foreground call there looks exactly like
-        # a worker that is still being served - and absorbing that onto a long
-        # recheck is how a long hang hides. Same boundary the alive reading and
-        # the deep-inspection marker already draw at this caller.
-        if [ "$admit_alive" = admit-alive ] && fm_quota_wait_active "$STATE" "$task"; then
+        # bin/fm-quota-lib.sh owns this decision, including which callers may
+        # take it: this loop hands over its own liveness admission and the
+        # worker's last status line and composes no preconditions of its own.
+        if fm_quota_wait_suppresses "$STATE" "$task" \
+          "$(last_status_line "$STATE/$task.status")" "$admit_alive"; then
           wedge_absorb_quota_wait "$win" "$task" "$since_file" "$age"
           return 0
         fi
