@@ -150,7 +150,7 @@ Classify each wake this way:
   A `stale` for a worker carrying a recorded provider quota refusal takes that same declared-wait handling, because the refused worker never got a turn in which to declare the wait itself.
   If it remains declared and idle past `FM_PAUSE_RESURFACE_SECS` (default 3600s), housekeeping sends one recheck and resets the pause window.
   That recheck names which human the wait is on: the external dependency for `paused:`, and the captain themself for a `captain-held` transfer, who can answer the held decision or release the hold.
-  A quota wait names the provider and the reset time instead of a human, and it retires on its own deadline, so a worker that does not resume returns to ordinary wedge escalation.
+  A quota wait names the provider instead of a human, states a reset time only where one could be read, and it retires on its own deadline, so a worker that does not resume returns to ordinary wedge escalation.
 - `check` -> always escalate. Check scripts print only when firstmate should wake.
 - `stale` with a terminal status or bare legacy captain-relevant line -> escalate.
   Nonterminal progress remains transient even when its prose contains a legacy free-text token or its seen-status marker already matches, so record a marker and self-handle.
