@@ -90,10 +90,12 @@ fm_nm_field() {  # <toon-output> <key>
 #
 # Callers that only ever attribute on proof can keep testing the exit status as
 # a boolean: every non-match outcome is non-zero, so `... || return 1` still
-# refuses on all three. bin/fm-teardown.sh depends on exactly that, and aborting
-# a run is destructive, so a diverged head must keep refusing there too. A
-# caller that reports state must branch on 2 and 3 explicitly rather than
-# reading either as a plain mismatch.
+# refuses on all three. Aborting a run is destructive, so bin/fm-teardown.sh
+# still attributes on proof alone and a diverged head keeps refusing there. It
+# does branch on 2, because "we cannot tell" is not a reason to walk away from a
+# parked run either: it refuses the teardown instead of silently skipping the
+# abort. A caller that reports state must branch on 2 and 3 explicitly rather
+# than reading either as a plain mismatch.
 FM_NM_HEAD_MATCH=0
 FM_NM_HEAD_MISMATCH=1
 FM_NM_HEAD_UNRESOLVED=2

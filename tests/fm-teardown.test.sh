@@ -2183,6 +2183,63 @@ test_another_branchs_parked_run_is_never_touched() {
   pass "a parked run on another branch is never aborted by this task's teardown (ownership is precise)"
 }
 
+# The pipeline pushes its fix commits from its own copy of the branch, so
+# between that push and the crew's next sync the run head simply is not an
+# object this worktree holds. That reads as UNRESOLVED, never as proof the run
+# belongs to someone else, and skipping the abort there orphans a parked run
+# forever - the exact failure Fix 1 exists to prevent. Teardown must refuse
+# loudly instead, because a refusal is recoverable and an orphaned run is not.
+test_parked_run_with_unresolvable_head_refuses_teardown() {
+  local case_dir rc unresolvable
+  case_dir=$(make_case parked-run-unresolvable-head)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  # A well-formed commit id this worktree provably does not have, so neither the
+  # equality nor the ancestry test can run.
+  unresolvable=0000000000000000000000000000000000000042
+
+  rc=0
+  FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$unresolvable")" \
+  FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 1 "$rc" "parked-run-unresolvable-head: teardown should refuse, not proceed"
+  assert_grep "cannot resolve" "$case_dir/stderr" \
+    "parked-run-unresolvable-head: teardown did not explain the unverifiable run head"
+  assert_absent "$case_dir/nm-abort.log" \
+    "parked-run-unresolvable-head: teardown aborted a run it could not attribute"
+  assert_present "$case_dir/wt" \
+    "parked-run-unresolvable-head: teardown removed the worktree and orphaned the parked run"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "parked-run-unresolvable-head: teardown removed task metadata after refusing"
+  pass "a parked run whose head this worktree cannot resolve refuses teardown instead of orphaning it"
+}
+
+# The counterweight to the case above: a run head that IS resolvable and is a
+# strict ancestor of local HEAD is proof the crew moved past that run, so it is
+# not ours and must not block teardown. Refusing here would make the new refusal
+# fire on ordinary foreign runs.
+test_parked_run_behind_local_head_never_blocks_teardown() {
+  local case_dir rc old_head
+  case_dir=$(make_case parked-run-behind-local-head)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "work the run was started from"
+  old_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  land_shippable_commit "$case_dir"
+
+  rc=0
+  FM_FAKE_AXI_STATUS="$(parked_axi_status_toon fm/task-x1 "$old_head")" \
+  FM_FAKE_NM_ABORT_LOG="$case_dir/nm-abort.log" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+
+  expect_code 0 "$rc" "parked-run-behind-local-head: a proven-foreign run must not block teardown"
+  assert_absent "$case_dir/nm-abort.log" \
+    "parked-run-behind-local-head: teardown aborted a run the crew had already moved past"
+  assert_not_contains "$(cat "$case_dir/stderr")" "REFUSED" \
+    "parked-run-behind-local-head: teardown refused on a provably foreign run"
+  pass "a parked run provably behind local HEAD is left alone and never blocks teardown"
+}
+
 test_own_autonomous_run_is_left_alone() {
   local case_dir rc head
   case_dir=$(make_case autonomous-run-left-alone)
@@ -2638,6 +2695,8 @@ test_mismatched_run_after_abort_refuses_unconfirmed
 test_empty_status_after_abort_refuses_unconfirmed
 test_not_found_status_after_abort_confirms_completion
 test_another_branchs_parked_run_is_never_touched
+test_parked_run_with_unresolvable_head_refuses_teardown
+test_parked_run_behind_local_head_never_blocks_teardown
 test_own_autonomous_run_is_left_alone
 test_leaked_worktree_process_is_reaped
 test_leaked_tasktmp_process_is_reaped
