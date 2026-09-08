@@ -1,0 +1,48 @@
+### bin/ reverted to base b45c0c6 (fix removed); tests/ kept at 14d2cfa
+$ bash tests/fm-teardown.test.sh   # new Fix 1 regression tests only
+not ok - parked-run-unresolvable-head: teardown should refuse, not proceed: expected exit 1, got 0
+runner exit: 1
+
+### same scenario, end-user transcript BEFORE the fix
+=== SCENARIO A: parked run on this task's own branch, head unresolvable in this worktree ===
+$ git -C wt rev-parse --short HEAD   # what this worktree holds
+6550121
+$ no-mistakes axi status             # the run the pipeline parked (fake backend)
+run:
+  id: "01RUN"
+  branch: fm/task-x1
+  status: awaiting_approval
+  awaiting_agent: parked 2m10s
+  head: "0000000000000000000000000000000000000042"
+  pr: ""
+  findings: none
+gate: review
+$ git -C wt cat-file -e 0000000000000000000000000000000000000042  # worktree does not have that object
+(exit 1: object missing)
+
+$ fm-teardown.sh task-x1
+/tmp/fm-teardown-tests.6JBG6K/evidence-unresolvable/project: already current
+teardown task-x1 complete (window firstmate:fm-task-x1, worktree /tmp/fm-teardown-tests.6JBG6K/evidence-unresolvable/wt)
+Backlog: task-x1 just finished. Run tasks-axi done task-x1 --pr PR_URL, then run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due.
+warning: lsof is unavailable; cannot resolve the tmux pane process group for task-x1
+exit status: 0
+
+post-state:
+  axi abort called: no (run left for its owner)
+  worktree still present: YES (run not orphaned)
+  task metadata removed
+
+$ fm-teardown.sh task-x1 --force    # --force must NOT bypass a live-run refusal
+error: no meta for task task-x1 at /tmp/fm-teardown-tests.6JBG6K/evidence-unresolvable/state/task-x1.meta
+exit status: 1
+  task metadata removed (--force bypassed the refusal - wrong)
+
+=== SCENARIO B (counterweight): parked run head is a RESOLVABLE strict ancestor of local HEAD ===
+run head:   bfe5c269531d38f8f8693fd70abc8f187f009dc5
+local HEAD: fb1c9683175d35711e7307d5e48d0096054de79d
+$ fm-teardown.sh task-x1
+warning: lsof is unavailable; cannot resolve the tmux pane process group for task-x1
+exit status: 0
+  axi abort called: no (foreign run left alone)
+  task metadata removed: YES (teardown completed normally)
+  refusal fired: no

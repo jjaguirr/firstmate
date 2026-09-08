@@ -1,0 +1,43 @@
+=== SCENARIO A: parked run on this task's own branch, head unresolvable in this worktree ===
+$ git -C wt rev-parse --short HEAD   # what this worktree holds
+e97ef3c
+$ no-mistakes axi status             # the run the pipeline parked (fake backend)
+run:
+  id: "01RUN"
+  branch: fm/task-x1
+  status: awaiting_approval
+  awaiting_agent: parked 2m10s
+  head: "0000000000000000000000000000000000000042"
+  pr: ""
+  findings: none
+gate: review
+$ git -C wt cat-file -e 0000000000000000000000000000000000000042  # worktree does not have that object
+(exit 1: object missing)
+
+$ fm-teardown.sh task-x1
+REFUSED: a no-mistakes run on task-x1's own branch is parked at a gate, but this worktree cannot resolve its head 0000000000000000000000000000000000000042, so the run can be neither claimed nor ruled out.
+Tearing down now would leave that run parked with no worker to answer it; aborting it unverified could stop a run this task does not own.
+Fetch the branch into /tmp/fm-teardown-tests.IvwDrD/evidence-unresolvable/wt so the run head resolves and retry teardown, or confirm the run's owner and abort it manually (no-mistakes axi abort --run 01RUN).
+exit status: 1
+
+post-state:
+  axi abort called: no (run left for its owner)
+  worktree still present: YES (run not orphaned)
+  task metadata retained: YES (teardown is retryable)
+
+$ fm-teardown.sh task-x1 --force    # --force must NOT bypass a live-run refusal
+REFUSED: a no-mistakes run on task-x1's own branch is parked at a gate, but this worktree cannot resolve its head 0000000000000000000000000000000000000042, so the run can be neither claimed nor ruled out.
+Tearing down now would leave that run parked with no worker to answer it; aborting it unverified could stop a run this task does not own.
+Fetch the branch into /tmp/fm-teardown-tests.IvwDrD/evidence-unresolvable/wt so the run head resolves and retry teardown, or confirm the run's owner and abort it manually (no-mistakes axi abort --run 01RUN).
+exit status: 1
+  task metadata retained: YES (--force did not bypass the refusal)
+
+=== SCENARIO B (counterweight): parked run head is a RESOLVABLE strict ancestor of local HEAD ===
+run head:   79c9adb596718405751172e8c19b8f422c4b39f4
+local HEAD: 09e1c884c083c23567279335be72ee7d8768b3f1
+$ fm-teardown.sh task-x1
+warning: lsof is unavailable; cannot resolve the tmux pane process group for task-x1
+exit status: 0
+  axi abort called: no (foreign run left alone)
+  task metadata removed: YES (teardown completed normally)
+  refusal fired: no
