@@ -38,21 +38,24 @@
 #   ONLY when the structural signal is genuinely unavailable (quota-axi missing,
 #   below the floor, timed out, or unreadable - never merely when it disagrees),
 #   it must be corroborated by two machine-verified facts the caller supplies
-#   (the endpoint reads alive and the pane classifies exactly idle), and the wait
-#   it produces is bounded far shorter than a structural one so a false match
-#   cannot quietly suppress escalation for long. A banner match with no parsable
-#   reset time records the wait but is never resumed automatically, because a
-#   resume time nobody can read is a guess.
+#   (the endpoint reads alive and the pane classifies exactly idle). A banner
+#   match with no parsable reset time is bounded far shorter than a structural
+#   wait and is never resumed automatically, because a resume time nobody can
+#   read is a guess. A banner that DOES state its reset runs to that reset like
+#   any other wait: on a home with no quota-axi the fallback is the only thing
+#   that can recover the fleet, and a bound shorter than the stated reset would
+#   retire the wait before the resume it exists to deliver - which is exactly the
+#   reported incident, a notice at 06:05 stating a reset at 08:50.
 #
 #   The residual false positive this accepts is a worker whose own transcript
 #   quotes a limit notice - an incident report, a test fixture, this very file.
 #   While the structural read is unavailable such a pane can be recorded as
-#   waiting, which suppresses its wedge reading for at most
-#   FM_QUOTA_BANNER_WAIT_MAX_SECS before the wait expires and ordinary
-#   escalation resumes. That bound is why the fallback is allowed to exist: the
-#   cost of a wrong rendered-text verdict is a bounded delay, while the cost of
-#   having no fallback is the original failure returning in full on every home
-#   where quota-axi is missing.
+#   waiting, which suppresses its wedge reading until the stated reset, or for at
+#   most FM_QUOTA_BANNER_WAIT_MAX_SECS when the notice states none, before the
+#   wait expires and ordinary escalation resumes. That bounded cost is why the
+#   fallback is allowed to exist: a wrong rendered-text verdict costs a delay
+#   that ends on its own, while the cost of having no fallback is the original
+#   failure returning in full on every home where quota-axi is missing.
 #
 # --- Provider attribution -------------------------------------------------
 #
@@ -98,10 +101,6 @@
 #   epoch is strictly newer than the recorded one, so no sequence of restarts,
 #   re-detections, or crash recoveries can produce a second nudge for one window.
 #
-# state/.quota-announced-<provider>  the reset epoch already reported to
-#   firstmate for that provider, so one quota window costs one wake and not one
-#   per poll.
-#
 # Every reader treats a malformed or unreadable record as absent, which returns
 # the pane to ordinary supervision rather than extending a wait nobody can read.
 
@@ -114,10 +113,11 @@ FM_QUOTA_PROBE_TIMEOUT=${FM_QUOTA_PROBE_TIMEOUT:-20}
 FM_QUOTA_PROBE_TTL=${FM_QUOTA_PROBE_TTL:-300}
 # The provider/model catalog changes on vendor releases, not on usage.
 FM_QUOTA_CATALOG_TTL=${FM_QUOTA_CATALOG_TTL:-3600}
-# How long a banner-only wait may suppress ordinary stale escalation before it
-# retires itself. Deliberately much shorter than a structural wait: the whole
-# point of the shorter bound is that a rendered-text verdict that turns out to
-# be wrong costs a bounded delay rather than an open-ended silence.
+# How long a banner wait that states NO reset time may suppress ordinary stale
+# escalation before it retires itself. Deliberately short: a rendered-text
+# verdict with nothing to wait for must cost a bounded delay rather than an
+# open-ended silence. A banner that states its reset runs to that reset instead,
+# because retiring it earlier would drop the resume it was recorded for.
 FM_QUOTA_BANNER_WAIT_MAX_SECS=${FM_QUOTA_BANNER_WAIT_MAX_SECS:-1800}
 # The same bound for a structural wait whose reset time could not be read. A
 # wait with no deadline is exactly the rot this whole change exists to remove.
@@ -171,13 +171,11 @@ fm_quota_axi_read() {  # <args...>
 }
 
 # --- provider attribution ---------------------------------------------------
-
-fm_quota_meta_field() {  # <meta> <key>
-  local meta=$1 key=$2 value
-  [ -f "$meta" ] || return 1
-  value=$(grep "^$key=" "$meta" 2>/dev/null | head -1 | cut -d= -f2-) || return 1
-  printf '%s' "$value"
-}
+#
+# The recorded meta is read through bin/fm-backend.sh's fm_meta_get, which every
+# driver of this file already sources. There is deliberately no second reader
+# here: a private copy would resolve a repeated key differently from the rest of
+# the fleet and quietly attribute a worker to another vendor's account.
 
 # Provider for one harness token through the single-vendor table, or empty.
 fm_quota_provider_for_harness() {  # <harness>
@@ -238,8 +236,8 @@ fm_quota_provider_for_model() {  # <state-dir> <model>
 # for that worker, and nothing downstream may substitute a guess.
 fm_quota_provider_for_meta() {  # <state-dir> <meta>
   local state=$1 meta=$2 harness model from_harness from_model
-  harness=$(fm_quota_meta_field "$meta" harness) || harness=
-  model=$(fm_quota_meta_field "$meta" model) || model=
+  harness=$(fm_meta_get "$meta" harness) || harness=
+  model=$(fm_meta_get "$meta" model) || model=
   from_harness=$(fm_quota_provider_for_harness "$harness")
   from_model=$(fm_quota_provider_for_model "$state" "$model")
   if [ -n "$from_model" ] && [ -n "$from_harness" ]; then
@@ -511,12 +509,24 @@ fm_quota_wait_clear() {  # <state-dir> <id>
   rm -f "$(fm_quota_wait_path "$1" "$2")" "$(fm_quota_resurfaced_path "$1" "$2")"
 }
 
+# The grace added after a reset time, as a number. A knob this code cannot read
+# as a number is no grace at all rather than an arithmetic error under `set -u`.
+fm_quota_reset_grace() {
+  case "$FM_QUOTA_RESET_GRACE_SECS" in
+    ''|*[!0-9]*) printf '0' ;;
+    *) printf '%s' "$FM_QUOTA_RESET_GRACE_SECS" ;;
+  esac
+}
+
 # The moment a wait stops being a wait even if nothing else happens, so no
-# recorded wait can outlive its own evidence. A structural wait with a real
-# reset expires at that reset; every other case expires on its evidence's own
-# bound, measured from detection.
+# recorded wait can outlive its own evidence. A wait carrying a readable reset
+# expires when the resume it is owed becomes due, never before it: a deadline
+# earlier than that would retire the record inside the grace window and drop the
+# one resume the wait exists to deliver. A wait with no readable reset has no
+# such moment to reach, so it expires on its evidence's own bound measured from
+# detection - the shorter banner bound where rendered text is all there was.
 fm_quota_wait_deadline() {  # <state-dir> <id>
-  local state=$1 id=$2 reset evidence detected bound
+  local state=$1 id=$2 reset evidence detected bound grace
   reset=$(fm_quota_wait_field "$state" "$id" reset)
   evidence=$(fm_quota_wait_field "$state" "$id" evidence)
   detected=$(fm_quota_wait_field "$state" "$id" detected)
@@ -527,13 +537,7 @@ fm_quota_wait_deadline() {  # <state-dir> <id>
   esac
   case "$reset" in
     ''|*[!0-9]*) printf '%s' $((detected + bound)) ;;
-    *)
-      if [ "$evidence" = banner ] && [ "$reset" -gt $((detected + bound)) ]; then
-        printf '%s' $((detected + bound))
-      else
-        printf '%s' "$reset"
-      fi
-      ;;
+    *) grace=$(fm_quota_reset_grace); printf '%s' $((reset + grace)) ;;
   esac
 }
 
@@ -553,10 +557,11 @@ fm_quota_wait_active() {  # <state-dir> <id>
 # resume time nobody could read is a guess, and guessing is how a nudge lands in
 # a worker that is actually mid-task.
 fm_quota_wait_resume_due() {  # <state-dir> <id>
-  local reset
+  local reset grace
   reset=$(fm_quota_wait_field "$1" "$2" reset)
   case "$reset" in ''|*[!0-9]*|unknown) return 1 ;; esac
-  [ "$(date +%s)" -ge $((reset + FM_QUOTA_RESET_GRACE_SECS)) ]
+  grace=$(fm_quota_reset_grace)
+  [ "$(date +%s)" -ge $((reset + grace)) ]
 }
 
 # 0 when a resume for <reset-epoch> has NOT been delivered before. This is what

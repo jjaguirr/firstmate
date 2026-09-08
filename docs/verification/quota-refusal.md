@@ -80,7 +80,9 @@ pi 0.84.2                      -> deliberately unattributed
 
 ## The rendered limit notice
 
-The notice is a harness-dependent signal, so it is never the whole verdict: it is consulted only when the structural read is unavailable, it must be corroborated by an alive endpoint reading and an exactly-idle semantic busy verdict, and the wait it produces expires within `FM_QUOTA_BANNER_WAIT_MAX_SECS` rather than running to a vendor reset time.
+The notice is a harness-dependent signal, so it is never the whole verdict: it is consulted only when the structural read is unavailable, and it must be corroborated by an alive endpoint reading, an exactly-idle semantic busy verdict, and a crew state that offers no explanation of its own for that idleness.
+A notice that states a reset time produces a wait that runs to that reset, because on a home with no `quota-axi` this fallback is the only thing that can recover the fleet and the reported incident stated a reset nearly three hours out.
+A notice that states none produces a wait bounded by `FM_QUOTA_BANNER_WAIT_MAX_SECS` and is never resumed automatically.
 
 Observed wording, reported from the incident of 2026-09-05 on Claude Code:
 

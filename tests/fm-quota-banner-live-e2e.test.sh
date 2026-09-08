@@ -59,9 +59,30 @@ note() { printf '# %s\n' "$1"; }
 . "$ROOT/bin/fm-quota-lib.sh"
 
 CHECKED=0
+LIVE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-quota-live.XXXXXX") || fail "could not create a temp dir"
+trap 'rm -rf "$LIVE_DIR"' EXIT
 
 harness_version() {  # <binary>
   "$1" --version 2>&1 </dev/null | head -1 | tr -d '\r'
+}
+
+# Every provider token the production single-vendor table can produce, as the
+# comma list quota-axi takes. Derived from the table rather than restated, so
+# this guard cannot drift into checking a vocabulary the code no longer uses.
+table_providers() {
+  local entry
+  for entry in $FM_QUOTA_HARNESS_PROVIDERS; do printf '%s\n' "${entry#*:}"; done |
+    sort -u | tr '\n' ',' | sed 's/,$//'
+}
+
+# The provider tokens the INSTALLED quota-axi answered for, one per line, taken
+# from the snapshot the structural check above refreshed. This is the accepting
+# side of the same argument the production code passes, so a token quota-axi no
+# longer reports is caught here rather than at the next real refusal. Empty when
+# quota-axi is absent or unreadable, which is the only case in which an
+# attributed token goes unchecked.
+live_providers() {
+  fm_quota_probe_report "$LIVE_DIR/probe" 2>/dev/null | cut -f1 | grep . || true
 }
 
 # --- 1. the structural signal is still reachable -----------------------------
@@ -72,9 +93,11 @@ test_structural_signal_reachable() {
     note "quota-axi is not installed, so the structural signal is unverified here"
     return 0
   fi
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-quota-live.XXXXXX") || fail "could not create a temp dir"
-  # Refresh through the production path, for every provider quota-axi accepts.
-  FM_QUOTA_PROBE_TTL=0 fm_quota_probe_refresh "$tmp" claude,codex,cursor,copilot,grok,kimi ||
+  tmp="$LIVE_DIR/probe"
+  mkdir -p "$tmp" || fail "could not create a temp dir"
+  # Refresh through the production path, for every provider the production table
+  # can attribute a worker to.
+  FM_QUOTA_PROBE_TTL=0 fm_quota_probe_refresh "$tmp" "$(table_providers)" ||
     fail "quota-axi $(quota-axi --version 2>&1 | head -1): the production probe could not read a report"
   report=$(fm_quota_probe_report "$tmp") ||
     fail "quota-axi $(quota-axi --version 2>&1 | head -1): the production report parser produced nothing; the effective-availability shape it reads has changed"
@@ -85,7 +108,6 @@ test_structural_signal_reachable() {
   # token would mean the parser is producing something no caller handles.
   printf '%s\n' "$report" | awk -F'\t' '$2 != "exhausted" && $2 != "available" && $2 != "unknown" { exit 1 }' ||
     fail "quota-axi $(quota-axi --version 2>&1 | head -1): the report produced a verdict outside exhausted/available/unknown"
-  rm -rf "$tmp"
   CHECKED=$((CHECKED + 1))
   pass "structural: quota-axi $(quota-axi --version 2>&1 | head -1) still reports through the production probe and parser ($rows providers)"
 }
@@ -93,7 +115,8 @@ test_structural_signal_reachable() {
 # --- 2 and 3. every installed harness ---------------------------------------
 
 test_installed_harnesses() {
-  local harness bin version provider text
+  local harness bin version provider text accepted
+  accepted=$(live_providers)
   for harness in claude codex opencode pi grok kimi cursor muse; do
     bin=$harness
     [ "$harness" != cursor ] || bin=cursor-agent
@@ -107,8 +130,15 @@ test_installed_harnesses() {
       claude|codex|grok|kimi|cursor)
         [ -n "$provider" ] ||
           fail "$harness ($version): a single-vendor harness no longer attributes to a provider"
-        printf '%s' "claude codex cursor copilot grok kimi" | grep -qw "$provider" ||
-          fail "$harness ($version): attributes to '$provider', which quota-axi does not accept"
+        # Checked against the providers the INSTALLED quota-axi actually reported
+        # on, so a vendor that renames or drops a provider token fails here
+        # rather than silently producing an argument nothing answers to.
+        if [ -n "$accepted" ]; then
+          printf '%s\n' "$accepted" | grep -qx "$provider" ||
+            fail "$harness ($version): attributes to '$provider', which the installed quota-axi did not report on"
+        else
+          note "$harness ($version): no quota-axi report could be read, so '$provider' is unchecked against the accepted provider set"
+        fi
         ;;
       *)
         [ -z "$provider" ] ||

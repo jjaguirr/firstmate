@@ -3,7 +3,6 @@
 #
 # Usage:
 #   fm-quota-watch.sh scan [--force]
-#   fm-quota-watch.sh status [<task-id>]
 #
 # `scan` is an adjunct to the existing watcher poll loop, not a watcher, daemon,
 # or vendor client of its own. It self-throttles to one evaluation per
@@ -22,10 +21,11 @@
 #
 #   1. Attributes each recorded worker to a provider, and reads quota-axi once
 #      for the whole set rather than once per worker.
-#   2. For a worker whose provider is refusing service and whose pane classifies
-#      exactly idle, records a bounded wait carrying that provider's reset time.
-#      bin/fm-watch.sh then absorbs that pane on the bounded recheck cadence
-#      instead of escalating it as a possible wedge.
+#   2. For a worker whose provider is refusing service and whose own state shows
+#      an unexplained idle pane behind a live agent, records a bounded wait
+#      carrying that provider's reset time. bin/fm-watch.sh then absorbs that
+#      pane on the bounded recheck cadence instead of escalating it as a possible
+#      wedge.
 #   3. When the reset time arrives, sends that worker EXACTLY ONE resume, and
 #      then retires the wait so ordinary supervision owns the pane again.
 #
@@ -37,14 +37,16 @@
 # stop answering, so the resume is delivered from here.
 #
 # THE RESUME IS NEVER BLIND. A resume sent into a worker that is actually
-# mid-task is worse than sending nothing, so before any text is delivered the
-# worker's state must be positively classified from three independent machine
-# reads, all of which must agree: the endpoint reports an agent alive, the
-# semantic busy contract reports exactly `idle`, and the authoritative crew
-# state is not `working`. Anything unreadable, ambiguous, or contradictory
-# refuses the resume, retires the wait, and lets the ordinary stale path
-# escalate the pane. That is also what keeps a remotely placed secondmate - an
-# endpoint this home cannot probe at all - from ever being nudged from here.
+# mid-task, or into one that is idle by design, is worse than sending nothing, so
+# before any text is delivered the worker's state must be positively classified
+# from three independent machine reads, all of which must agree: the endpoint
+# reports an agent alive, the semantic busy contract reports exactly `idle`, and
+# the authoritative crew state offers no explanation of its own for that idleness
+# - not working, and equally not paused, parked at a decision, or done. Anything
+# unreadable, ambiguous, or contradictory refuses the resume, retires the wait,
+# and lets the ordinary stale path escalate the pane. That is also what keeps a
+# remotely placed secondmate - an endpoint this home cannot probe at all - from
+# ever being nudged from here.
 #
 # IT DOES NOT MAKE THE ALARM QUIETER. A recorded wait suppresses nothing except
 # the wedge reading of one idle pane, it carries its own deadline, and it
@@ -102,12 +104,6 @@ recorded_tasks() {
   done
 }
 
-task_backend() {  # <meta>
-  local backend
-  backend=$(fm_quota_meta_field "$1" backend) || backend=
-  printf '%s' "${backend:-tmux}"
-}
-
 # 0 when the pane classifies EXACTLY idle through the semantic busy contract.
 # unknown, busy, and dead all return 1, because this is the gate that decides
 # whether a worker is sitting refused or is in the middle of a turn, and only a
@@ -122,23 +118,37 @@ task_agent_alive() {  # <meta>
   local target verdict
   target=$(fm_backend_target_of_meta "$1")
   [ -n "$target" ] || return 1
-  verdict=$(fm_backend_agent_alive "$(task_backend "$1")" "$target" 2>/dev/null) || return 1
+  verdict=$(fm_backend_agent_alive "$(fm_backend_of_meta "$1")" "$target" 2>/dev/null) || return 1
   [ "$verdict" = alive ]
+}
+
+# 0 when the worker's own authoritative state does NOT already explain why its
+# pane is idle. A crew that declared an external-wait pause, is parked at a
+# decision, is done, or is working was never refused a turn: it is idle by
+# design. Recording a quota wait for such a worker would park something that was
+# not stuck and, at the reset, push a resume past the very gate it was holding.
+# Only `none` - no declared explanation at all - is the shape a refused turn
+# leaves behind, so only `none` may be recorded as a refusal.
+task_idleness_unexplained() {  # <id>
+  [ "$(crew_absorb_class "$1")" = none ]
 }
 
 task_capture() {  # <meta>
   local target
   target=$(fm_backend_target_of_meta "$1")
   [ -n "$target" ] || return 1
-  fm_backend_capture "$(task_backend "$1")" "$target" 40 2>/dev/null
+  fm_backend_capture "$(fm_backend_of_meta "$1")" "$target" 40 2>/dev/null
 }
 
 # --- detection --------------------------------------------------------------
 
 # Record a structural wait for a worker whose provider is refusing service.
-# The idle gate is required even here: an exhausted account does not mean THIS
-# worker was refused, only that it would be if it asked, and a worker still
-# rendering busy is finishing a turn the provider already granted.
+# An exhausted account does not mean THIS worker was refused, only that it would
+# be if it asked, so the same three state gates the banner path uses are required
+# here too: the endpoint must report a live agent (a dead one is the case
+# bin/fm-watch.sh's demand-deep-inspection escalation owns, and a wait must never
+# absorb it), the pane must classify exactly idle rather than mid-turn, and the
+# worker's own state must not already explain that idleness.
 detect_structural() {  # <id> <meta> <provider> <reset-epoch>
   local id=$1 meta=$2 provider=$3 reset=$4 harness fp
   # A refusal whose stated reset is already in the past is contradictory
@@ -148,16 +158,19 @@ detect_structural() {  # <id> <meta> <provider> <reset-epoch>
   [ "$reset" -gt "$(date +%s)" ] || return 1
   fp=$(fm_quota_fingerprint structural "$provider" "$reset")
   fm_quota_fingerprint_unspent "$STATE" "$id" "$fp" || return 1
+  task_agent_alive "$meta" || return 1
   task_is_idle "$id" "$meta" || return 1
-  harness=$(fm_quota_meta_field "$meta" harness) || harness=
+  task_idleness_unexplained "$id" || return 1
+  harness=$(fm_meta_get "$meta" harness) || harness=
   fm_quota_wait_write "$STATE" "$id" "$provider" "$harness" "$reset" structural "$fp" || return 1
   printf 'quota-limit: %s is waiting on %s, resets %s\n' \
     "$id" "$provider" "$(fm_quota_format_reset "$reset")"
 }
 
 # Record a banner-corroborated wait for a worker whose provider could not be
-# read structurally. Three signals must agree, and two of them are machine
-# reads rather than rendered text, so no single vendor string carries this.
+# read structurally. Several signals must agree, and all but one of them are
+# machine reads rather than rendered text, so no single vendor string carries
+# this.
 detect_banner() {  # <id> <meta> <provider>
   local id=$1 meta=$2 provider=$3 text reset harness fp
   text=$(task_capture "$meta") || return 1
@@ -166,8 +179,9 @@ detect_banner() {  # <id> <meta> <provider>
   fm_quota_fingerprint_unspent "$STATE" "$id" "$fp" || return 1
   task_agent_alive "$meta" || return 1
   task_is_idle "$id" "$meta" || return 1
+  task_idleness_unexplained "$id" || return 1
   reset=$(fm_quota_banner_reset_epoch "$text")
-  harness=$(fm_quota_meta_field "$meta" harness) || harness=
+  harness=$(fm_meta_get "$meta" harness) || harness=
   fm_quota_wait_write "$STATE" "$id" "${provider:-unattributed}" "$harness" \
     "${reset:-unknown}" banner "$fp" || return 1
   printf 'quota-limit: %s reports a provider limit on the %s runtime and account headroom could not be read; %s\n' \
@@ -183,7 +197,13 @@ resume_refusal() {  # <id> <meta>
   local id=$1 meta=$2
   task_agent_alive "$meta" || { printf 'its endpoint no longer reports a live agent'; return 0; }
   task_is_idle "$id" "$meta" || { printf 'its current state could not be read as idle'; return 0; }
-  [ "$(crew_absorb_class "$id")" != working ] || { printf 'it is working again already'; return 0; }
+  case "$(crew_absorb_class "$id")" in
+    none) ;;
+    working) printf 'it is working again already'; return 0 ;;
+    # A worker that has since declared a pause, reached a decision gate, or
+    # finished is idle by design. Whatever it is holding, it is not this wait.
+    *) printf 'its own recorded state already explains why it is idle'; return 0 ;;
+  esac
 }
 
 # Deliver the one resume for this reset, or explain why it was not delivered.
@@ -196,8 +216,8 @@ end_wait() {  # <id>
   fm_quota_wait_clear "$STATE" "$1"
 }
 
-resume_task() {  # <id> <meta> <reset-epoch>
-  local id=$1 meta=$2 reset=$3 provider status current_status current_reset refusal rc
+resume_task() {  # <id> <meta> <reset-epoch> <scan-providers>
+  local id=$1 meta=$2 reset=$3 providers=$4 provider status current_status current_reset refusal rc
   provider=$(fm_quota_wait_field "$STATE" "$id" provider)
   # Re-read the account before resuming. A window that slipped is a corrected
   # deadline for the SAME wait, never a second nudge: the record is updated and
@@ -208,7 +228,13 @@ resume_task() {  # <id> <meta> <reset-epoch>
     # other caller can tolerate an answer up to FM_QUOTA_PROBE_TTL old, but this
     # one decides whether to send text into a live worker, and a cached refusal
     # here would defer a resume that is actually due by a whole interval.
-    FM_QUOTA_PROBE_TTL=0 fm_quota_probe_refresh "$STATE" "$provider" >/dev/null 2>&1 || true
+    #
+    # The refresh asks for the WHOLE scan's provider set, not just this worker's.
+    # The snapshot is shared: refreshing one provider into it would leave every
+    # other provider absent, and a later worker in this same scan would then read
+    # its own account as unreadable and fall to the banner path while real
+    # structural evidence existed.
+    FM_QUOTA_PROBE_TTL=0 fm_quota_probe_refresh "$STATE" "${providers:-$provider}" >/dev/null 2>&1 || true
     status=$(fm_quota_provider_status "$STATE" "$provider")
     current_status=$(printf '%s' "$status" | cut -f1)
     current_reset=$(printf '%s' "$status" | cut -f2)
@@ -255,19 +281,8 @@ resume_task() {  # <id> <meta> <reset-epoch>
 
 # --- scan -------------------------------------------------------------------
 
-# One line per provider whose refusal has not been reported yet, so a fleet-wide
-# outage costs one wake per quota window rather than one per worker per poll.
-announce_provider() {  # <provider> <reset-epoch>
-  local provider=$1 reset=$2 marker
-  marker="$STATE/.quota-announced-$provider"
-  [ "$(head -1 "$marker" 2>/dev/null || true)" != "$reset" ] || return 0
-  printf '%s\n' "$reset" > "$marker" 2>/dev/null || true
-  printf 'quota-limit: the %s account is out of headroom until %s\n' \
-    "$provider" "$(fm_quota_format_reset "$reset")"
-}
-
 scan_once() {
-  local id meta provider providers='' seen status state_token reset entry
+  local id meta provider providers='' status state_token reset entry
   local -a rows=()
   while IFS=$(printf '\t') read -r id meta; do
     [ -n "$id" ] || continue
@@ -280,7 +295,6 @@ scan_once() {
   [ "${#rows[@]}" -gt 0 ] || return 0
   [ -z "$providers" ] || fm_quota_probe_refresh "$STATE" "$providers" >/dev/null 2>&1 || true
 
-  seen=
   for entry in "${rows[@]}"; do
     id=${entry%%"$FM_QUOTA_TAB"*}
     meta=${entry#*"$FM_QUOTA_TAB"}
@@ -288,7 +302,7 @@ scan_once() {
     meta=${meta%%"$FM_QUOTA_TAB"*}
     if [ -s "$(fm_quota_wait_path "$STATE" "$id")" ]; then
       if fm_quota_wait_resume_due "$STATE" "$id"; then
-        resume_task "$id" "$meta" "$(fm_quota_wait_field "$STATE" "$id" reset)"
+        resume_task "$id" "$meta" "$(fm_quota_wait_field "$STATE" "$id" reset)" "$providers"
       elif ! fm_quota_wait_active "$STATE" "$id"; then
         end_wait "$id"
         printf 'quota-limit: the recorded wait on %s expired without a usable reset time; the ordinary check is back on this worker\n' "$id"
@@ -305,10 +319,6 @@ scan_once() {
     case "$state_token" in
       exhausted)
         detect_structural "$id" "$meta" "$provider" "$reset" || true
-        case ",$seen," in
-          *",$provider,"*) ;;
-          *) seen="${seen:+$seen,}$provider"; announce_provider "$provider" "$reset" ;;
-        esac
         ;;
       available)
         # The vendor says this account has headroom. A rendered limit notice is
@@ -333,22 +343,8 @@ cmd_scan() {
   scan_once
 }
 
-cmd_status() {
-  local id meta
-  if [ "$#" -ge 1 ] && [ -n "$1" ]; then
-    printf '%s\n' "$(head -1 "$(fm_quota_wait_path "$STATE" "$1")" 2>/dev/null || printf 'no recorded wait')"
-    return 0
-  fi
-  while IFS=$(printf '\t') read -r id meta; do
-    [ -n "$id" ] || continue
-    [ -s "$(fm_quota_wait_path "$STATE" "$id")" ] || continue
-    printf '%s\t%s\n' "$id" "$(head -1 "$(fm_quota_wait_path "$STATE" "$id")")"
-  done < <(recorded_tasks)
-}
-
 case "${1:-}" in
   scan) shift; cmd_scan "${1:-}" ;;
-  status) shift; cmd_status "$@" ;;
   -h|--help|help) usage ;;
   *) usage; exit 2 ;;
 esac

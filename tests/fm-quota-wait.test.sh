@@ -31,6 +31,10 @@ set -u
 . "$ROOT/bin/fm-timeout-lib.sh"
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-wake-lib.sh"
+# The meta reader bin/fm-quota-lib.sh attributes a provider through, sourced here
+# for the same reason every production driver of that file sources it.
+# shellcheck source=/dev/null
+. "$ROOT/bin/fm-backend.sh"
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-quota-lib.sh"
 
@@ -468,6 +472,112 @@ test_a_wait_with_no_readable_reset_expires_itself() {
   pass "expiry: a wait with no readable reset retires on its own bound and is never resumed blindly"
 }
 
+test_a_worker_parked_by_design_is_never_recorded_as_refused() {
+  local dir id out
+  dir=$(make_case parked "the worker stopped mid-task")
+  id=$(case_id parked)
+  set_busy_state "$dir" "$id" idle || fail "parked: could not record an idle busy state"
+  # Idle BY DESIGN: this worker is holding a decision, so the provider never
+  # refused it a turn. Recording a wait would park something that was not stuck,
+  # and the resume at reset would push it past the gate it is holding.
+  make_fake_crew_state "$dir" "state: parked · source: decision · awaiting a captain decision"
+  write_quota_json "$dir/quota.json" claude exhausted_now "$(iso_in 3600)"
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_absent "$dir/state/$id.quota-wait" \
+    "parked: a worker idle by design was recorded as parked on a provider limit"
+  assert_not_contains "$out" "is waiting on" \
+    "parked: a worker holding a decision was reported as waiting on quota"
+  [ ! -s "$dir/sent.log" ] || fail "parked: a resume was delivered into a worker holding a decision"
+  pass "parked: an exhausted account never records a wait for a worker whose own state explains its idleness"
+}
+
+test_a_dead_endpoint_never_earns_a_quota_wait() {
+  local dir id out
+  dir=$(make_case deadendpoint "the worker stopped mid-task")
+  id=$(case_id deadendpoint)
+  set_busy_state "$dir" "$id" idle || fail "deadendpoint: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  write_quota_json "$dir/quota.json" claude exhausted_now "$(iso_in 3600)"
+  # The agent is gone while the semantic busy record still reads idle. That is
+  # the shape the watcher escalates as demand-deep-inspection, and a quota wait
+  # over it would absorb that escalation for as long as the reset is away.
+  PATH="$dir/fakebin:$PATH" tmux kill-window -t "$SESSION:fm-$id" 2>/dev/null || true
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_absent "$dir/state/$id.quota-wait" \
+    "deadendpoint: a pane with no live agent was recorded as waiting on a provider limit"
+  assert_not_contains "$out" "is waiting on" \
+    "deadendpoint: an endpoint with no live agent was reported as a quota wait"
+  pass "deadendpoint: an exhausted account never parks a pane whose endpoint reports no live agent"
+}
+
+test_a_wait_inside_the_reset_grace_window_survives() {
+  local dir id out
+  dir=$(make_case grace "the worker stopped mid-task")
+  id=$(case_id grace)
+  set_busy_state "$dir" "$id" idle || fail "grace: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # A scan that lands between the stated reset and the moment the resume becomes
+  # due. A wait that retires inside that window takes its worker's one automatic
+  # resume with it, and the account now reports headroom, so nothing re-detects.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) - 10 ))" structural \
+    "$(fm_quota_fingerprint structural claude grace)" ||
+    fail "grace: could not write the wait record"
+  write_quota_json "$dir/quota.json" claude through_reset "$(iso_in 3600)"
+
+  fm_quota_wait_resume_due "$dir/state" "$id" &&
+    fail "grace: the resume is already due, so this case is not exercising the grace window"
+  fm_quota_wait_active "$dir/state" "$id" ||
+    fail "grace: a wait stopped being current before the resume it is owed became due"
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_present "$dir/state/$id.quota-wait" \
+    "grace: the wait was retired inside its own grace window, so its resume can never be delivered"
+  assert_not_contains "$out" "expired without a usable reset time" \
+    "grace: a wait carrying a usable reset time was reported as having none"
+  [ ! -s "$dir/sent.log" ] || fail "grace: a resume was delivered before it was due"
+  pass "grace: a wait whose reset has passed but whose resume is not yet due survives to deliver it"
+}
+
+test_a_banner_that_states_its_reset_runs_to_it_and_resumes() {
+  local dir id out reset detected
+  dir=$(make_case bannerreset "You have hit your session limit, resets at $(iso_in 9000)")
+  id=$(case_id bannerreset)
+  set_busy_state "$dir" "$id" idle || fail "bannerreset: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # A home with no quota-axi at all, which is the only kind of home this fallback
+  # exists for. The reported incident is this exact shape: a notice at 06:05
+  # stating a reset at 08:50, nearly three hours out.
+  rm -f "$dir/fakebin/quota-axi"
+
+  out=$(run_scan "$dir" "$id" FM_QUOTA_AXI_BIN=quota-axi-absent-for-test)
+  assert_present "$dir/state/$id.quota-wait" "bannerreset: no wait was recorded from the stated notice"
+  reset=$(fm_quota_wait_field "$dir/state" "$id" reset)
+  case "$reset" in ''|*[!0-9]*) fail "bannerreset: the reset the notice stated was not recorded" ;; esac
+
+  # Age the record past the bound a banner wait that states NO reset carries. A
+  # wait that retires here never delivers the resume it was recorded for.
+  detected=$(( $(date +%s) - 3600 ))
+  sed -i.bak "s/detected=[0-9]*/detected=$detected/" "$dir/state/$id.quota-wait" 2>/dev/null ||
+    sed -i '' "s/detected=[0-9]*/detected=$detected/" "$dir/state/$id.quota-wait"
+  rm -f "$dir/state/$id.quota-wait.bak"
+  fm_quota_wait_active "$dir/state" "$id" ||
+    fail "bannerreset: a banner wait retired before the reset its own notice stated"
+
+  # The stated reset arrives, and the fleet recovers itself with no quota-axi
+  # anywhere and no human in the loop.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) - 600 ))" banner \
+    "$(fm_quota_fingerprint banner claude "$id stated reset")" ||
+    fail "bannerreset: could not restate the wait at its stated reset"
+  out=$(run_scan "$dir" "$id" FM_QUOTA_AXI_BIN=quota-axi-absent-for-test)
+  assert_contains "$out" "was resumed automatically" \
+    "bannerreset: a banner wait whose stated reset arrived was never resumed"
+  [ "$(wc -l < "$dir/sent.log" 2>/dev/null | tr -d ' ')" = 1 ] ||
+    fail "bannerreset: expected exactly 1 delivered resume"
+  pass "bannerreset: a notice that states its reset waits until then and resumes on a home with no quota-axi"
+}
+
 test_evidence_that_already_made_a_wait_never_makes_another() {
   local dir id out stale_reset
   dir=$(make_case respend "the worker stopped mid-task")
@@ -652,6 +762,10 @@ test_resume_refuses_an_unclassifiable_endpoint
 test_resume_refuses_a_worker_that_is_working_again
 test_a_still_refused_account_is_not_resumed
 test_a_wait_with_no_readable_reset_expires_itself
+test_a_wait_inside_the_reset_grace_window_survives
+test_a_banner_that_states_its_reset_runs_to_it_and_resumes
+test_a_worker_parked_by_design_is_never_recorded_as_refused
+test_a_dead_endpoint_never_earns_a_quota_wait
 test_evidence_that_already_made_a_wait_never_makes_another
 test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged

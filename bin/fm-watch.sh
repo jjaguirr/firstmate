@@ -429,8 +429,8 @@ wedge_defer_writing() {  # <window> <since-file> <triage-label> <idle-age>
   triage_log "absorbed $label (worktree written since the idle window opened, idle ${age}s): $win"
 }
 
-# Absorb one wedge escalation for a pane whose worker is waiting out a recorded
-# provider quota refusal (bin/fm-quota-lib.sh owns what that record means and
+# Absorb one wedge escalation for an IDLE-STALE pane whose worker is waiting out
+# a recorded provider quota refusal (bin/fm-quota-lib.sh owns what that record means and
 # when it stops being current). The pane is idle because the provider refused
 # the turn, not because the worker is wedged, and the wait carries its own reset
 # time, so escalating it as a possible wedge reports the wrong thing and asks
@@ -581,7 +581,12 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
-        if fm_quota_wait_active "$STATE" "$task"; then
+        # Only on the idle-stale path. A pane past the busy-turn bound renders a
+        # harness busy footer, so a hung foreground call there looks exactly like
+        # a worker that is still being served - and absorbing that onto a long
+        # recheck is how a long hang hides. Same boundary the alive reading and
+        # the deep-inspection marker already draw at this caller.
+        if [ "$admit_alive" = admit-alive ] && fm_quota_wait_active "$STATE" "$task"; then
           wedge_absorb_quota_wait "$win" "$task" "$since_file" "$age"
           return 0
         fi
