@@ -357,6 +357,10 @@
       "audience": "maintainer-verification"
     },
     {
+      "path": "docs/verification/quota-refusal.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/verification/runtime-backends.md",
       "audience": "maintainer-verification"
     },

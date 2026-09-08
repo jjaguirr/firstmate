@@ -46,7 +46,8 @@
 #     (configurable), rechecked once. A wedged crewmate is therefore detected
 #     within STALE_ESCALATE_SECS + a tick, never lost. A declared wait - either a
 #     paused: external wait or a verified captain-held transfer, per
-#     fm-classify-lib.sh's combined predicate - instead gets its own longer
+#     fm-classify-lib.sh's combined predicate, or a recorded provider quota
+#     refusal per bin/fm-quota-lib.sh - instead gets its own longer
 #     PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
@@ -182,6 +183,12 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # (fm_busy_classify).
 # shellcheck source=bin/fm-busy-lib.sh
 . "$FM_DAEMON_DIR/fm-busy-lib.sh"
+
+# The single owner of the provider quota-refusal contract. Only the record
+# readers are used here; detection and the resume stay with the watcher poll's
+# bin/fm-quota-watch.sh, which keeps running underneath this daemon.
+# shellcheck source=/dev/null
+. "$FM_DAEMON_DIR/fm-quota-lib.sh"
 
 # --- tunables ---------------------------------------------------------------
 # Supervisor backends this daemon knows how to inject into today. zellij, orca,
@@ -368,6 +375,31 @@ classify_signal() {  # <reason-after-colon> <state>
   fi
 }
 
+# The reason one recorded provider quota refusal is reported with, in the wake
+# and in the housekeeping recheck alike. bin/fm-quota-lib.sh owns both rules the
+# sentence rests on, so this daemon and the watcher cannot drift apart on what a
+# wait is called or on what it promises.
+quota_wait_reason() {  # <state> <task>
+  local state=$1 task=$2
+  printf 'waiting on the %s usage limit%s; %s' \
+    "$(fm_quota_wait_provider_name "$state" "$task")" \
+    "$(fm_quota_wait_reset_phrase "$state" "$task")" \
+    "$(fm_quota_wait_resume_outcome "$state" "$task")"
+}
+
+# 0 when an idle pane's idleness is DECLARED rather than suspicious: the worker's
+# own paused:/captain-held: line, or a recorded provider quota refusal it never
+# got a turn to declare for itself. Every pause-marker guard reads this one
+# predicate, so a quota wait keeps its marker across housekeeping ticks and ages
+# onto the same bounded recheck a declared pause gets. Without that the marker is
+# recorded and deleted every tick, and the pane reaches the away digest never.
+stale_is_declared_wait() {  # <window> <state> <last-status-line>
+  local win=$1 state=$2 last=$3 task
+  status_is_paused_or_captain_held "$last" && return 0
+  task=$(window_to_task "$win" "$state")
+  fm_quota_wait_suppresses "$state" "$task" "$last" unknown
+}
+
 # classify_stale decides the WAKE itself (one-shot per distinct hash). On a
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
@@ -375,6 +407,17 @@ classify_stale() {  # <window> <state>
   local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
+  if fm_quota_wait_suppresses "$state" "$task" "$last" unknown; then
+    # A recorded provider quota refusal is a declared external wait the worker
+    # could not declare for itself: it was refused service, so it never got a
+    # turn in which to write a status line. It takes the same long recheck
+    # cadence a declared pause takes, and for the same reason - the idle pane is
+    # expected and the wait carries its own reset time. The record expires on its
+    # own bound, so a worker that does not resume returns to wedge escalation
+    # here exactly as it would with no record at all.
+    printf 'pause|paused (%s), rechecked on a long cadence' "$(quota_wait_reason "$state" "$task")"
+    return
+  fi
   if [ -n "$last" ] && status_is_paused_or_captain_held "$last"; then
     # A DECLARED external-wait pause or a verified captain-held transfer
     # (fm-classify-lib.sh owns which declarations qualify): an idle pane is
@@ -490,7 +533,7 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
   key=$(_stale_key "$task")
   marker="$state/.subsuper-paused-$key"
   watcher_key=$(_stale_key "$win")
-  if status_is_paused_or_captain_held "$last"; then
+  if stale_is_declared_wait "$win" "$state" "$last"; then
     stale_marker_remove "$win" "$state"
     pause_marker_record "$win" "$state"
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
@@ -508,7 +551,7 @@ migrate_watcher_pause_markers() {  # <state>
     key=$(_stale_key "$task")
     watcher_key=$(_stale_key "$win")
     last=$(last_status_line "$state/$task.status")
-    if status_is_paused_or_captain_held "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
+    if stale_is_declared_wait "$win" "$state" "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
       reconcile_pause_tracking "$win" "$state" "$last"
     fi
   done
@@ -1051,7 +1094,7 @@ housekeeping() {  # <state>
     fi
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
-    if [ -z "$last" ] || ! status_is_paused_or_captain_held "$last"; then
+    if ! stale_is_declared_wait "$win" "$state" "$last"; then
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
     fi
@@ -1068,6 +1111,9 @@ housekeeping() {  # <state>
           _now > "$marker"
         elif [ -n "$last" ] && status_is_paused "$last"; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          _now > "$marker"
+        elif fm_quota_wait_suppresses "$state" "$task" "$last" unknown; then
+          escalate_add "$state" "paused ${age}s ($(quota_wait_reason "$state" "$task")): $win"
           _now > "$marker"
         else
           rm -f "$marker"

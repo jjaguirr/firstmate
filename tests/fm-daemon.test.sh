@@ -255,6 +255,155 @@ test_stale_captain_held_classifies_pause() {
   pass "a captain-held transfer classifies as pause, not as a wedge candidate"
 }
 
+# A worker refused service on provider quota never gets a turn in which to
+# declare its own wait, so the wait is recorded for it. Away mode must read that
+# record the same way it reads a declared pause: the idle pane is expected and
+# the wait carries its own reset time. The record expires on its own bound, so a
+# worker that does not resume returns to wedge aging here with nothing carried
+# over - which is what keeps this from being a quieter alarm.
+# A quota wait explains an IDLE pane, never a status line the digest still owes
+# the captain. A worker that reported blocked: before the account was exhausted
+# is still blocked, and letting the wait stand in front of that reading would be
+# a quieter alarm without a rarer condition.
+test_stale_quota_wait_never_swallows_a_terminal_status() {
+  local dir state out
+  dir=$(make_supercase stale-quota-terminal)
+  state="$dir/state"
+  printf 'blocked: cannot reach the staging DB\n' > "$state/quota-w9t.status"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9t claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the quota wait record"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9t" "$state")
+  case "$out" in pause\|*) fail "a recorded quota wait swallowed a terminal status: $out" ;; esac
+  case "$out" in *"cannot reach the staging DB"*) ;; *) fail "the terminal status never reached the digest: $out" ;; esac
+
+  # The marker boundary reads the same owner, so a blocked worker never earns the
+  # declared-wait cadence there either - its wedge marker has to age instead.
+  reconcile_pause_tracking "sess:fm-quota-w9t" "$state" "blocked: cannot reach the staging DB"
+  [ ! -e "$state/.subsuper-paused-$(_stale_key quota-w9t)" ] ||
+    fail "a blocked worker behind a quota wait was given a declared-wait pause marker"
+  pass "a recorded quota wait never stands in front of a terminal status"
+}
+
+# The housekeeping recheck reads the same owner as the wake and the marker
+# boundary. A blocked worker that happens to carry a quota wait must never be
+# re-labelled as a provider pause, and must never be promised a resume.
+test_housekeeping_never_rechecks_a_terminal_status_as_a_quota_pause() {
+  local dir state fakebin win key
+  dir=$(make_supercase quota-terminal-recheck)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  win="sess:fm-quota-w9r"
+  printf 'window=%s\nbackend=tmux\nkind=ship\n' "$win" > "$state/quota-w9r.meta"
+  printf 'blocked: cannot reach the staging DB\n' > "$state/quota-w9r.status"
+  printf 'Idle.\n' > "$dir/pane.txt"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9r claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the quota wait record"
+  key=$(_stale_key quota-w9r)
+  # A marker already aged past the declared-wait recheck window, which is the
+  # state the recheck arm fires from.
+  echo $(( $(date +%s) - 99999 )) > "$state/.subsuper-paused-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
+    FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 housekeeping "$state"
+
+  if [ -e "$state/.subsuper-escalations" ]; then
+    ! grep -F "usage limit" "$state/.subsuper-escalations" >/dev/null ||
+      fail "a blocked worker was rechecked as a provider quota pause"
+  fi
+  [ ! -e "$state/.subsuper-paused-$key" ] ||
+    fail "a blocked worker behind a quota wait kept a declared-wait pause marker"
+  pass "the housekeeping recheck never re-labels a terminal status as a provider quota pause"
+}
+
+# The record a human has to pick up: a matched notice that stated no reset time.
+# Away mode must not promise an automatic resume for it, and must not render the
+# internal unattributed token as if it were a vendor name.
+test_stale_quota_wait_with_no_reset_is_reported_as_needing_a_human() {
+  local dir state out
+  dir=$(make_supercase stale-quota-noreset)
+  state="$dir/state"
+  printf 'working: implementing the fix\n' > "$state/quota-w9u.status"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9u unattributed claude \
+    unknown banner || fail "could not write the quota wait record"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")
+  case "$out" in pause\|*) ;; *) fail "a recorded quota wait did not classify as pause: $out" ;; esac
+  # The other half of the same rule, taken first: a wait that DOES carry a
+  # reachable reset states that time here and promises the resume it will get.
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9u claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the resumable wait record"
+  case "$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")" in
+    *"this worker is resumed automatically"*) ;;
+    *) fail "a wait whose reset is reachable was not reported as one that resumes itself" ;;
+  esac
+  printf '%s' "$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")" |
+    grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}T' ||
+    fail "a wait carrying a reset did not state that time"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9u unattributed claude \
+    unknown banner || fail "could not restore the reset-less wait record"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")
+  case "$out" in *"NOT resumed automatically"*) ;; *) fail "a wait that will never be resumed promised a resume: $out" ;; esac
+  case "$out" in *unattributed*) fail "the internal unattributed token was rendered as a provider name: $out" ;; esac
+  # A wait with no reset has no time to state, so the line must carry no rendered
+  # time, in any shape a surface might reach for.
+  ! printf '%s' "$out" | grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}T|unknown time' ||
+    fail "a wait carrying no reset was described with a reset time: $out"
+
+  # The same surface, against the wait the rendered-text ceiling caps: the record
+  # carries a reset, and the deadline still retires before it, so nothing about
+  # the reset's presence may be read as a promise here either.
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9u claude claude \
+    "$(( $(date +%s) + 86400 ))" banner '' notice || fail "could not write the capped wait record"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_resume_reachable "$state" quota-w9u &&
+    fail "the stated reset was not capped, so this case proves nothing"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")
+  case "$out" in *"NOT resumed automatically"*) ;; *) fail "a capped wait promised a resume: $out" ;; esac
+  pass "a quota wait nothing will resume is reported as one, whether its reset is unreadable or capped"
+}
+
+# The declared-wait cadence the away branch promises is a property of the pause
+# MARKER surviving housekeeping. A quota-parked worker's last line is whatever it
+# wrote before the refusal, so a guard that reads only paused:/captain-held:
+# deletes the marker on every tick, its age never reaches FM_PAUSE_RESURFACE_SECS,
+# and the pane reaches the away digest never - no wedge line and no recheck line.
+test_stale_quota_wait_pause_marker_survives_housekeeping() {
+  local dir state marker
+  dir=$(make_supercase stale-quota-marker)
+  state="$dir/state"
+  printf 'working: implementing the fix\n' > "$state/quota-w9m.status"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9m claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the quota wait record"
+  marker="$state/.subsuper-paused-$(_stale_key quota-w9m)"
+
+  reconcile_pause_tracking "sess:fm-quota-w9m" "$state" "working: implementing the fix"
+  [ -e "$marker" ] || fail "a recorded quota wait never got a pause marker to age"
+  reconcile_pause_tracking "sess:fm-quota-w9m" "$state" "working: implementing the fix"
+  [ -e "$marker" ] || fail "the next housekeeping tick deleted the quota wait's pause marker"
+
+  # The record's own deadline is what returns the pane to wedge aging.
+  fm_quota_wait_clear "$state" quota-w9m
+  reconcile_pause_tracking "sess:fm-quota-w9m" "$state" "working: implementing the fix"
+  [ ! -e "$marker" ] || fail "a retired quota wait kept its pause marker"
+  pass "a recorded quota wait keeps its pause marker across housekeeping, and retiring it drops the marker"
+}
+
+test_stale_quota_wait_classifies_pause() {
+  local dir state out
+  dir=$(make_supercase stale-quota)
+  state="$dir/state"
+  printf 'working: implementing the fix\n' > "$state/quota-w9q.status"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9q" "$state")
+  case "$out" in pause\|*) fail "a pane with no quota record classified as a declared wait: $out" ;; esac
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9q claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the quota wait record"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9q" "$state")
+  case "$out" in pause\|*) ;; *) fail "a recorded quota wait did not classify as pause: $out" ;; esac
+  case "$out" in *"usage limit"*) ;; *) fail "the pause reason did not name the provider limit: $out" ;; esac
+  fm_quota_wait_clear "$state" quota-w9q
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9q" "$state")
+  case "$out" in pause\|*) fail "a retired quota wait still suppressed wedge aging: $out" ;; esac
+  pass "a recorded provider quota wait classifies as pause, and retiring it restores wedge aging"
+}
+
 # handle_wake on a paused stale records a pause marker, drops any pre-existing wedge
 # marker (so a working->paused pane is not still wedge-aged), and does NOT escalate
 # on the wake itself - the recheck is housekeeping's job on the long cadence.
@@ -1972,6 +2121,11 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_stale_captain_held_classifies_pause
+test_stale_quota_wait_classifies_pause
+test_stale_quota_wait_never_swallows_a_terminal_status
+test_stale_quota_wait_with_no_reset_is_reported_as_needing_a_human
+test_stale_quota_wait_pause_marker_survives_housekeeping
+test_housekeeping_never_rechecks_a_terminal_status_as_a_quota_pause
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking

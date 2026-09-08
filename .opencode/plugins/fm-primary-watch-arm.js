@@ -457,18 +457,26 @@ function armAttempt(status, armChild, includeArmChild) {
   return includeArmChild ? { status, armChild } : status;
 }
 
+// Launches are serialized, never shared: a caller that arrives while another
+// launch is in flight queues behind it and then evaluates its own admission.
+// beginArm's answer is a point-in-time reading of ownership, primary-root shape
+// and arm need, so handing a later caller an earlier caller's answer can drop
+// an idle event that arrived exactly when one of those facts changed - the
+// session takes the lock a moment after a read-only attempt started, and the
+// event that should arm inherits "read-only" and never arms. Queuing keeps the
+// one-child invariant: the next beginArm sees `child` and reports "existing".
 async function ensureArm(paths, sessionID, client, predecessorArmPid = "", includeArmChild = false) {
+  const previous = launchInFlight;
+  const launch = (async () => {
+    if (previous) await previous.catch(() => {});
+    return beginArm(paths, sessionID, client, predecessorArmPid);
+  })();
+  launchInFlight = launch;
   let launchResult = null;
-  if (!launchInFlight) {
-    const launch = beginArm(paths, sessionID, client, predecessorArmPid);
-    launchInFlight = launch;
-    try {
-      launchResult = await launch;
-    } finally {
-      if (launchInFlight === launch) launchInFlight = null;
-    }
-  } else {
-    launchResult = await launchInFlight;
+  try {
+    launchResult = await launch;
+  } finally {
+    if (launchInFlight === launch) launchInFlight = null;
   }
   const armChild = launchResult.armChild;
   if (!armChild) {
