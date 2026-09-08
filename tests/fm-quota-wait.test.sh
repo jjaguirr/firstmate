@@ -271,6 +271,15 @@ run_scan() {  # <dir> <id> [extra env assignments...]
 
 # A hermetic fm-crew-state.sh so the resume gate's third read is controlled by
 # the case rather than by a real worktree.
+# Rewrite a wait record's detection time, which is what every bound measured
+# from detection is read against. Portable across GNU and BSD sed.
+set_detected() {  # <dir> <id> <epoch>
+  local record="$1/state/$2.quota-wait"
+  sed -i.bak "s/detected=[0-9]*/detected=$3/" "$record" 2>/dev/null ||
+    sed -i '' "s/detected=[0-9]*/detected=$3/" "$record"
+  rm -f "$record.bak"
+}
+
 make_fake_crew_state() {  # <dir> <verdict>
   cat > "$1/fakebin/fm-crew-state.sh" <<SH
 #!/usr/bin/env bash
@@ -726,9 +735,7 @@ test_a_banner_that_states_its_reset_runs_to_it_and_resumes() {
   # Age the record past the bound a banner wait that states NO reset carries. A
   # wait that retires here never delivers the resume it was recorded for.
   detected=$(( $(date +%s) - 3600 ))
-  sed -i.bak "s/detected=[0-9]*/detected=$detected/" "$dir/state/$id.quota-wait" 2>/dev/null ||
-    sed -i '' "s/detected=[0-9]*/detected=$detected/" "$dir/state/$id.quota-wait"
-  rm -f "$dir/state/$id.quota-wait.bak"
+  set_detected "$dir" "$id" "$detected"
   fm_quota_wait_active "$dir/state" "$id" ||
     fail "bannerreset: a banner wait retired before the reset its own notice stated"
 
@@ -743,6 +750,54 @@ test_a_banner_that_states_its_reset_runs_to_it_and_resumes() {
   [ "$(wc -l < "$dir/sent.log" 2>/dev/null | tr -d ' ')" = 1 ] ||
     fail "bannerreset: expected exactly 1 delivered resume"
   pass "bannerreset: a notice that states its reset waits until then and resumes on a home with no quota-axi"
+}
+
+# The ceiling on a reset read from rendered text, in both directions. It arrived
+# after the review stage of the run that built this path closed, from the
+# observation that a notice-derived wait was otherwise bounded only by whatever
+# the notice said - so a transcript quoting someone else's limit notice could
+# hold one pane out of ordinary escalation for most of a day.
+test_a_notice_stated_reset_within_the_ceiling_waits_as_stated() {
+  local dir id detected
+  dir=$(make_case noticeinside "the worker is idle")
+  id=$(case_id noticeinside)
+  # The founding incident's own shape: a notice at 06:05 stating 08:50, 2h45m.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) + 9900 ))" banner \
+    "$(fm_quota_fingerprint banner claude noticeinside)" notice ||
+    fail "noticeinside: could not write the wait record"
+  detected=$(( $(date +%s) - 3600 ))
+  set_detected "$dir" "$id" "$detected"
+  fm_quota_wait_active "$dir/state" "$id" ||
+    fail "noticeinside: a notice-stated reset inside the ceiling retired early"
+  pass "noticeinside: a reset a notice states below the ceiling still governs the wait"
+}
+
+test_a_notice_stated_reset_beyond_the_ceiling_is_capped() {
+  local dir id now
+  dir=$(make_case noticebeyond "the worker is idle")
+  id=$(case_id noticebeyond)
+  now=$(date +%s)
+  # A notice claiming a reset a full day out, which is the outlier the ceiling
+  # exists for rather than a window any vendor of this shape publishes.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( now + 86400 ))" banner \
+    "$(fm_quota_fingerprint banner claude noticebeyond)" notice ||
+    fail "noticebeyond: could not write the wait record"
+  set_detected "$dir" "$id" "$(( now - 100 ))"
+  fm_quota_wait_active "$dir/state" "$id" ||
+    fail "noticebeyond: the wait retired before its ceiling was reached"
+  set_detected "$dir" "$id" "$(( now - FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT - 60 ))"
+  ! fm_quota_wait_active "$dir/state" "$id" ||
+    fail "noticebeyond: a notice-stated reset past the ceiling still suppressed the pane"
+
+  # The same reset, stated by the ACCOUNT rather than by rendered text, is not
+  # capped: that evidence is the vendor's own accounting.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( now + 86400 ))" structural \
+    "$(fm_quota_fingerprint structural claude noticebeyond)" vendor ||
+    fail "noticebeyond: could not write the vendor-stated wait record"
+  set_detected "$dir" "$id" "$(( now - FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT - 60 ))"
+  fm_quota_wait_active "$dir/state" "$id" ||
+    fail "noticebeyond: a vendor-stated reset was truncated by the rendered-text ceiling"
+  pass "noticebeyond: a reset only a notice claims is capped, while the account's own reset is not"
 }
 
 test_a_wait_whose_agent_died_is_retired_by_the_scan() {
@@ -1356,6 +1411,8 @@ test_a_wait_inside_the_reset_grace_window_survives
 test_a_banner_that_states_its_reset_runs_to_it_and_resumes
 test_a_worker_parked_by_design_is_never_recorded_as_refused
 test_a_dead_endpoint_never_earns_a_quota_wait
+test_a_notice_stated_reset_within_the_ceiling_waits_as_stated
+test_a_notice_stated_reset_beyond_the_ceiling_is_capped
 test_a_wait_whose_agent_died_is_retired_by_the_scan
 test_a_failed_resume_read_keeps_the_scan_snapshot
 test_an_exhausted_account_with_no_readable_reset_still_records

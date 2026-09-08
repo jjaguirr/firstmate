@@ -82,6 +82,8 @@ pi 0.84.2                      -> deliberately unattributed
 
 The notice is a harness-dependent signal, so it is never the whole verdict: it is consulted only when the structural read is unavailable, and it must be corroborated by an alive endpoint reading, an exactly-idle semantic busy verdict, and a crew state that offers no explanation of its own for that idleness.
 A notice that states a reset time produces a wait that runs to that reset, because on a home with no `quota-axi` this fallback is the only thing that can recover the fleet and the reported incident stated a reset nearly three hours out.
+That stated reset is truncated to `FM_QUOTA_NOTICE_RESET_MAX_SECS` measured from detection, so a notice claiming a window most of a day out cannot hold one pane out of ordinary escalation for that whole time.
+The default ceiling of six hours clears the reported incident's 2h45m comfortably, and a reset the vendor's own accounting stated is never truncated.
 A notice that states none produces a wait bounded by `FM_QUOTA_BANNER_WAIT_MAX_SECS` and is never resumed automatically.
 
 Observed wording, reported from the incident of 2026-09-05 on Claude Code:

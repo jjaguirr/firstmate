@@ -83,7 +83,12 @@
 #
 # state/<id>.quota-wait   one line, atomically replaced:
 #     v1 provider=<p> harness=<h> reset=<epoch|unknown> evidence=<structural|banner>
-#        detected=<epoch> fp=<evidence-fingerprint>
+#        detected=<epoch> fp=<evidence-fingerprint> reset_src=<vendor|notice>
+#   reset_src records where the RESET TIME came from, which is not the same
+#   question as which signal carried the verdict: a structural verdict whose
+#   limiting window named no resetsAt takes its clock from the rendered notice.
+#   A record written before this field existed reads as vendor, which keeps an
+#   in-flight wait on the deadline it was recorded with.
 #   Present means "this worker is waiting out a provider refusal". Absent means
 #   the ordinary supervision paths own the pane, with no exception of any kind.
 #
@@ -122,6 +127,24 @@ FM_QUOTA_CATALOG_TTL=${FM_QUOTA_CATALOG_TTL:-3600}
 # retiring it earlier would drop the resume it was recorded for.
 FM_QUOTA_BANNER_WAIT_MAX_SECS_DEFAULT=1800
 FM_QUOTA_BANNER_WAIT_MAX_SECS=${FM_QUOTA_BANNER_WAIT_MAX_SECS:-$FM_QUOTA_BANNER_WAIT_MAX_SECS_DEFAULT}
+# Ceiling on a wait whose reset time was read from RENDERED TEXT rather than
+# from the vendor's own accounting, measured from detection.
+# A stated reset governs below the ceiling and is truncated to it above.
+# Six hours is chosen to clear the founding incident comfortably rather than
+# tightly: that notice appeared at 06:05 and stated an 08:50 reset, 2h45m, so a
+# real vendor window of that shape is honored untouched with room to spare.
+# What the ceiling refuses is the outlier - a transcript that quotes someone
+# else's notice, or a notice stating a window most of a day out - which would
+# otherwise hold one pane out of ordinary escalation for that whole time on a
+# home where no structural read is available to contradict it.
+# A wait suppresses only an idle pane and never a stopped worker or a reported
+# blocker, but a day of silence is still a guard made quieter without making the
+# condition rarer, which this contract does not accept.
+# A reset the VENDOR itself stated is not capped here: that evidence is the
+# account rather than rendered text, and truncating it would drop the resume the
+# wait exists to deliver.
+FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT=21600
+FM_QUOTA_NOTICE_RESET_MAX_SECS=${FM_QUOTA_NOTICE_RESET_MAX_SECS:-$FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT}
 # Grace added after a reset time before a resume is attempted, so a nudge does
 # not land in the same second the window turns over.
 FM_QUOTA_RESET_GRACE_SECS=${FM_QUOTA_RESET_GRACE_SECS:-60}
@@ -424,12 +447,13 @@ fm_quota_nudged_path() {  # <state-dir> <id>
 # wait rests on, so the same evidence cannot produce a second wait once this one
 # has ended; an empty fingerprint records a wait that is never suppressed later,
 # which is the safe direction.
-fm_quota_wait_write() {  # <state-dir> <id> <provider> <harness> <reset-epoch|unknown> <evidence> [fingerprint]
-  local state=$1 id=$2 provider=$3 harness=$4 reset=$5 evidence=$6 fp=${7:-} path tmp
+fm_quota_wait_write() {  # <state-dir> <id> <provider> <harness> <reset-epoch|unknown> <evidence> [fingerprint] [reset-source]
+  local state=$1 id=$2 provider=$3 harness=$4 reset=$5 evidence=$6 fp=${7:-} src=${8:-vendor} path tmp
+  case "$src" in notice) ;; *) src=vendor ;; esac
   path=$(fm_quota_wait_path "$state" "$id")
   tmp="$path.tmp.$$"
-  printf 'v1 provider=%s harness=%s reset=%s evidence=%s detected=%s fp=%s\n' \
-    "$provider" "${harness:-unknown}" "$reset" "$evidence" "$(date +%s)" "$fp" > "$tmp" || return 1
+  printf 'v1 provider=%s harness=%s reset=%s evidence=%s detected=%s fp=%s reset_src=%s\n' \
+    "$provider" "${harness:-unknown}" "$reset" "$evidence" "$(date +%s)" "$fp" "$src" > "$tmp" || return 1
   mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp"; return 1; }
 }
 
@@ -514,6 +538,16 @@ fm_quota_banner_bound() {
   esac
 }
 
+# The rendered-text reset ceiling, as a number. A knob this code cannot read as
+# a number falls back to the documented default rather than aborting the
+# watcher poll loop on an arithmetic error under `set -u`.
+fm_quota_notice_bound() {
+  case "$FM_QUOTA_NOTICE_RESET_MAX_SECS" in
+    ''|*[!0-9]*) printf '%s' "$FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT" ;;
+    *) printf '%s' "$FM_QUOTA_NOTICE_RESET_MAX_SECS" ;;
+  esac
+}
+
 # The grace added after a reset time, as a number. A knob this code cannot read
 # as a number is no grace at all rather than an arithmetic error under `set -u`.
 fm_quota_reset_grace() {
@@ -532,22 +566,35 @@ fm_quota_reset_grace() {
 # whichever signal recorded it, the notice path or a structural verdict whose
 # limiting window carried no resetsAt.
 #
-# That a wait STATING its reset runs to that reset, with the bound applying only
-# to one stating none, is deliberate: the founding incident is a notice at 06:05
-# naming an 08:50 reset, so a short blanket cap would retire the wait before the
-# resume it exists to deliver. A long wait cannot hide a broken
+# That a wait STATING its reset runs to that reset, with the reset-less bound
+# applying only to one stating none, is deliberate: the founding incident is a
+# notice at 06:05 naming an 08:50 reset, so a short blanket cap would retire the
+# wait before the resume it exists to deliver. A long wait cannot hide a broken
 # worker either way - it always retires at its own deadline and can never
 # re-extend, and fm_quota_wait_suppresses stands in front of neither a terminal
 # status nor a non-alive reading.
+#
+# A reset read from RENDERED TEXT is additionally truncated to
+# fm_quota_notice_bound measured from detection, because that evidence is a
+# vendor string rather than the account: it is honored where a real window would
+# fall and refused where it would buy most of a day of silence. A reset the
+# vendor itself stated is never truncated.
 fm_quota_wait_deadline() {  # <state-dir> <id>
-  local state=$1 id=$2 reset detected grace bound
+  local state=$1 id=$2 reset detected grace bound src deadline ceiling
   reset=$(fm_quota_wait_field "$state" "$id" reset)
   detected=$(fm_quota_wait_field "$state" "$id" detected)
   case "$detected" in ''|*[!0-9]*) return 1 ;; esac
   case "$reset" in
-    ''|*[!0-9]*) bound=$(fm_quota_banner_bound); printf '%s' $((detected + bound)) ;;
-    *) grace=$(fm_quota_reset_grace); printf '%s' $((reset + grace)) ;;
+    ''|*[!0-9]*) bound=$(fm_quota_banner_bound); printf '%s' $((detected + bound)); return ;;
   esac
+  grace=$(fm_quota_reset_grace)
+  deadline=$((reset + grace))
+  src=$(fm_quota_wait_field "$state" "$id" reset_src)
+  if [ "$src" = notice ]; then
+    ceiling=$((detected + $(fm_quota_notice_bound)))
+    [ "$deadline" -le "$ceiling" ] || deadline=$ceiling
+  fi
+  printf '%s' "$deadline"
 }
 
 # 0 while a recorded wait is still current: the record parses and its deadline

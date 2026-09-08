@@ -156,7 +156,7 @@ task_capture() {  # <meta>
 # absorb it), the pane must classify exactly idle rather than mid-turn, and the
 # worker's own state must not already explain that idleness.
 detect_structural() {  # <id> <meta> <provider> <reset-epoch|unknown>
-  local id=$1 meta=$2 provider=$3 reset=$4 harness fp
+  local id=$1 meta=$2 provider=$3 reset=$4 harness fp src=vendor
   case "$reset" in
     ''|unknown|*[!0-9]*)
       # quota-axi verified the refusal but named no reset this code can read:
@@ -170,6 +170,9 @@ detect_structural() {  # <id> <meta> <provider> <reset-epoch|unknown>
       # on the short bound.
       reset=$(fm_quota_banner_reset_epoch "$(task_capture "$meta")") || reset=
       reset=${reset:-unknown}
+      # The clock came from rendered text even though the verdict did not, so
+      # the wait is bounded as a rendered-text reset rather than a vendor one.
+      case "$reset" in unknown) ;; *) src=notice ;; esac
       ;;
     *)
       # A refusal whose stated reset is already in the past is contradictory
@@ -185,7 +188,7 @@ detect_structural() {  # <id> <meta> <provider> <reset-epoch|unknown>
   task_is_idle "$id" "$meta" || return 1
   task_idleness_unexplained "$id" || return 1
   harness=$(fm_meta_get "$meta" harness) || harness=
-  fm_quota_wait_write "$STATE" "$id" "$provider" "$harness" "$reset" structural "$fp" || return 1
+  fm_quota_wait_write "$STATE" "$id" "$provider" "$harness" "$reset" structural "$fp" "$src" || return 1
   case "$reset" in
     ''|unknown|*[!0-9]*)
       printf 'quota-limit: %s is waiting on %s, which states no reset time, so this worker is NOT resumed automatically\n' \
@@ -214,7 +217,7 @@ detect_banner() {  # <id> <meta> <provider>
   reset=$(fm_quota_banner_reset_epoch "$text")
   harness=$(fm_meta_get "$meta" harness) || harness=
   fm_quota_wait_write "$STATE" "$id" "${provider:-unattributed}" "$harness" \
-    "${reset:-unknown}" banner "$fp" || return 1
+    "${reset:-unknown}" banner "$fp" notice || return 1
   printf 'quota-limit: %s reports a provider limit on the %s runtime and account headroom could not be read; %s\n' \
     "$id" "${harness:-unknown}" \
     "$(if [ -n "$reset" ]; then printf 'resets %s' "$(fm_quota_format_reset "$reset")"; else printf 'no reset time was stated, so this waits without an automatic resume'; fi)"

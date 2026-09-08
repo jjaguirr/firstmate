@@ -552,6 +552,7 @@ FM_QUOTA_PROBE_TIMEOUT=20    # seconds allowed per quota-axi call; a read that d
 FM_QUOTA_PROBE_TTL=300       # seconds a structural quota-axi result is reused; bypassed for the one fresh account read taken per provider at resume time
 FM_QUOTA_CATALOG_TTL=3600    # seconds the quota-axi provider/model catalog behind provider attribution is reused
 FM_QUOTA_BANNER_WAIT_MAX_SECS=1800   # maximum seconds a recorded quota wait that carries NO readable reset time may take the FM_PAUSE_RESURFACE_SECS recheck below before it retires itself and the pane returns to ordinary escalation; a wait that carries a reset runs to that reset instead and is never resumed without one
+FM_QUOTA_NOTICE_RESET_MAX_SECS=21600 # maximum seconds after detection that a wait whose reset time was read from a RENDERED LIMIT NOTICE may run; a reset the notice states below that ceiling governs the wait, one above it is truncated to the ceiling, and a reset the vendor's own accounting stated is never truncated
 FM_QUOTA_RESET_GRACE_SECS=60 # seconds added after a wait's reset time before its single automatic resume is attempted
 FM_QUOTA_RESUME_TEXT=        # optional override for the one-line resume delivered when that reset arrives; bin/fm-quota-watch.sh owns the default wording
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or Relay dispatch)
