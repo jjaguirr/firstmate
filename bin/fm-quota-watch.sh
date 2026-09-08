@@ -189,8 +189,8 @@ detect_structural() {  # <id> <meta> <provider> <reset-epoch|unknown>
   task_idleness_unexplained "$id" || return 1
   harness=$(fm_meta_get "$meta" harness) || harness=
   fm_quota_wait_write "$STATE" "$id" "$provider" "$harness" "$reset" structural "$fp" "$src" || return 1
-  printf 'quota-limit: %s is waiting on %s, resets %s; %s\n' \
-    "$id" "$provider" "$(fm_quota_format_reset "$reset")" \
+  printf 'quota-limit: %s is waiting on %s%s; %s\n' \
+    "$id" "$provider" "$(fm_quota_wait_reset_phrase "$STATE" "$id")" \
     "$(fm_quota_wait_resume_outcome "$STATE" "$id")"
 }
 
@@ -211,8 +211,8 @@ detect_banner() {  # <id> <meta> <provider>
   harness=$(fm_meta_get "$meta" harness) || harness=
   fm_quota_wait_write "$STATE" "$id" "${provider:-unattributed}" "$harness" \
     "${reset:-unknown}" banner "$fp" notice || return 1
-  printf 'quota-limit: %s reports a provider limit on the %s runtime and account headroom could not be read; resets %s; %s\n' \
-    "$id" "${harness:-unknown}" "$(fm_quota_format_reset "${reset:-unknown}")" \
+  printf 'quota-limit: %s reports a provider limit on the %s runtime and account headroom could not be read%s; %s\n' \
+    "$id" "${harness:-unknown}" "$(fm_quota_wait_reset_phrase "$STATE" "$id")" \
     "$(fm_quota_wait_resume_outcome "$STATE" "$id")"
 }
 

@@ -592,7 +592,7 @@ fm_quota_wait_deadline() {  # <state-dir> <id>
   src=$(fm_quota_wait_field "$state" "$id" reset_src)
   if [ "$src" = notice ]; then
     ceiling=$((detected + $(fm_quota_notice_bound)))
-    [ "$deadline" -le "$ceiling" ] || deadline=$ceiling
+    [ "$reset" -le "$ceiling" ] || deadline=$ceiling
   fi
   printf '%s' "$deadline"
 }
@@ -687,6 +687,18 @@ fm_quota_wait_resume_reachable() {  # <state-dir> <id>
   case "$deadline" in ''|*[!0-9]*) return 1 ;; esac
   grace=$(fm_quota_reset_grace)
   [ "$deadline" -ge $((reset + grace)) ]
+}
+
+# The reset a recorded wait carries, as a clause a sentence about that wait can
+# take, and NOTHING at all when no reset could be read. A wait with no reset has
+# no time to state, so no surface may render one: the resume outcome below is
+# where that case is spoken, once. Lives here beside the other renderers so both
+# detection lines ask the same owner rather than each deciding locally.
+fm_quota_wait_reset_phrase() {  # <state-dir> <id>
+  local reset
+  reset=$(fm_quota_wait_field "$1" "$2" reset)
+  case "$reset" in ''|*[!0-9]*) return 0 ;; esac
+  printf ', resets %s' "$(fm_quota_format_reset "$reset")"
 }
 
 # What a reader must expect of a recorded wait. Only a resume this record can

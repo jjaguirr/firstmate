@@ -782,6 +782,37 @@ test_a_notice_stated_reset_within_the_ceiling_waits_as_stated() {
   pass "noticeinside: a reset a notice states below the ceiling still governs the wait"
 }
 
+# The ceiling's boundary itself, in both directions. It is measured on the RESET
+# the notice states, not on the deadline that reset produces, so the grace added
+# afterwards can never eat into the six hours the constant and the documentation
+# both name. A comparison made one term out costs a wait its one resume in a band
+# nothing else would notice.
+test_a_notice_stated_reset_at_the_ceiling_is_measured_on_the_reset() {
+  local dir id now ceiling
+  dir=$(make_case noticeboundary "the worker is idle")
+  id=$(case_id noticeboundary)
+  now=$(date +%s)
+  ceiling=$FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( now + ceiling ))" banner \
+    "$(fm_quota_fingerprint banner claude noticeboundary)" notice ||
+    fail "noticeboundary: could not write the wait record"
+  set_detected "$dir" "$id" "$now"
+  fm_quota_wait_resume_reachable "$dir/state" "$id" ||
+    fail "noticeboundary: a reset exactly at the ceiling lost the resume it was recorded for"
+  [ "$(fm_quota_wait_deadline "$dir/state" "$id")" = "$(( now + ceiling + FM_QUOTA_RESET_GRACE_SECS ))" ] ||
+    fail "noticeboundary: a reset at the ceiling did not keep the grace its resume is delivered in"
+
+  # One second past the ceiling is truncated, so the comparison cannot drift the
+  # other way either.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( now + ceiling + 1 ))" banner \
+    "$(fm_quota_fingerprint banner claude noticepastboundary)" notice ||
+    fail "noticeboundary: could not write the past-ceiling record"
+  set_detected "$dir" "$id" "$now"
+  fm_quota_wait_resume_reachable "$dir/state" "$id" &&
+    fail "noticeboundary: a reset one second past the ceiling was not truncated"
+  pass "noticeboundary: the ceiling is measured on the reset itself, with the grace added after it"
+}
+
 test_a_notice_stated_reset_beyond_the_ceiling_is_capped() {
   local dir id now
   dir=$(make_case noticebeyond "the worker is idle")
@@ -1026,6 +1057,9 @@ JSON
     fail "noresetnobanner: a reset time was recorded that nothing could have read"
   assert_contains "$out" "NOT resumed automatically" \
     "noresetnobanner: a wait nothing can resume was not reported as one"
+  # A wait with no reset has no time to state, so the line must not render one.
+  assert_not_contains "$out" "resets" \
+    "noresetnobanner: a wait carrying no reset was reported as if it had one"
   assert_not_contains "$out" "headroom could not be read" \
     "noresetnobanner: a machine-read exhausted account was reported as unreadable"
   pass "noresetnobanner: an exhausted account with no reset anywhere still records a bounded structural wait"
@@ -1527,6 +1561,7 @@ test_a_banner_that_states_its_reset_runs_to_it_and_resumes
 test_a_worker_parked_by_design_is_never_recorded_as_refused
 test_a_dead_endpoint_never_earns_a_quota_wait
 test_a_notice_stated_reset_within_the_ceiling_waits_as_stated
+test_a_notice_stated_reset_at_the_ceiling_is_measured_on_the_reset
 test_a_notice_stated_reset_beyond_the_ceiling_is_capped
 test_a_capped_notice_reset_is_never_reported_or_delivered_as_a_resume
 test_a_capped_notice_reset_is_never_promised_at_detection
