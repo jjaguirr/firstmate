@@ -671,23 +671,49 @@ fm_quota_wait_provider_name() {  # <state-dir> <id>
   esac
 }
 
-# What a reader must expect of a recorded wait. A wait whose reset nobody could
-# read is never resumed automatically, so no surface may promise otherwise.
+# 0 when the resume a recorded wait is owed can actually be REACHED: its reset
+# parses, and its own deadline does not retire the record before that resume
+# comes due. The presence of a reset is not that question and may never be used
+# as a proxy for it, because the rendered-text ceiling produces waits whose reset
+# is perfectly readable and whose resume can still never fire - the record is
+# gone at the cap, hours before the notice's stated reset arrives. This is the
+# one owner of the promise, so the reporting surfaces and the resume path cannot
+# disagree about which waits self-resume.
+fm_quota_wait_resume_reachable() {  # <state-dir> <id>
+  local state=$1 id=$2 reset deadline grace
+  reset=$(fm_quota_wait_field "$state" "$id" reset)
+  case "$reset" in ''|*[!0-9]*) return 1 ;; esac
+  deadline=$(fm_quota_wait_deadline "$state" "$id") || return 1
+  case "$deadline" in ''|*[!0-9]*) return 1 ;; esac
+  grace=$(fm_quota_reset_grace)
+  [ "$deadline" -ge $((reset + grace)) ]
+}
+
+# What a reader must expect of a recorded wait. Only a resume this record can
+# reach is promised: a wait whose reset nobody could read is never resumed, and
+# neither is one the ceiling caps short of the reset its notice states, so no
+# surface may report either as self-resuming.
 fm_quota_wait_resume_outcome() {  # <state-dir> <id>
+  if fm_quota_wait_resume_reachable "$1" "$2"; then
+    printf 'this worker is resumed automatically when that limit resets'
+    return
+  fi
   case "$(fm_quota_wait_field "$1" "$2" reset)" in
     ''|*[!0-9]*) printf 'no reset time could be read, so this worker is NOT resumed automatically' ;;
-    *) printf 'this worker is resumed automatically when that limit resets' ;;
+    *) printf 'that reset was read from a rendered notice and is capped, so this wait retires first and the worker is NOT resumed automatically; ordinary escalation takes this pane back at the cap, and an account still refused records a fresh wait on fresh evidence' ;;
   esac
 }
 
 # 0 when a recorded wait's reset time has arrived and a resume is therefore due.
-# A wait with no readable reset is never due: it expires instead, because a
-# resume time nobody could read is a guess, and guessing is how a nudge lands in
-# a worker that is actually mid-task.
+# A wait whose resume is not reachable is never due: one with no readable reset
+# expires instead, because a resume time nobody could read is a guess and
+# guessing is how a nudge lands in a worker that is actually mid-task; and one
+# the ceiling caps has already spent the deadline it was recorded with, so
+# delivering at its stated reset would honour a bound the record no longer has.
 fm_quota_wait_resume_due() {  # <state-dir> <id>
   local reset grace
+  fm_quota_wait_resume_reachable "$1" "$2" || return 1
   reset=$(fm_quota_wait_field "$1" "$2" reset)
-  case "$reset" in ''|*[!0-9]*|unknown) return 1 ;; esac
   grace=$(fm_quota_reset_grace)
   [ "$(date +%s)" -ge $((reset + grace)) ]
 }

@@ -742,8 +742,12 @@ test_a_banner_that_states_its_reset_runs_to_it_and_resumes() {
   # The stated reset arrives, and the fleet recovers itself with no quota-axi
   # anywhere and no human in the loop.
   fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) - 600 ))" banner \
-    "$(fm_quota_fingerprint banner claude "$id stated reset")" ||
+    "$(fm_quota_fingerprint banner claude "$id stated reset")" notice ||
     fail "bannerreset: could not restate the wait at its stated reset"
+  case "$(fm_quota_wait_resume_outcome "$dir/state" "$id")" in
+    *"this worker is resumed automatically"*) ;;
+    *) fail "bannerreset: a reachable resume was not reported as one" ;;
+  esac
   out=$(run_scan "$dir" "$id" FM_QUOTA_AXI_BIN=quota-axi-absent-for-test)
   assert_contains "$out" "was resumed automatically" \
     "bannerreset: a banner wait whose stated reset arrived was never resumed"
@@ -769,6 +773,10 @@ test_a_notice_stated_reset_within_the_ceiling_waits_as_stated() {
   set_detected "$dir" "$id" "$detected"
   fm_quota_wait_active "$dir/state" "$id" ||
     fail "noticeinside: a notice-stated reset inside the ceiling retired early"
+  case "$(fm_quota_wait_resume_outcome "$dir/state" "$id")" in
+    *"this worker is resumed automatically"*) ;;
+    *) fail "noticeinside: a wait that runs to its stated reset stopped promising that resume" ;;
+  esac
   pass "noticeinside: a reset a notice states below the ceiling still governs the wait"
 }
 
@@ -798,6 +806,48 @@ test_a_notice_stated_reset_beyond_the_ceiling_is_capped() {
   fm_quota_wait_active "$dir/state" "$id" ||
     fail "noticebeyond: a vendor-stated reset was truncated by the rendered-text ceiling"
   pass "noticebeyond: a reset only a notice claims is capped, while the account's own reset is not"
+}
+
+# The ceiling's other half. Capping a wait short of the reset its notice stated
+# creates a second class of wait that is never resumed, so the promise a surface
+# makes and the resume the scan delivers must both read the DEADLINE rather than
+# the mere presence of a reset. Otherwise the captain is told a worker resumes
+# itself while the record dies hours earlier, and the scan later delivers text
+# into a pane whose wait expired most of a day ago.
+test_a_capped_notice_reset_is_never_reported_or_delivered_as_a_resume() {
+  local dir id out now
+  dir=$(make_case noticecapped "the worker stopped mid-task")
+  id=$(case_id noticecapped)
+  set_busy_state "$dir" "$id" idle || fail "noticecapped: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  now=$(date +%s)
+  # A notice detected a day ago that stated a reset nearly 24h out, truncated by
+  # the ceiling to six hours after detection. That stated reset has just arrived,
+  # about eighteen hours after the wait itself expired.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( now - 100 ))" banner \
+    "$(fm_quota_fingerprint banner claude noticecapped)" notice ||
+    fail "noticecapped: could not write the wait record"
+  set_detected "$dir" "$id" "$(( now - 86500 ))"
+
+  fm_quota_wait_resume_due "$dir/state" "$id" &&
+    fail "noticecapped: a resume came due for a wait that expired at its cap"
+  case "$(fm_quota_wait_resume_outcome "$dir/state" "$id")" in
+    *"NOT resumed automatically"*) ;;
+    *) fail "noticecapped: a capped wait was reported as one that resumes itself" ;;
+  esac
+
+  write_quota_json "$dir/quota.json" claude through_reset "$(iso_in 3600)"
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_not_contains "$out" "was resumed automatically" \
+    "noticecapped: a wait capped hours earlier still delivered its notice's resume"
+  [ ! -s "$dir/sent.log" ] ||
+    fail "noticecapped: text was delivered into a pane whose wait had already expired"
+  assert_contains "$out" "capped short of the reset its rendered notice stated" \
+    "noticecapped: the capped expiry was not reported as one"
+  assert_not_contains "$out" "expired without a usable reset time" \
+    "noticecapped: a capped reset that parsed fine was reported as unreadable"
+  assert_absent "$dir/state/$id.quota-wait" "noticecapped: the capped wait was not retired"
+  pass "noticecapped: a wait the ceiling caps neither promises nor delivers an automatic resume"
 }
 
 test_a_wait_whose_agent_died_is_retired_by_the_scan() {
@@ -1413,6 +1463,7 @@ test_a_worker_parked_by_design_is_never_recorded_as_refused
 test_a_dead_endpoint_never_earns_a_quota_wait
 test_a_notice_stated_reset_within_the_ceiling_waits_as_stated
 test_a_notice_stated_reset_beyond_the_ceiling_is_capped
+test_a_capped_notice_reset_is_never_reported_or_delivered_as_a_resume
 test_a_wait_whose_agent_died_is_retired_by_the_scan
 test_a_failed_resume_read_keeps_the_scan_snapshot
 test_an_exhausted_account_with_no_readable_reset_still_records

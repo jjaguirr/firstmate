@@ -87,7 +87,7 @@ SEND_BIN="${FM_QUOTA_SEND_BIN:-$SCRIPT_DIR/fm-send.sh}"
 # The one resume text. A single line, plain English, and deliberately free of
 # fleet vocabulary: it is read by a worker that has lost no context at all and
 # only needs to be told the wait is over.
-FM_QUOTA_RESUME_TEXT=${FM_QUOTA_RESUME_TEXT:-'The provider usage limit that stopped your last turn has reset - continue the task you were working on from where it stopped.'}
+FM_QUOTA_RESUME_TEXT='The provider usage limit that stopped your last turn has reset - continue the task you were working on from where it stopped.'
 
 usage() {
   awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" >&2
@@ -304,6 +304,17 @@ resume_probe_discard() {
   RESUME_PROBE_ROOT=
 }
 
+# The snapshot root dies with the scan that made it, however that scan ends. A
+# resume pass is where waits come due in bulk, each forced re-read is bounded but
+# not instant, and this process is launched from the watcher poll - which is
+# itself killable and lock-stealable - so the ordinary end of scan_once is not
+# the only way out. This is safe against a scan running beside it because the
+# root is that process's own mktemp -d and never a shared or swept path: nothing
+# here can reach another scan's snapshot.
+trap 'resume_probe_discard' EXIT
+trap 'resume_probe_discard; exit 130' INT
+trap 'resume_probe_discard; exit 143' TERM
+
 resume_task() {  # <id> <meta> <reset-epoch>
   local id=$1 meta=$2 reset=$3 provider status current_status refusal rc
   provider=$(fm_quota_wait_field "$STATE" "$id" provider)
@@ -360,7 +371,7 @@ resume_task() {  # <id> <meta> <reset-epoch>
 # --- scan -------------------------------------------------------------------
 
 scan_once() {
-  local id meta provider providers='' status state_token reset entry
+  local id meta provider providers='' status state_token reset entry expiry
   local -a rows=()
   while IFS=$(printf '\t') read -r id meta; do
     [ -n "$id" ] || continue
@@ -392,8 +403,21 @@ scan_once() {
         fm_quota_wait_clear "$STATE" "$id"
         printf 'quota-limit: the recorded wait on %s was retired because its endpoint no longer reports a live agent; the ordinary check is back on this worker\n' "$id"
       elif ! fm_quota_wait_active "$STATE" "$id"; then
+        # Two shapes reach a deadline, and they are not the same report. A reset
+        # read from a rendered notice is capped, so a wait can expire carrying a
+        # reset that parsed perfectly and was simply further out than such a wait
+        # may run; calling that an unreadable reset sends an operator looking for
+        # a parse failure that never happened.
+        if fm_quota_wait_resume_reachable "$STATE" "$id"; then
+          expiry='expired at the reset it carried'
+        else
+          case "$(fm_quota_wait_field "$STATE" "$id" reset)" in
+            ''|*[!0-9]*) expiry='expired without a usable reset time' ;;
+            *) expiry='was capped short of the reset its rendered notice stated, and expired at that cap without an automatic resume' ;;
+          esac
+        fi
         end_wait "$id"
-        printf 'quota-limit: the recorded wait on %s expired without a usable reset time; the ordinary check is back on this worker\n' "$id"
+        printf 'quota-limit: the recorded wait on %s %s; the ordinary check is back on this worker\n' "$id" "$expiry"
       fi
       continue
     fi
@@ -419,7 +443,6 @@ scan_once() {
         ;;
     esac
   done
-  resume_probe_discard
 }
 
 cmd_scan() {
