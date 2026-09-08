@@ -406,6 +406,7 @@ remote_secondmate_teardown() {
   rm -f -- "$STATE/$ID.meta" "$STATE/$ID.turn-ended" \
     "$STATE/$ID.quota-wait" "$STATE/$ID.quota-resurfaced" "$STATE/$ID.quota-nudged" \
     "$STATE/$ID.quota-spent"
+  rm -rf -- "$STATE/$ID.quota-nudged.lock" "$STATE/$ID.quota-nudged.lock.owner."*
   printf 'teardown %s complete (remote %s:%s)\n' "$ID" "$remote_host" "$remote_home"
   return 0
 }
@@ -2313,6 +2314,8 @@ cleanup_firstmate_home_children() {
       "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.kimi-turnend-token" \
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
       "$sub_state/$child_id.cursor-session"
+    rm -rf "$sub_state/$child_id.quota-nudged.lock" \
+      "$sub_state/$child_id.quota-nudged.lock.owner."*
   done
 }
 
@@ -2596,6 +2599,7 @@ rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.muse-session-current" "$STATE/$ID.cursor-session" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note"
+rm -rf "$STATE/$ID.quota-nudged.lock" "$STATE/$ID.quota-nudged.lock.owner."*
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then

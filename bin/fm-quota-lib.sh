@@ -502,8 +502,6 @@ fm_quota_wait_clear() {  # <state-dir> <id>
   rm -f "$(fm_quota_wait_path "$1" "$2")" "$(fm_quota_resurfaced_path "$1" "$2")"
 }
 
-# The grace added after a reset time, as a number. A knob this code cannot read
-# as a number is no grace at all rather than an arithmetic error under `set -u`.
 # The reset-less bound, as a number. A knob this code cannot read as a number
 # falls back to the documented default rather than aborting the watcher poll
 # loop on an arithmetic error under `set -u`.
@@ -514,6 +512,8 @@ fm_quota_banner_bound() {
   esac
 }
 
+# The grace added after a reset time, as a number. A knob this code cannot read
+# as a number is no grace at all rather than an arithmetic error under `set -u`.
 fm_quota_reset_grace() {
   case "$FM_QUOTA_RESET_GRACE_SECS" in
     ''|*[!0-9]*) printf '0' ;;
@@ -660,4 +660,34 @@ fm_quota_nudge_record() {  # <state-dir> <id> <reset-epoch>
   tmp="$path.tmp.$$"
   printf '%s\n' "$3" > "$tmp" || return 1
   mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# Claim <reset-epoch>'s one resume, atomically against any other scan. Reading
+# the durable record and writing it are one step here because they are two steps
+# everywhere else: the routine poll scan and an operator's `scan --force` can sit
+# in the same forced re-probe for seconds, and both would otherwise read the same
+# reset as unspent and deliver into the same live pane. The claim is made BEFORE
+# delivery, so a crash between the two costs one missed resume that the ordinary
+# stale path escalates, never a second nudge.
+#
+# Returns 0 when this caller owns the resume, 1 when the reset was already spent,
+# and 2 when the claim could not be made at all - another scan holds it, or the
+# record could not be written - which delivers nothing and leaves the wait for a
+# later scan. The lock is bin/fm-wake-lib.sh's, so a scan killed mid-claim leaves
+# a dead-pid hold that the next attempt reclaims rather than a permanent block.
+fm_quota_nudge_claim() {  # <state-dir> <id> <reset-epoch>
+  local state=$1 id=$2 reset=$3 lock rc
+  lock="$(fm_quota_nudged_path "$state" "$id").lock"
+  fm_lock_try_acquire "$lock" || return 2
+  if fm_quota_nudge_unspent "$state" "$id" "$reset"; then
+    if fm_quota_nudge_record "$state" "$id" "$reset"; then
+      rc=0
+    else
+      rc=2
+    fi
+  else
+    rc=1
+  fi
+  fm_lock_release "$lock" || true
+  return "$rc"
 }

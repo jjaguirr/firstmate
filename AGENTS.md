@@ -94,6 +94,7 @@ state/               runtime records and signals; gitignored
   <id>.muse-session  muse busy-source binding (sessions root plus task worktree) written by fm-spawn; removed by teardown
   <id>.cursor-session  cursor busy-source binding (projects root, task worktree, prior conversations) written by fm-spawn; removed by teardown
   <id>.quota-wait <id>.quota-resurfaced <id>.quota-nudged <id>.quota-spent  a bounded provider-quota wait carrying its reset time, that wait's re-surface throttle, the reset its one automatic resume was spent on, and the evidence a wait was already made from; written only by bin/fm-quota-watch.sh, removed by teardown
+  <id>.quota-nudged.lock  the single-flight hold two concurrent scans claim one reset through, so a routine poll scan and an operator's forced scan cannot both deliver; released as soon as the claim is made, reclaimed from a dead holder by the next scan, removed by teardown
   .quota-probe.json .quota-catalog.json .quota-probe-resume.*  cached quota-axi evidence and the private snapshot one resume reads its account from; safe to delete
   <id>.meta          task metadata; each producer script's header owns its exact fields and mutation contract, with docs/configuration.md routing operator-facing backend and trace-context details
   <id>.herdr-presentation  quarantinable attempt and restart-binding journal for Herdr's optional visual projection; never task or endpoint authority; see docs/herdr-backend.md "Presentation spaces"

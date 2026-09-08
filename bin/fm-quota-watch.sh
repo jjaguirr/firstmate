@@ -289,11 +289,16 @@ resume_task() {  # <id> <meta> <reset-epoch>
       "$id" "$refusal"
     return 0
   fi
-  fm_quota_nudge_unspent "$STATE" "$id" "$reset" || { end_wait "$id"; return 0; }
-  # Record the spend BEFORE delivering it. A crash between the two costs one
+  # Claim the spend BEFORE delivering it. A crash between the two costs one
   # missed resume, which the ordinary stale path escalates; the other order
   # would cost an unbounded resend loop into a live worker.
-  fm_quota_nudge_record "$STATE" "$id" "$reset" || return 0
+  fm_quota_nudge_claim "$STATE" "$id" "$reset"
+  rc=$?
+  case "$rc" in
+    0) ;;
+    1) end_wait "$id"; return 0 ;;
+    *) return 0 ;;
+  esac
   end_wait "$id"
   rc=0
   # Delivered to the recorded backend target rather than the task selector. A

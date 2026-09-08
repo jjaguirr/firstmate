@@ -905,6 +905,73 @@ test_a_non_numeric_bound_degrades_to_the_documented_default() {
   pass "badbound: a bound this code cannot read as a number degrades to the documented default"
 }
 
+# Hold a claim from a separate live process, which is what a concurrent scan is.
+# Sets HOLD_CLAIM_PID for the caller to kill.
+hold_claim() {  # <dir> <lock>
+  local dir=$1 claim_lock=$2 i=0
+  (
+    . "$ROOT/bin/fm-timeout-lib.sh"
+    . "$ROOT/bin/fm-wake-lib.sh"
+    FM_STATE_OVERRIDE="$dir/state" fm_lock_try_acquire "$claim_lock" || exit 1
+    sleep 60
+  ) &
+  HOLD_CLAIM_PID=$!
+  while [ "$i" -lt 100 ]; do
+    if [ -e "$claim_lock" ] || [ -L "$claim_lock" ]; then
+      return 0
+    fi
+    kill -0 "$HOLD_CLAIM_PID" 2>/dev/null || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+test_one_reset_is_claimed_by_exactly_one_scan() {
+  local dir id lock out rc
+  dir=$(make_case oneclaim "the worker stopped mid-task")
+  id=$(case_id oneclaim)
+  set_busy_state "$dir" "$id" idle || fail "oneclaim: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  lock="$dir/state/$id.quota-nudged.lock"
+
+  # Two scans can be in flight at once: the watcher poll launches one on its own
+  # cadence while an operator runs the forced check the header sanctions, and
+  # both sit in the forced re-probe for seconds before either would write. The
+  # claim is what makes the reset one reset rather than two nudges.
+  rc=0; fm_quota_nudge_claim "$dir/state" "$id" 1000 || rc=$?
+  [ "$rc" = 0 ] || fail "oneclaim: the first claim on an unspent reset was refused (rc=$rc)"
+  rc=0; fm_quota_nudge_claim "$dir/state" "$id" 1000 || rc=$?
+  [ "$rc" = 1 ] || fail "oneclaim: a spent reset was claimed a second time (rc=$rc)"
+
+  # A scan that cannot take the claim delivers nothing and leaves the wait for a
+  # later scan rather than racing the holder. The holder is a separate live
+  # process, which is what a concurrent scan actually is.
+  hold_claim "$dir" "$lock" || fail "oneclaim: could not hold the claim from another process"
+  rc=0; fm_quota_nudge_claim "$dir/state" "$id" 2000 || rc=$?
+  [ "$rc" = 2 ] || fail "oneclaim: a contended claim was granted anyway (rc=$rc)"
+
+  # And end to end: a scan whose claim another process holds delivers no text.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) - 600 ))" structural \
+    "$(fm_quota_fingerprint structural claude oneclaim)" ||
+    fail "oneclaim: could not write the wait record"
+  rm -f "$dir/state/$id.quota-nudged"
+  write_quota_json "$dir/quota.json" claude through_reset "$(iso_in 3600)"
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  [ ! -s "$dir/sent.log" ] || fail "oneclaim: a scan delivered a resume whose claim another scan held"
+  assert_present "$dir/state/$id.quota-wait" \
+    "oneclaim: a scan that could not claim the reset retired the wait anyway"
+  assert_not_contains "$out" "was resumed automatically" "oneclaim: an unclaimed resume was reported"
+
+  # A scan KILLED mid-claim must not block every later resume forever.
+  kill "$HOLD_CLAIM_PID" 2>/dev/null || true
+  wait_for_exit "$HOLD_CLAIM_PID" || fail "oneclaim: the holding process did not exit"
+  [ -e "$lock" ] || [ -L "$lock" ] || fail "oneclaim: the abandoned hold did not persist"
+  rc=0; fm_quota_nudge_claim "$dir/state" "$id" 3000 || rc=$?
+  [ "$rc" = 0 ] || fail "oneclaim: a hold left by a dead scan blocked a legitimate later resume (rc=$rc)"
+  pass "oneclaim: one reset is claimed by exactly one scan, and a dead holder never blocks a later one"
+}
+
 test_evidence_that_already_made_a_wait_never_makes_another() {
   local dir id out stale_reset
   dir=$(make_case respend "the worker stopped mid-task")
@@ -1169,6 +1236,7 @@ test_an_exhausted_account_with_no_readable_reset_still_records
 test_an_exhausted_account_with_no_banner_and_no_reset_still_records
 test_a_worker_holding_a_blocker_is_never_parked_or_nudged
 test_a_non_numeric_bound_degrades_to_the_documented_default
+test_one_reset_is_claimed_by_exactly_one_scan
 test_evidence_that_already_made_a_wait_never_makes_another
 test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged
