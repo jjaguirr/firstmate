@@ -149,13 +149,29 @@ task_capture() {  # <meta>
 # bin/fm-watch.sh's demand-deep-inspection escalation owns, and a wait must never
 # absorb it), the pane must classify exactly idle rather than mid-turn, and the
 # worker's own state must not already explain that idleness.
-detect_structural() {  # <id> <meta> <provider> <reset-epoch>
+detect_structural() {  # <id> <meta> <provider> <reset-epoch|unknown>
   local id=$1 meta=$2 provider=$3 reset=$4 harness fp
-  # A refusal whose stated reset is already in the past is contradictory
-  # evidence, not a wait: there is nothing left to wait for, so the pane belongs
-  # to ordinary escalation rather than to a bounded wait that can never clear.
-  case "$reset" in ''|unknown|*[!0-9]*) return 1 ;; esac
-  [ "$reset" -gt "$(date +%s)" ] || return 1
+  case "$reset" in
+    ''|unknown|*[!0-9]*)
+      # quota-axi verified the refusal but named no reset this code can read:
+      # the scope carried no limiting window, or that window carried no
+      # resetsAt. The VERDICT stays structural - the account was machine-read as
+      # refusing - and the rendered notice is consulted for the RESET TIME
+      # ALONE, never for whether there is a refusal. When the notice states none
+      # either, the wait is still recorded with an unknown reset and expires on
+      # the short bound, because recording nothing here leaves the worker parked
+      # exactly as in the reported incident on a home that does have quota-axi.
+      reset=$(fm_quota_banner_reset_epoch "$(task_capture "$meta")") || reset=
+      reset=${reset:-unknown}
+      ;;
+    *)
+      # A refusal whose stated reset is already in the past is contradictory
+      # evidence, not a wait: there is nothing left to wait for, so the pane
+      # belongs to ordinary escalation rather than to a bounded wait that can
+      # never clear.
+      [ "$reset" -gt "$(date +%s)" ] || return 1
+      ;;
+  esac
   fp=$(fm_quota_fingerprint structural "$provider" "$reset")
   fm_quota_fingerprint_unspent "$STATE" "$id" "$fp" || return 1
   task_agent_alive "$meta" || return 1
@@ -163,8 +179,16 @@ detect_structural() {  # <id> <meta> <provider> <reset-epoch>
   task_idleness_unexplained "$id" || return 1
   harness=$(fm_meta_get "$meta" harness) || harness=
   fm_quota_wait_write "$STATE" "$id" "$provider" "$harness" "$reset" structural "$fp" || return 1
-  printf 'quota-limit: %s is waiting on %s, resets %s\n' \
-    "$id" "$provider" "$(fm_quota_format_reset "$reset")"
+  case "$reset" in
+    ''|unknown|*[!0-9]*)
+      printf 'quota-limit: %s is waiting on %s, which states no reset time, so this worker is NOT resumed automatically\n' \
+        "$id" "$provider"
+      ;;
+    *)
+      printf 'quota-limit: %s is waiting on %s, resets %s\n' \
+        "$id" "$provider" "$(fm_quota_format_reset "$reset")"
+      ;;
+  esac
 }
 
 # Record a banner-corroborated wait for a worker whose provider could not be
@@ -276,7 +300,8 @@ resume_task() {  # <id> <meta> <reset-epoch>
   fm_quota_nudge_record "$STATE" "$id" "$reset" || return 0
   end_wait "$id"
   rc=0
-  FM_HOME="$FM_HOME" "$SEND_BIN" "$id" "$FM_QUOTA_RESUME_TEXT" >/dev/null 2>&1 || rc=$?
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    "$SEND_BIN" "$id" "$FM_QUOTA_RESUME_TEXT" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
     printf 'quota-limit: %s was resumed automatically now that its provider limit has reset\n' "$id"
   else
@@ -333,18 +358,7 @@ scan_once() {
     fi
     case "$state_token" in
       exhausted)
-        case "$reset" in
-          ''|unknown|*[!0-9]*)
-            # The account is refusing, but the vendor did not say when that
-            # clears - no limiting window carried a readable resetsAt. That is
-            # the same shape as a structural read being unavailable, not a
-            # verdict to act on, so it takes the corroborated fallback rather
-            # than ending the arm and leaving the worker parked on a home that
-            # does have quota-axi.
-            detect_banner "$id" "$meta" "$provider" || true
-            ;;
-          *) detect_structural "$id" "$meta" "$provider" "$reset" || true ;;
-        esac
+        detect_structural "$id" "$meta" "$provider" "$reset" || true
         ;;
       available)
         # The vendor says this account has headroom. A rendered limit notice is

@@ -295,6 +295,32 @@ test_stale_quota_wait_with_no_reset_is_reported_as_needing_a_human() {
   pass "a quota wait with no readable reset is reported as one nothing will resume"
 }
 
+# The declared-wait cadence the away branch promises is a property of the pause
+# MARKER surviving housekeeping. A quota-parked worker's last line is whatever it
+# wrote before the refusal, so a guard that reads only paused:/captain-held:
+# deletes the marker on every tick, its age never reaches FM_PAUSE_RESURFACE_SECS,
+# and the pane reaches the away digest never - no wedge line and no recheck line.
+test_stale_quota_wait_pause_marker_survives_housekeeping() {
+  local dir state marker
+  dir=$(make_supercase stale-quota-marker)
+  state="$dir/state"
+  printf 'working: implementing the fix\n' > "$state/quota-w9m.status"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9m claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the quota wait record"
+  marker="$state/.subsuper-paused-$(_stale_key quota-w9m)"
+
+  reconcile_pause_tracking "sess:fm-quota-w9m" "$state" "working: implementing the fix"
+  [ -e "$marker" ] || fail "a recorded quota wait never got a pause marker to age"
+  reconcile_pause_tracking "sess:fm-quota-w9m" "$state" "working: implementing the fix"
+  [ -e "$marker" ] || fail "the next housekeeping tick deleted the quota wait's pause marker"
+
+  # The record's own deadline is what returns the pane to wedge aging.
+  fm_quota_wait_clear "$state" quota-w9m
+  reconcile_pause_tracking "sess:fm-quota-w9m" "$state" "working: implementing the fix"
+  [ ! -e "$marker" ] || fail "a retired quota wait kept its pause marker"
+  pass "a recorded quota wait keeps its pause marker across housekeeping, and retiring it drops the marker"
+}
+
 test_stale_quota_wait_classifies_pause() {
   local dir state out
   dir=$(make_supercase stale-quota)
@@ -2033,6 +2059,7 @@ test_stale_captain_held_classifies_pause
 test_stale_quota_wait_classifies_pause
 test_stale_quota_wait_never_swallows_a_terminal_status
 test_stale_quota_wait_with_no_reset_is_reported_as_needing_a_human
+test_stale_quota_wait_pause_marker_survives_housekeeping
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking

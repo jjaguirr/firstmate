@@ -71,9 +71,14 @@ iso_in() {  # <seconds-from-now>
 # rendered it ("8:50am"). Local time, because that is what the notice states and
 # what the production parser resolves against.
 clock_in_hours() {  # <hours-from-now>
-  date -d "@$(( $(date +%s) + $1 * 3600 ))" '+%-I:%M%p' 2>/dev/null |
-    tr 'APM' 'apm' ||
-    date -r "$(( $(date +%s) + $1 * 3600 ))" '+%-I:%M%p' | tr 'APM' 'apm'
+  local at formatted
+  at=$(( $(date +%s) + $1 * 3600 ))
+  # The status of a pipeline is its LAST command's, so the fallback has to guard
+  # the date call itself rather than the tr that formats its output.
+  formatted=$(date -d "@$at" '+%I:%M%p' 2>/dev/null) ||
+    formatted=$(date -r "$at" '+%I:%M%p') || return 1
+  [ -n "$formatted" ] || return 1
+  printf '%s' "${formatted#0}" | tr 'APM' 'apm'
 }
 
 # quota-axi's provider report, with a runway status and a limiting window reset
@@ -703,6 +708,50 @@ test_a_failed_resume_read_keeps_the_scan_snapshot() {
   pass "sharedsnapshot: a resume reads its account into a snapshot of its own, never the one the scan shares"
 }
 
+test_an_exhausted_account_with_no_banner_and_no_reset_still_records() {
+  local dir id out
+  dir=$(make_case noresetnobanner "the worker stopped mid-task")
+  id=$(case_id noresetnobanner)
+  set_busy_state "$dir" "$id" idle || fail "noresetnobanner: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # The vendor verified the refusal and named no window, and the pane renders no
+  # notice either, so there is nothing anywhere to read a reset time from. The
+  # verdict is still machine-read, so the wait is still recorded - bounded, and
+  # never resumed automatically.
+  PATH="$dir/fakebin:$PATH" tmux capture-pane -p -t "$SESSION:fm-$id" 2>/dev/null |
+    grep -qiE 'limit' && fail "noresetnobanner: the pane rendered a limit notice, so this case proves nothing"
+  cat > "$dir/quota.json" <<'JSON'
+{
+  "schemaVersion": 5,
+  "providers": [
+    {
+      "provider": "claude",
+      "windows": [],
+      "quotaSemantics": {
+        "status": "known",
+        "effectiveAvailability": [
+          { "scope": "all_models", "status": "known", "runway": { "status": "exhausted_now" } }
+        ]
+      }
+    }
+  ]
+}
+JSON
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_present "$dir/state/$id.quota-wait" \
+    "noresetnobanner: a machine-verified refusal with no reset anywhere recorded nothing at all"
+  [ "$(fm_quota_wait_field "$dir/state" "$id" evidence)" = structural ] ||
+    fail "noresetnobanner: a structurally verified refusal was recorded as weaker evidence"
+  [ "$(fm_quota_wait_field "$dir/state" "$id" reset)" = unknown ] ||
+    fail "noresetnobanner: a reset time was recorded that nothing could have read"
+  assert_contains "$out" "NOT resumed automatically" \
+    "noresetnobanner: a wait nothing can resume was not reported as one"
+  assert_not_contains "$out" "headroom could not be read" \
+    "noresetnobanner: a machine-read exhausted account was reported as unreadable"
+  pass "noresetnobanner: an exhausted account with no reset anywhere still records a bounded structural wait"
+}
+
 test_an_exhausted_account_with_no_readable_reset_still_records() {
   local dir id out
   dir=$(make_case noreset "$BANNER")
@@ -736,7 +785,17 @@ JSON
   assert_contains "$out" "quota-limit:" "noreset: the refusal was not reported"
   [ "$(fm_quota_wait_field "$dir/state" "$id" provider)" = claude ] ||
     fail "noreset: the wait did not carry the provider the vendor named"
-  pass "noreset: an exhausted account whose reset cannot be read still records a bounded wait"
+  # The verdict came from quota-axi, so the record must say so; the notice was
+  # read for its reset time alone. Reporting this as unreadable headroom would
+  # tell the captain the opposite of what the machine read.
+  [ "$(fm_quota_wait_field "$dir/state" "$id" evidence)" = structural ] ||
+    fail "noreset: a structurally verified refusal was recorded as weaker evidence"
+  case "$(fm_quota_wait_field "$dir/state" "$id" reset)" in
+    ''|*[!0-9]*) fail "noreset: the reset the notice stated was not taken from it" ;;
+  esac
+  assert_not_contains "$out" "headroom could not be read" \
+    "noreset: a machine-read exhausted account was reported as unreadable"
+  pass "noreset: an exhausted account takes its reset from the notice while the verdict stays structural"
 }
 
 test_evidence_that_already_made_a_wait_never_makes_another() {
@@ -963,6 +1022,7 @@ test_a_dead_endpoint_never_earns_a_quota_wait
 test_a_wait_whose_agent_died_is_retired_by_the_scan
 test_a_failed_resume_read_keeps_the_scan_snapshot
 test_an_exhausted_account_with_no_readable_reset_still_records
+test_an_exhausted_account_with_no_banner_and_no_reset_still_records
 test_evidence_that_already_made_a_wait_never_makes_another
 test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged

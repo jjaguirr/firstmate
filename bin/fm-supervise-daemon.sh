@@ -380,25 +380,54 @@ classify_signal() {  # <reason-after-colon> <state>
 # turn and could not write anything new; whatever its last line says therefore
 # still describes work this daemon owes the digest, and a wait that swallowed a
 # blocked: or done: would be exactly the quieter alarm this change forbids. The
-# nonterminal progress verbs are excluded here for the same reason the terminal
-# branch excludes them: they are the ordinary shape of a worker that simply
-# stopped mid-task, which is what a quota refusal looks like.
+# nonterminal progress verbs need no arm of their own: fm-classify-lib.sh's own
+# captain-relevant predicate already refuses working, resolved, captain-held and
+# paused before any free-text matching, and those are the ordinary shape of a
+# worker that simply stopped mid-task, which is what a quota refusal looks like.
 status_owns_terminal_path() {  # <status-line>
   local last=$1
   [ -n "$last" ] || return 1
   status_is_terminal_verb "$last" && return 0
-  status_is_captain_relevant "$last" || return 1
-  case "$(status_line_verb "$last")" in
-    working|resolved|captain-held) return 1 ;;
+  status_is_captain_relevant "$last"
+}
+
+# The reason one recorded provider quota refusal is reported with, in the wake
+# and in the housekeeping recheck alike. `unattributed` is an internal token for
+# a worker whose provider could not be established, never a vendor name, and a
+# wait whose reset nobody could read is never resumed automatically - so neither
+# may be stated as if it were otherwise.
+quota_wait_reason() {  # <state> <task>
+  local state=$1 task=$2 provider reset name outcome
+  provider=$(fm_quota_wait_field "$state" "$task" provider)
+  reset=$(fm_quota_wait_field "$state" "$task" reset)
+  case "$provider" in ''|unattributed) name="provider" ;; *) name="$provider" ;; esac
+  case "$reset" in
+    ''|*[!0-9]*) outcome="no reset time could be read, so this worker is NOT resumed automatically" ;;
+    *) outcome="this worker is resumed automatically when that limit resets" ;;
   esac
-  return 0
+  printf 'waiting on the %s usage limit to reset %s; %s' \
+    "$name" "$(fm_quota_format_reset "$reset")" "$outcome"
+}
+
+# 0 when an idle pane's idleness is DECLARED rather than suspicious: the worker's
+# own paused:/captain-held: line, or a recorded provider quota refusal it never
+# got a turn to declare for itself. Every pause-marker guard reads this one
+# predicate, so a quota wait keeps its marker across housekeeping ticks and ages
+# onto the same bounded recheck a declared pause gets. Without that the marker is
+# recorded and deleted every tick, and the pane reaches the away digest never.
+stale_is_declared_wait() {  # <window> <state> <last-status-line>
+  local win=$1 state=$2 last=$3 task
+  status_is_paused_or_captain_held "$last" && return 0
+  task=$(window_to_task "$win" "$state")
+  [ -n "$task" ] || return 1
+  fm_quota_wait_active "$state" "$task"
 }
 
 # classify_stale decides the WAKE itself (one-shot per distinct hash). On a
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last seen provider reset name outcome
+  local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
   if [ -n "$task" ] && ! status_owns_terminal_path "$last" &&
@@ -410,15 +439,7 @@ classify_stale() {  # <window> <state>
     # expected and the wait carries its own reset time. The record expires on its
     # own bound, so a worker that does not resume returns to wedge escalation
     # here exactly as it would with no record at all.
-    provider=$(fm_quota_wait_field "$state" "$task" provider)
-    reset=$(fm_quota_wait_field "$state" "$task" reset)
-    case "$provider" in ''|unattributed) name="provider" ;; *) name="$provider" ;; esac
-    case "$reset" in
-      ''|*[!0-9]*) outcome="no reset time could be read, so this worker is NOT resumed automatically" ;;
-      *) outcome="this worker is resumed automatically when that limit resets" ;;
-    esac
-    printf 'pause|paused (waiting on the %s usage limit to reset %s), rechecked on a long cadence; %s' \
-      "$name" "$(fm_quota_format_reset "$reset")" "$outcome"
+    printf 'pause|paused (%s), rechecked on a long cadence' "$(quota_wait_reason "$state" "$task")"
     return
   fi
   if [ -n "$last" ] && status_is_paused_or_captain_held "$last"; then
@@ -536,7 +557,7 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
   key=$(_stale_key "$task")
   marker="$state/.subsuper-paused-$key"
   watcher_key=$(_stale_key "$win")
-  if status_is_paused_or_captain_held "$last"; then
+  if stale_is_declared_wait "$win" "$state" "$last"; then
     stale_marker_remove "$win" "$state"
     pause_marker_record "$win" "$state"
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
@@ -554,7 +575,7 @@ migrate_watcher_pause_markers() {  # <state>
     key=$(_stale_key "$task")
     watcher_key=$(_stale_key "$win")
     last=$(last_status_line "$state/$task.status")
-    if status_is_paused_or_captain_held "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
+    if stale_is_declared_wait "$win" "$state" "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
       reconcile_pause_tracking "$win" "$state" "$last"
     fi
   done
@@ -1097,7 +1118,7 @@ housekeeping() {  # <state>
     fi
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
-    if [ -z "$last" ] || ! status_is_paused_or_captain_held "$last"; then
+    if ! stale_is_declared_wait "$win" "$state" "$last"; then
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
     fi
@@ -1114,6 +1135,9 @@ housekeeping() {  # <state>
           _now > "$marker"
         elif [ -n "$last" ] && status_is_paused "$last"; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          _now > "$marker"
+        elif [ -n "$task" ] && fm_quota_wait_active "$state" "$task"; then
+          escalate_add "$state" "paused ${age}s ($(quota_wait_reason "$state" "$task")): $win"
           _now > "$marker"
         else
           rm -f "$marker"
