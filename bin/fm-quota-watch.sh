@@ -189,16 +189,9 @@ detect_structural() {  # <id> <meta> <provider> <reset-epoch|unknown>
   task_idleness_unexplained "$id" || return 1
   harness=$(fm_meta_get "$meta" harness) || harness=
   fm_quota_wait_write "$STATE" "$id" "$provider" "$harness" "$reset" structural "$fp" "$src" || return 1
-  case "$reset" in
-    ''|unknown|*[!0-9]*)
-      printf 'quota-limit: %s is waiting on %s, which states no reset time, so this worker is NOT resumed automatically\n' \
-        "$id" "$provider"
-      ;;
-    *)
-      printf 'quota-limit: %s is waiting on %s, resets %s\n' \
-        "$id" "$provider" "$(fm_quota_format_reset "$reset")"
-      ;;
-  esac
+  printf 'quota-limit: %s is waiting on %s, resets %s; %s\n' \
+    "$id" "$provider" "$(fm_quota_format_reset "$reset")" \
+    "$(fm_quota_wait_resume_outcome "$STATE" "$id")"
 }
 
 # Record a banner-corroborated wait for a worker whose provider could not be
@@ -218,9 +211,9 @@ detect_banner() {  # <id> <meta> <provider>
   harness=$(fm_meta_get "$meta" harness) || harness=
   fm_quota_wait_write "$STATE" "$id" "${provider:-unattributed}" "$harness" \
     "${reset:-unknown}" banner "$fp" notice || return 1
-  printf 'quota-limit: %s reports a provider limit on the %s runtime and account headroom could not be read; %s\n' \
-    "$id" "${harness:-unknown}" \
-    "$(if [ -n "$reset" ]; then printf 'resets %s' "$(fm_quota_format_reset "$reset")"; else printf 'no reset time was stated, so this waits without an automatic resume'; fi)"
+  printf 'quota-limit: %s reports a provider limit on the %s runtime and account headroom could not be read; resets %s; %s\n' \
+    "$id" "${harness:-unknown}" "$(fm_quota_format_reset "${reset:-unknown}")" \
+    "$(fm_quota_wait_resume_outcome "$STATE" "$id")"
 }
 
 # --- resume -----------------------------------------------------------------

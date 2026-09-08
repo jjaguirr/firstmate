@@ -729,6 +729,8 @@ test_a_banner_that_states_its_reset_runs_to_it_and_resumes() {
 
   out=$(run_scan "$dir" "$id" FM_QUOTA_AXI_BIN=quota-axi-absent-for-test)
   assert_present "$dir/state/$id.quota-wait" "bannerreset: no wait was recorded from the stated notice"
+  assert_contains "$out" "this worker is resumed automatically" \
+    "bannerreset: a reset inside the ceiling was not announced as one that resumes itself"
   reset=$(fm_quota_wait_field "$dir/state" "$id" reset)
   case "$reset" in ''|*[!0-9]*) fail "bannerreset: the reset the notice stated was not recorded" ;; esac
 
@@ -848,6 +850,69 @@ test_a_capped_notice_reset_is_never_reported_or_delivered_as_a_resume() {
     "noticecapped: a capped reset that parsed fine was reported as unreadable"
   assert_absent "$dir/state/$id.quota-wait" "noticecapped: the capped wait was not retired"
   pass "noticecapped: a wait the ceiling caps neither promises nor delivers an automatic resume"
+}
+
+# The same promise, at the FIRST line an operator sees. Detection is where a
+# wait is announced, so a reset the ceiling will cap must not be stated there as
+# one this fleet waits for: the record dies at the cap, hours before that reset,
+# and nothing resumes the worker.
+test_a_capped_notice_reset_is_never_promised_at_detection() {
+  local dir id out
+  dir=$(make_case noticedetect "You have hit your session limit, resets $(clock_in_hours 8)")
+  id=$(case_id noticedetect)
+  set_busy_state "$dir" "$id" idle || fail "noticedetect: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # No quota-axi anywhere, which is the only home the notice fallback runs on.
+  rm -f "$dir/fakebin/quota-axi"
+
+  out=$(run_scan "$dir" "$id" FM_QUOTA_AXI_BIN=quota-axi-absent-for-test)
+  assert_present "$dir/state/$id.quota-wait" "noticedetect: no wait was recorded from the stated notice"
+  fm_quota_wait_resume_reachable "$dir/state" "$id" &&
+    fail "noticedetect: the stated reset was not capped, so this case proves nothing"
+  assert_contains "$out" "NOT resumed automatically" \
+    "noticedetect: detection announced a resume the ceiling will never deliver"
+  assert_not_contains "$out" "this worker is resumed automatically" \
+    "noticedetect: a capped wait was announced as one that resumes itself"
+  pass "noticedetect: a notice stating a reset past the ceiling is never announced as self-resuming"
+}
+
+# The structural path borrows a rendered reset when the account names none, so
+# it announces capped waits too and must answer the same question.
+test_a_structural_wait_on_a_capped_borrowed_reset_is_never_promised() {
+  local dir id out
+  dir=$(make_case structcapped "You have hit your session limit, resets $(clock_in_hours 8)")
+  id=$(case_id structcapped)
+  set_busy_state "$dir" "$id" idle || fail "structcapped: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # Machine-verified refusal that names no limiting window, so the reset time -
+  # and only the reset time - comes from the pane.
+  cat > "$dir/quota.json" <<'JSON'
+{
+  "schemaVersion": 5,
+  "providers": [
+    {
+      "provider": "claude",
+      "windows": [],
+      "quotaSemantics": {
+        "status": "known",
+        "effectiveAvailability": [
+          { "scope": "all_models", "status": "known", "runway": { "status": "exhausted_now" } }
+        ]
+      }
+    }
+  ]
+}
+JSON
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_present "$dir/state/$id.quota-wait" "structcapped: the verified refusal recorded nothing at all"
+  [ "$(fm_quota_wait_field "$dir/state" "$id" evidence)" = structural ] ||
+    fail "structcapped: a structurally verified refusal was recorded as weaker evidence"
+  fm_quota_wait_resume_reachable "$dir/state" "$id" &&
+    fail "structcapped: the borrowed reset was not capped, so this case proves nothing"
+  assert_contains "$out" "NOT resumed automatically" \
+    "structcapped: detection announced a resume the ceiling will never deliver"
+  pass "structcapped: a structural wait whose borrowed reset is capped is never announced as self-resuming"
 }
 
 test_a_wait_whose_agent_died_is_retired_by_the_scan() {
@@ -1464,6 +1529,8 @@ test_a_dead_endpoint_never_earns_a_quota_wait
 test_a_notice_stated_reset_within_the_ceiling_waits_as_stated
 test_a_notice_stated_reset_beyond_the_ceiling_is_capped
 test_a_capped_notice_reset_is_never_reported_or_delivered_as_a_resume
+test_a_capped_notice_reset_is_never_promised_at_detection
+test_a_structural_wait_on_a_capped_borrowed_reset_is_never_promised
 test_a_wait_whose_agent_died_is_retired_by_the_scan
 test_a_failed_resume_read_keeps_the_scan_snapshot
 test_an_exhausted_account_with_no_readable_reset_still_records
