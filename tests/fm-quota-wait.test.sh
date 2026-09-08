@@ -410,6 +410,41 @@ test_banner_detection_without_quota_axi() {
   pass "banner: a rendered limit notice alone records a wait when account headroom cannot be read"
 }
 
+# The banner detection line, against the one wait it can record that carries no
+# reset: a home with no quota-axi whose pane renders a notice stating no clock.
+# The three other surfaces a wait reaches a person through carry this assertion
+# already; this is the fourth, so a line that composes the reset clause itself
+# instead of asking the owner fails here rather than printing a dangling time.
+test_a_banner_that_states_no_reset_is_never_detected_with_a_time() {
+  local dir id out
+  dir=$(make_case bannernoreset "Usage limit reached")
+  id=$(case_id bannernoreset)
+  set_busy_state "$dir" "$id" idle || fail "bannernoreset: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+
+  rm -f "$dir/fakebin/quota-axi"
+  command -v quota-axi-absent-for-test >/dev/null 2>&1 &&
+    fail "bannernoreset: the stand-in for an absent quota binary unexpectedly exists"
+  out=$(run_scan "$dir" "$id" FM_QUOTA_AXI_BIN=quota-axi-absent-for-test)
+
+  assert_present "$dir/state/$id.quota-wait" \
+    "bannernoreset: a matched notice stating no reset recorded no wait at all"
+  [ "$(fm_quota_wait_field "$dir/state" "$id" evidence)" = banner ] ||
+    fail "bannernoreset: the recorded wait did not name the banner evidence"
+  [ "$(fm_quota_wait_field "$dir/state" "$id" reset)" = unknown ] ||
+    fail "bannernoreset: a reset time was recorded that nothing could have read"
+  assert_contains "$out" "NOT resumed automatically" \
+    "bannernoreset: a wait nothing can resume was not reported as one"
+  # A wait with no reset has no time to state, so the detection line must carry
+  # no rendered time, in any shape a surface might reach for.
+  ! printf '%s\n' "$out" | grep -F 'quota-limit:' |
+    grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}T|unknown time|resets' ||
+    fail "bannernoreset: a wait carrying no reset was detected with a reset time"
+  assert_not_contains "$out" "this worker is resumed automatically" \
+    "bannernoreset: a wait that can never be resumed promised an automatic resume"
+  pass "bannernoreset: a banner-detected wait whose notice states no reset is never reported with a time"
+}
+
 test_available_headroom_outranks_a_banner() {
   local dir id out
   dir=$(make_case outranked "$BANNER")
@@ -1605,6 +1640,7 @@ test_the_suppression_owner_honours_both_guards
 test_provider_attribution
 test_structural_detection_without_a_banner
 test_banner_detection_without_quota_axi
+test_a_banner_that_states_no_reset_is_never_detected_with_a_time
 test_available_headroom_outranks_a_banner
 test_a_busy_worker_is_never_parked
 test_an_unreadable_pane_is_never_parked
