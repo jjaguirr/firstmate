@@ -118,7 +118,8 @@ FM_QUOTA_CATALOG_TTL=${FM_QUOTA_CATALOG_TTL:-3600}
 # verdict with nothing to wait for must cost a bounded delay rather than an
 # open-ended silence. A banner that states its reset runs to that reset instead,
 # because retiring it earlier would drop the resume it was recorded for.
-FM_QUOTA_BANNER_WAIT_MAX_SECS=${FM_QUOTA_BANNER_WAIT_MAX_SECS:-1800}
+FM_QUOTA_BANNER_WAIT_MAX_SECS_DEFAULT=1800
+FM_QUOTA_BANNER_WAIT_MAX_SECS=${FM_QUOTA_BANNER_WAIT_MAX_SECS:-$FM_QUOTA_BANNER_WAIT_MAX_SECS_DEFAULT}
 # Grace added after a reset time before a resume is attempted, so a nudge does
 # not land in the same second the window turns over.
 FM_QUOTA_RESET_GRACE_SECS=${FM_QUOTA_RESET_GRACE_SECS:-60}
@@ -503,6 +504,16 @@ fm_quota_wait_clear() {  # <state-dir> <id>
 
 # The grace added after a reset time, as a number. A knob this code cannot read
 # as a number is no grace at all rather than an arithmetic error under `set -u`.
+# The reset-less bound, as a number. A knob this code cannot read as a number
+# falls back to the documented default rather than aborting the watcher poll
+# loop on an arithmetic error under `set -u`.
+fm_quota_banner_bound() {
+  case "$FM_QUOTA_BANNER_WAIT_MAX_SECS" in
+    ''|*[!0-9]*) printf '%s' "$FM_QUOTA_BANNER_WAIT_MAX_SECS_DEFAULT" ;;
+    *) printf '%s' "$FM_QUOTA_BANNER_WAIT_MAX_SECS" ;;
+  esac
+}
+
 fm_quota_reset_grace() {
   case "$FM_QUOTA_RESET_GRACE_SECS" in
     ''|*[!0-9]*) printf '0' ;;
@@ -517,13 +528,21 @@ fm_quota_reset_grace() {
 # one resume the wait exists to deliver. A reset-less wait has no such moment to
 # reach, and only the banner path can record one, so it expires on that path's
 # own bound measured from detection.
+#
+# That a notice STATING its reset runs to that reset, with the bound applying
+# only to a notice stating none, is deliberate: the founding incident is a
+# notice at 06:05 naming an 08:50 reset, so a short blanket cap would retire the
+# wait before the resume it exists to deliver. A long wait cannot hide a broken
+# worker either way - it always retires at its own deadline and can never
+# re-extend, and fm_quota_wait_suppresses stands in front of neither a terminal
+# status nor a non-alive reading.
 fm_quota_wait_deadline() {  # <state-dir> <id>
-  local state=$1 id=$2 reset detected grace
+  local state=$1 id=$2 reset detected grace bound
   reset=$(fm_quota_wait_field "$state" "$id" reset)
   detected=$(fm_quota_wait_field "$state" "$id" detected)
   case "$detected" in ''|*[!0-9]*) return 1 ;; esac
   case "$reset" in
-    ''|*[!0-9]*) printf '%s' $((detected + FM_QUOTA_BANNER_WAIT_MAX_SECS)) ;;
+    ''|*[!0-9]*) bound=$(fm_quota_banner_bound); printf '%s' $((detected + bound)) ;;
     *) grace=$(fm_quota_reset_grace); printf '%s' $((reset + grace)) ;;
   esac
 }
@@ -537,6 +556,19 @@ fm_quota_wait_active() {  # <state-dir> <id>
   deadline=$(fm_quota_wait_deadline "$1" "$2") || return 1
   [ -n "$deadline" ] || return 1
   [ "$(date +%s)" -lt "$deadline" ]
+}
+
+# 0 when a status line is one the captain is still owed: a terminal verb, or a
+# captain-relevant line that is not an ordinary progress verb. A quota refusal
+# explains an idle PANE, never a reading a worker already declared, so nothing
+# on this path may stand in front of one or nudge a worker holding one. The
+# status predicates come from bin/fm-classify-lib.sh, which every driver of this
+# file already sources.
+fm_quota_status_owed_to_captain() {  # <status-line>
+  local last=$1
+  [ -n "$last" ] || return 1
+  status_is_terminal_verb "$last" && return 0
+  status_is_captain_relevant "$last"
 }
 
 # THE one owner of the question "may this recorded wait stand in front of a
@@ -560,11 +592,10 @@ fm_quota_wait_active() {  # <state-dir> <id>
 #                 It is not the busy-hang path either, so the record and the
 #                 status line carry the decision alone.
 #
-# A terminal or captain-relevant status line is never suppressed at any site: a
-# worker that reported blocked: or done: still owes the captain that reading,
-# and a wait that swallowed it would be exactly the quieter alarm without a
-# rarer condition this contract forbids. The status predicates come from
-# bin/fm-classify-lib.sh, which every driver of this file already sources.
+# A status line the captain is still owed is never suppressed at any site: a
+# worker that reported blocked: or done: still owes that reading, and a wait
+# that swallowed it would be exactly the quieter alarm without a rarer condition
+# this contract forbids.
 fm_quota_wait_suppresses() {  # <state-dir> <id> <last-status-line> <admission>
   local state=$1 id=$2 last=$3 admission=$4
   [ -n "$id" ] || return 1
@@ -572,10 +603,7 @@ fm_quota_wait_suppresses() {  # <state-dir> <id> <last-status-line> <admission>
     admit-alive|unknown) ;;
     *) return 1 ;;
   esac
-  if [ -n "$last" ]; then
-    status_is_terminal_verb "$last" && return 1
-    status_is_captain_relevant "$last" && return 1
-  fi
+  ! fm_quota_status_owed_to_captain "$last" || return 1
   fm_quota_wait_active "$state" "$id"
 }
 

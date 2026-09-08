@@ -456,6 +456,12 @@ test_resume_sends_exactly_one_nudge_per_reset() {
   sends=$(wc -l < "$dir/sent.log" 2>/dev/null | tr -d ' ')
   [ "$sends" = 1 ] || fail "resume: expected exactly 1 delivered resume, got ${sends:-0}"
   assert_grep "$id" "$dir/sent.log" "resume: the resume did not name the parked worker"
+  # Delivered to the recorded backend target. bin/fm-send.sh arms a durable
+  # parent pending-reply expectation - with its own recovery resend and
+  # escalation - for a SELECTOR that resolves to a secondmate, and a resume is
+  # not a request, so one nudge would stop being one nudge.
+  assert_grep "$SESSION:fm-$id" "$dir/sent.log" \
+    "resume: the resume was delivered to a task selector rather than the recorded backend target"
   assert_absent "$dir/state/$id.quota-wait" \
     "resume: the wait was not retired, so ordinary supervision never takes the pane back"
 
@@ -843,6 +849,62 @@ JSON
   pass "noreset: an exhausted account takes its reset from the notice while the verdict stays structural"
 }
 
+test_a_worker_holding_a_blocker_is_never_parked_or_nudged() {
+  local dir id out
+  dir=$(make_case blockedworker "the worker stopped mid-task")
+  id=$(case_id blockedworker)
+  set_busy_state "$dir" "$id" idle || fail "blockedworker: could not record an idle busy state"
+  # A declared blocker reads `none` through the crew verdict, exactly like a
+  # worker that simply stopped, so the crew read alone cannot tell them apart.
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  printf 'blocked: cannot reach the staging DB\n' > "$dir/state/$id.status"
+  write_quota_json "$dir/quota.json" claude exhausted_now "$(iso_in 3600)"
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_absent "$dir/state/$id.quota-wait" \
+    "blockedworker: a worker awaiting an answer to its own blocker was recorded as quota-parked"
+  assert_not_contains "$out" "is waiting on" "blockedworker: a blocked worker was reported as quota-parked"
+
+  # And the resume refuses it too, for a wait recorded before the blocker was
+  # declared: a nudge here restarts a worker past the answer it asked for.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) - 600 ))" structural \
+    "$(fm_quota_fingerprint structural claude blockedworker)" ||
+    fail "blockedworker: could not write the wait record"
+  write_quota_json "$dir/quota.json" claude through_reset "$(iso_in 3600)"
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  [ ! -s "$dir/sent.log" ] || fail "blockedworker: a resume was delivered into a worker holding an open blocker"
+  assert_contains "$out" "was not resumed automatically" "blockedworker: the refusal was not reported"
+  assert_absent "$dir/state/$id.quota-wait" \
+    "blockedworker: the refused wait was not retired back to ordinary supervision"
+  pass "blockedworker: a worker holding a declared blocker is never quota-parked and never nudged"
+}
+
+test_a_non_numeric_bound_degrades_to_the_documented_default() {
+  local dir id out
+  dir=$(make_case badbound "$BANNER")
+  id=$(case_id badbound)
+  set_busy_state "$dir" "$id" idle || fail "badbound: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # A wait recorded just now, well inside the bound it is supposed to carry.
+  fm_quota_wait_write "$dir/state" "$id" claude claude unknown banner ||
+    fail "badbound: could not write the wait record"
+  write_quota_json "$dir/quota.json" claude through_reset "$(iso_in 3600)"
+
+  # The tunable set to something this code cannot read as a number. Bash fails
+  # the arithmetic outright, and the deadline read is the ONE thing standing
+  # between a recorded wait and being treated as expired, so an unguarded knob
+  # silently drops every reset-less wait the moment it is mistyped.
+  FM_QUOTA_BANNER_WAIT_MAX_SECS=30m fm_quota_wait_active "$dir/state" "$id" ||
+    fail "badbound: a wait inside its own bound read as expired under a non-numeric knob"
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json" \
+    FM_QUOTA_BANNER_WAIT_MAX_SECS=30m)
+  assert_present "$dir/state/$id.quota-wait" \
+    "badbound: a non-numeric bound retired a wait that was still inside its own bound"
+  assert_not_contains "$out" "expired without a usable reset time" \
+    "badbound: a current wait was reported as expired under a non-numeric bound"
+  pass "badbound: a bound this code cannot read as a number degrades to the documented default"
+}
+
 test_evidence_that_already_made_a_wait_never_makes_another() {
   local dir id out stale_reset
   dir=$(make_case respend "the worker stopped mid-task")
@@ -906,6 +968,11 @@ test_a_local_secondmate_is_treated_like_any_other_worker() {
   assert_contains "$out" "was resumed automatically" "mate: a local mate was not resumed after its limit reset"
   sends=$(wc -l < "$dir/sent.log" 2>/dev/null | tr -d ' ')
   [ "$sends" = 1 ] || fail "mate: expected exactly 1 delivered resume, got ${sends:-0}"
+  # A secondmate selector is exactly what bin/fm-send.sh marks, so this is the
+  # case where delivering to the selector would arm a pending-reply expectation
+  # and cost the mate a second, unrelated injection.
+  assert_grep "$SESSION:fm-$id" "$dir/sent.log" \
+    "mate: a mate's resume was delivered to the marked task selector"
   pass "mate: a persistent mate whose endpoint this home can read is resumed on the same terms as any worker"
 }
 
@@ -1100,6 +1167,8 @@ test_a_wait_whose_agent_died_is_retired_by_the_scan
 test_a_failed_resume_read_keeps_the_scan_snapshot
 test_an_exhausted_account_with_no_readable_reset_still_records
 test_an_exhausted_account_with_no_banner_and_no_reset_still_records
+test_a_worker_holding_a_blocker_is_never_parked_or_nudged
+test_a_non_numeric_bound_degrades_to_the_documented_default
 test_evidence_that_already_made_a_wait_never_makes_another
 test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged

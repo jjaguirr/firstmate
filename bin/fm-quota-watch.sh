@@ -129,8 +129,14 @@ task_agent_alive() {  # <meta>
 # not stuck and, at the reset, push a resume past the very gate it was holding.
 # Only `none` - no declared explanation at all - is the shape a refused turn
 # leaves behind, so only `none` may be recorded as a refusal.
+#
+# The crew verdict alone is not that shape: crew_absorb_class collapses blocked
+# and failed into `none` too, so the worker's own last status line is read as
+# well. A declared blocker is an answer the worker is waiting for, not a turn the
+# provider refused.
 task_idleness_unexplained() {  # <id>
-  [ "$(crew_absorb_class "$1")" = none ]
+  [ "$(crew_absorb_class "$1")" = none ] || return 1
+  ! fm_quota_status_owed_to_captain "$(last_status_line "$STATE/$1.status")"
 }
 
 task_capture() {  # <meta>
@@ -157,10 +163,11 @@ detect_structural() {  # <id> <meta> <provider> <reset-epoch|unknown>
       # the scope carried no limiting window, or that window carried no
       # resetsAt. The VERDICT stays structural - the account was machine-read as
       # refusing - and the rendered notice is consulted for the RESET TIME
-      # ALONE, never for whether there is a refusal. When the notice states none
-      # either, the wait is still recorded with an unknown reset and expires on
-      # the short bound, because recording nothing here leaves the worker parked
-      # exactly as in the reported incident on a home that does have quota-axi.
+      # ALONE, never for whether there is a refusal - a deliberate division,
+      # because removing it returns to recording nothing for an account known to
+      # be refused, which is the reported 38-hour park. When the notice states
+      # none either, the wait is still recorded with an unknown reset and expires
+      # on the short bound.
       reset=$(fm_quota_banner_reset_epoch "$(task_capture "$meta")") || reset=
       reset=${reset:-unknown}
       ;;
@@ -228,6 +235,8 @@ resume_refusal() {  # <id> <meta>
     # finished is idle by design. Whatever it is holding, it is not this wait.
     *) printf 'its own recorded state already explains why it is idle'; return 0 ;;
   esac
+  ! fm_quota_status_owed_to_captain "$(last_status_line "$STATE/$id.status")" ||
+    { printf 'it is holding a declaration the captain has not answered'; return 0; }
 }
 
 # Deliver the one resume for this reset, or explain why it was not delivered.
@@ -287,8 +296,15 @@ resume_task() {  # <id> <meta> <reset-epoch>
   fm_quota_nudge_record "$STATE" "$id" "$reset" || return 0
   end_wait "$id"
   rc=0
+  # Delivered to the recorded backend target rather than the task selector. A
+  # resume is not a request and no reply is owed for it, and bin/fm-send.sh
+  # arms a durable parent pending-reply expectation - with its own recovery
+  # resend and escalation - for a SELECTOR that resolves to a secondmate. The
+  # explicit target is that file's documented unmarked form, so one nudge stays
+  # one nudge for a mate exactly as it does for a worker.
   FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-    "$SEND_BIN" "$id" "$FM_QUOTA_RESUME_TEXT" >/dev/null 2>&1 || rc=$?
+    "$SEND_BIN" "$(fm_backend_target_of_meta "$meta")" "$FM_QUOTA_RESUME_TEXT" \
+    >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
     printf 'quota-limit: %s was resumed automatically now that its provider limit has reset\n' "$id"
   else
