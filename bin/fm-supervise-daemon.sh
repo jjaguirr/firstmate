@@ -46,7 +46,8 @@
 #     (configurable), rechecked once. A wedged crewmate is therefore detected
 #     within STALE_ESCALATE_SECS + a tick, never lost. A declared wait - either a
 #     paused: external wait or a verified captain-held transfer, per
-#     fm-classify-lib.sh's combined predicate - instead gets its own longer
+#     fm-classify-lib.sh's combined predicate, or a recorded provider quota
+#     refusal per bin/fm-quota-lib.sh - instead gets its own longer
 #     PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
@@ -182,6 +183,12 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # (fm_busy_classify).
 # shellcheck source=bin/fm-busy-lib.sh
 . "$FM_DAEMON_DIR/fm-busy-lib.sh"
+
+# The single owner of the provider quota-refusal contract. Only the record
+# readers are used here; detection and the resume stay with the watcher poll's
+# bin/fm-quota-watch.sh, which keeps running underneath this daemon.
+# shellcheck source=/dev/null
+. "$FM_DAEMON_DIR/fm-quota-lib.sh"
 
 # --- tunables ---------------------------------------------------------------
 # Supervisor backends this daemon knows how to inject into today. zellij, orca,
@@ -375,6 +382,19 @@ classify_stale() {  # <window> <state>
   local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
+  if [ -n "$task" ] && fm_quota_wait_active "$state" "$task"; then
+    # A recorded provider quota refusal is a declared external wait the worker
+    # could not declare for itself: it was refused service, so it never got a
+    # turn in which to write a status line. It takes the same long recheck
+    # cadence a declared pause takes, and for the same reason - the idle pane is
+    # expected and the wait carries its own reset time. The record expires on its
+    # own bound, so a worker that does not resume returns to wedge escalation
+    # here exactly as it would with no record at all.
+    printf 'pause|paused (waiting on the %s usage limit to reset %s), rechecked on a long cadence' \
+      "$(fm_quota_wait_field "$state" "$task" provider)" \
+      "$(fm_quota_format_reset "$(fm_quota_wait_field "$state" "$task" reset)")"
+    return
+  fi
   if [ -n "$last" ] && status_is_paused_or_captain_held "$last"; then
     # A DECLARED external-wait pause or a verified captain-held transfer
     # (fm-classify-lib.sh owns which declarations qualify): an idle pane is

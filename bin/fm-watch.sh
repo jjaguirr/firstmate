@@ -94,6 +94,10 @@
 #   check: inactive-outcome bounded poll-loop reconciliation found a suspicious
 #                          inactive terminal outcome that still lacks its durable
 #                          upstream receipt
+#   check: quota-limit: ... a provider refused a worker's turn on account quota,
+#                          a recorded quota wait retired, or a worker was resumed
+#                          automatically once that limit reset
+#                          (bin/fm-quota-watch.sh owns detection and resume)
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -126,6 +130,14 @@ mkdir -p "$STATE"
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-busy-lib.sh
 . "$SCRIPT_DIR/fm-busy-lib.sh"
+# Provider quota refusals. Only the record readers are used from this loop; the
+# vendor read, the detection, and the resume all live in bin/fm-quota-watch.sh,
+# which this loop calls exactly the way it calls the inactive-outcome scan.
+# Source analysis stops here for the same reason it stops at the transition
+# owner above: that file is its own canonical lint root, and expanding it from
+# this already-large runtime adds no uncovered file.
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/fm-quota-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -417,6 +429,41 @@ wedge_defer_writing() {  # <window> <since-file> <triage-label> <idle-age>
   triage_log "absorbed $label (worktree written since the idle window opened, idle ${age}s): $win"
 }
 
+# Absorb one wedge escalation for a pane whose worker is waiting out a recorded
+# provider quota refusal (bin/fm-quota-lib.sh owns what that record means and
+# when it stops being current). The pane is idle because the provider refused
+# the turn, not because the worker is wedged, and the wait carries its own reset
+# time, so escalating it as a possible wedge reports the wrong thing and asks
+# for an inspection that can only conclude "still waiting".
+#
+# This is an ABSORB with a deadline, never a suppression. The idle timer is
+# re-armed so the next window probes again; the wait re-surfaces once every
+# PAUSE_RESURFACE_SECS through the shared resurface_absorbed, exactly like a
+# declared pause; and the record retires itself the moment its deadline passes,
+# after which this branch stops applying and the ordinary wedge timer owns the
+# pane again with nothing carried over.
+#
+# It deliberately runs BEFORE the liveness read below rather than after it. A
+# quota-refused worker's endpoint reads alive - its process is fine, it is the
+# account that was refused - so leaving this until after that read would spend
+# the reading, advance the affirmative-liveness chain on a pane whose idleness
+# is already explained, and let the resulting backoff decide how often a KNOWN
+# wait is rechecked. Reaching this first leaves that chain untouched in both
+# directions, which is the same leave-the-schedule-alone treatment every other
+# absent-evidence outcome in this file gets.
+wedge_absorb_quota_wait() {  # <window> <task> <since-file> <idle-age>
+  local win=$1 task=$2 since_file=$3 age=$4 wait_file wage provider reset
+  wait_file=$(fm_quota_wait_path "$STATE" "$task")
+  wage=$(age_of "$wait_file")
+  provider=$(fm_quota_wait_field "$STATE" "$task" provider)
+  reset=$(fm_quota_wait_field "$STATE" "$task" reset)
+  date +%s > "$since_file"
+  clear_write_tracking "$(window_key "$win")"
+  resurface_absorbed "$win" "$(fm_quota_resurfaced_path "$STATE" "$task")" "$wage" \
+    "stale: $win (idle ${age}s, waiting ${wage}s on the ${provider:-provider} usage limit to reset $(fm_quota_format_reset "$reset"), rechecked on a long cadence not a wedge; this worker is resumed automatically when that limit resets)"
+  triage_log "absorbed stale (provider quota wait on ${provider:-unknown}, idle ${age}s): $win"
+}
+
 # Drop a window's write-deferral chain wherever its stale bookkeeping resets, so
 # the bounded re-surface cadence is measured from the CURRENT quiet stretch and a
 # long-finished one cannot make the next deferral resurface immediately.
@@ -534,6 +581,10 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+        if fm_quota_wait_active "$STATE" "$task"; then
+          wedge_absorb_quota_wait "$win" "$task" "$since_file" "$age"
+          return 0
+        fi
         if crew_worktree_written_since "$task" "$STATE" "$since_file"; then
           wedge_defer_writing "$win" "$since_file" "$label" "$age"
           return 0
@@ -1342,6 +1393,30 @@ while :; do
   # A process-event result carries richer adapter-owned wake context than the
   # generic recovery reason, so give that owner first refusal.
   resurface_after_downtime
+
+  # Provider quota refusals, on the cadence bin/fm-quota-lib.sh owns. The
+  # due-check is read here rather than inside the scan so an ordinary poll costs
+  # one stat instead of a process launch: this loop runs every few seconds and a
+  # quota answer cannot change that fast. The scan itself is the one place in
+  # this loop that may deliver text to a worker, and it does so only for a
+  # recorded wait whose reset has arrived and whose state three independent reads
+  # agree on; its own header owns that contract. Silent unless something happened.
+  if fm_quota_scan_due "$STATE"; then
+    quota_out=
+    if quota_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-quota-watch.sh" scan 2>/dev/null); then
+      if [ -n "$quota_out" ]; then
+        reason="check: $(printf '%s' "$quota_out" | tr '\n' '; ')"
+        fm_wake_append check quota-limit "$reason" || exit 1
+        wake "$reason"
+      fi
+    else
+      # The scan could not run at all. Advance its cadence anyway, so a broken
+      # install costs one failed launch per interval rather than one per poll.
+      fm_quota_scan_defer "$STATE"
+      triage_log "provider quota reconciliation unavailable"
+    fi
+  fi
 
   # The existing poll loop also owns the bounded inactive-outcome cadence.
   # This is mechanical and silent unless a durable terminal-outcome obligation

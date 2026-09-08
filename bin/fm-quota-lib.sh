@@ -1,0 +1,580 @@
+# shellcheck shell=bash
+# fm-quota-lib.sh - the ONE owner of firstmate's provider-quota-refusal contract.
+# Sourced, never executed. bin/fm-quota-watch.sh is its only production driver.
+#
+# The failure this exists for: a provider refuses a worker's turn because the
+# account is out of quota. The harness renders a limit notice and ends the turn
+# exactly the way a completed turn ends, so the pane goes idle with an empty
+# composer while the agent process stays alive. Every supervision signal
+# firstmate owns - the turn-end marker, the pane hash, the endpoint liveness
+# read - is then byte-identical to a worker that finished and is waiting. The
+# fleet parks, nothing escalates, and the wait outlives the quota window that
+# caused it by however long it takes a human to notice.
+#
+# The contract this file states is: a quota refusal is a DECLARED EXTERNAL WAIT
+# that carries its own reset time. It is recorded as a bounded wait rather than
+# a wedge, so stale escalation does not fire against a wait that is known and
+# expected to clear, and it retires on its own so the ordinary stale path takes
+# the pane back if the wait was wrong or the resume did not restart progress.
+#
+# --- Evidence -------------------------------------------------------------
+#
+# Two signals answer "is this provider refusing right now", and they fail for
+# different reasons, so neither is allowed to be the whole verdict on its own.
+#
+#   STRUCTURAL (fm_quota_probe). quota-axi's own effective-availability read for
+#   the provider: `runway.status == exhausted_now` on the `all_models` scope.
+#   This is machine-readable vendor accounting, not rendered text, so it carries
+#   the verdict wherever it is available. Only the `all_models` scope is
+#   consulted, because AGENTS.md's granularity rule is that provider-level or
+#   all-model evidence applies to every model in the family while a named-model
+#   window bounds only that model - and what is parked here is a worker, whose
+#   provider is what got refused.
+#
+#   BANNER (fm_quota_banner_matches). The rendered limit notice. This is a
+#   harness-dependent check in the sense firstmate-coding-guidelines defines, so
+#   it obeys that rule rather than being trusted on its own: several independent
+#   vendor phrasings are matched instead of one exact string, it is consulted
+#   ONLY when the structural signal is genuinely unavailable (quota-axi missing,
+#   below the floor, timed out, or unreadable - never merely when it disagrees),
+#   it must be corroborated by two machine-verified facts the caller supplies
+#   (the endpoint reads alive and the pane classifies exactly idle), and the wait
+#   it produces is bounded far shorter than a structural one so a false match
+#   cannot quietly suppress escalation for long. A banner match with no parsable
+#   reset time records the wait but is never resumed automatically, because a
+#   resume time nobody can read is a guess.
+#
+#   The residual false positive this accepts is a worker whose own transcript
+#   quotes a limit notice - an incident report, a test fixture, this very file.
+#   While the structural read is unavailable such a pane can be recorded as
+#   waiting, which suppresses its wedge reading for at most
+#   FM_QUOTA_BANNER_WAIT_MAX_SECS before the wait expires and ordinary
+#   escalation resumes. That bound is why the fallback is allowed to exist: the
+#   cost of a wrong rendered-text verdict is a bounded delay, while the cost of
+#   having no fallback is the original failure returning in full on every home
+#   where quota-axi is missing.
+#
+# --- Provider attribution -------------------------------------------------
+#
+# The provider is established from the worker's recorded harness and model, and
+# never from a name prefix. Two independent sources, in this order:
+#
+#   1. quota-axi's own model catalog (`quota-axi models --json`), a deterministic
+#      provider/model join published by the same tool that reports the quota. A
+#      recorded concrete model id present in that catalog names its provider
+#      authoritatively.
+#   2. FM_QUOTA_HARNESS_PROVIDERS below: the harnesses that authenticate to
+#      exactly one vendor. opencode, pi, pi-signed, and muse are deliberately
+#      absent - they are multi-provider surfaces, so their harness name is not
+#      evidence of a provider, and a worker on one of them has no structural
+#      verdict unless its recorded model resolved through the catalog.
+#
+# When both sources answer and DISAGREE, the provider is not established. A
+# contradiction is missing evidence, never an excuse to pick one.
+#
+# An unestablished provider is disclosed uncertainty, not a failure: it means no
+# structural verdict, so that worker falls to the corroborated-banner path and
+# is never guessed onto some other account's quota window.
+#
+# --- Records --------------------------------------------------------------
+#
+# state/<id>.quota-wait   one line, atomically replaced:
+#     v1 provider=<p> harness=<h> reset=<epoch|unknown> evidence=<structural|banner>
+#        detected=<epoch> fp=<evidence-fingerprint>
+#   Present means "this worker is waiting out a provider refusal". Absent means
+#   the ordinary supervision paths own the pane, with no exception of any kind.
+#
+# state/<id>.quota-spent   the evidence fingerprint of the last wait that ENDED
+#   here, however it ended - resumed, refused, or expired. A wait is never
+#   re-recorded from evidence that already produced one, which is what stops a
+#   worker whose refusal cannot be cleared from oscillating forever between an
+#   absorbed wait and an escalating pane. New evidence - a reset the vendor has
+#   moved, a different rendered notice - has a different fingerprint and records
+#   normally.
+#
+# state/<id>.quota-nudged  the reset epoch of the last resume actually delivered.
+#   This is what makes "one nudge per reset" a property of the system rather
+#   than of the caller's control flow: a resume is refused unless its reset
+#   epoch is strictly newer than the recorded one, so no sequence of restarts,
+#   re-detections, or crash recoveries can produce a second nudge for one window.
+#
+# state/.quota-announced-<provider>  the reset epoch already reported to
+#   firstmate for that provider, so one quota window costs one wake and not one
+#   per poll.
+#
+# Every reader treats a malformed or unreadable record as absent, which returns
+# the pane to ordinary supervision rather than extending a wait nobody can read.
+
+# Bound on every quota-axi call. A quota read that cannot finish promptly is
+# missing evidence, not a reason to hold the supervision loop.
+FM_QUOTA_PROBE_TIMEOUT=${FM_QUOTA_PROBE_TIMEOUT:-20}
+# How long a structural probe result is reused. Quota windows move in hours;
+# re-reading per poll would spend a vendor call every 15 seconds for an answer
+# that cannot have changed.
+FM_QUOTA_PROBE_TTL=${FM_QUOTA_PROBE_TTL:-300}
+# The provider/model catalog changes on vendor releases, not on usage.
+FM_QUOTA_CATALOG_TTL=${FM_QUOTA_CATALOG_TTL:-3600}
+# How long a banner-only wait may suppress ordinary stale escalation before it
+# retires itself. Deliberately much shorter than a structural wait: the whole
+# point of the shorter bound is that a rendered-text verdict that turns out to
+# be wrong costs a bounded delay rather than an open-ended silence.
+FM_QUOTA_BANNER_WAIT_MAX_SECS=${FM_QUOTA_BANNER_WAIT_MAX_SECS:-1800}
+# The same bound for a structural wait whose reset time could not be read. A
+# wait with no deadline is exactly the rot this whole change exists to remove.
+FM_QUOTA_UNKNOWN_RESET_MAX_SECS=${FM_QUOTA_UNKNOWN_RESET_MAX_SECS:-21600}
+# Grace added after a reset time before a resume is attempted, so a nudge does
+# not land in the same second the window turns over.
+FM_QUOTA_RESET_GRACE_SECS=${FM_QUOTA_RESET_GRACE_SECS:-60}
+# How often the whole scan is evaluated. Kept here rather than in the scan
+# script because the watcher poll asks whether a scan is DUE before paying to
+# start one: the supervision loop runs every few seconds and a quota answer
+# cannot change that fast, so a per-poll process launch would be pure cost.
+FM_QUOTA_SCAN_INTERVAL=${FM_QUOTA_SCAN_INTERVAL:-300}
+
+fm_quota_scan_marker() {  # <state-dir>
+  printf '%s/.quota-scan' "$1"
+}
+
+# 0 when a scan is due. A missing or unreadable marker reads as due, so a fresh
+# home evaluates once immediately rather than waiting out a first interval.
+fm_quota_scan_due() {  # <state-dir>
+  case "$FM_QUOTA_SCAN_INTERVAL" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$(fm_path_age "$(fm_quota_scan_marker "$1")")" -ge "$FM_QUOTA_SCAN_INTERVAL" ]
+}
+
+# Advance the cadence without having evaluated anything. The one caller is a
+# supervision loop whose scan could not run at all: without this it would retry
+# the failed launch on every poll, turning one broken install into a spawn loop
+# underneath the fleet.
+fm_quota_scan_defer() {  # <state-dir>
+  : > "$(fm_quota_scan_marker "$1")" 2>/dev/null || true
+}
+
+# Harnesses that authenticate to exactly one vendor, as a provider token
+# quota-axi accepts. Multi-provider harnesses are absent on purpose; see the
+# provider-attribution note above.
+FM_QUOTA_HARNESS_PROVIDERS="claude:claude codex:codex grok:grok kimi:kimi cursor:cursor"
+
+fm_quota_bin() {
+  printf '%s' "${FM_QUOTA_AXI_BIN:-quota-axi}"
+}
+
+# Run one bounded, non-interactive quota-axi read. stdin is closed so no vendor
+# prompt can block the supervision loop, and the keychain prompt is never opted
+# into here.
+fm_quota_axi_read() {  # <args...>
+  local bin
+  bin=$(fm_quota_bin)
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  case "$FM_QUOTA_PROBE_TIMEOUT" in ''|*[!0-9]*|0) return 1 ;; esac
+  fm_run_timed "$FM_QUOTA_PROBE_TIMEOUT" "$bin" "$@" 2>/dev/null </dev/null
+}
+
+# --- provider attribution ---------------------------------------------------
+
+fm_quota_meta_field() {  # <meta> <key>
+  local meta=$1 key=$2 value
+  [ -f "$meta" ] || return 1
+  value=$(grep "^$key=" "$meta" 2>/dev/null | head -1 | cut -d= -f2-) || return 1
+  printf '%s' "$value"
+}
+
+# Provider for one harness token through the single-vendor table, or empty.
+fm_quota_provider_for_harness() {  # <harness>
+  local harness=$1 entry
+  [ -n "$harness" ] || return 0
+  for entry in $FM_QUOTA_HARNESS_PROVIDERS; do
+    [ "${entry%%:*}" = "$harness" ] || continue
+    printf '%s' "${entry#*:}"
+    return 0
+  done
+  return 0
+}
+
+fm_quota_catalog_path() {  # <state-dir>
+  printf '%s/.quota-catalog.json' "$1"
+}
+
+# Refresh and print quota-axi's provider/model catalog, reusing a cached copy
+# within FM_QUOTA_CATALOG_TTL. A failed refresh keeps serving the cached copy:
+# a stale join is still authoritative about which vendor publishes a model id,
+# and losing it would silently downgrade attribution to the harness table alone.
+fm_quota_catalog() {  # <state-dir>
+  local state=$1 cache tmp
+  cache=$(fm_quota_catalog_path "$state")
+  if [ -s "$cache" ] && [ "$(fm_path_age "$cache")" -lt "$FM_QUOTA_CATALOG_TTL" ]; then
+    cat "$cache"
+    return 0
+  fi
+  tmp="$cache.tmp.$$"
+  if fm_quota_axi_read models --json > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  [ -s "$cache" ] || return 1
+  cat "$cache"
+}
+
+# Provider for one concrete model id through that catalog, or empty. A model id
+# published by more than one provider resolves to nothing rather than to the
+# first match.
+fm_quota_provider_for_model() {  # <state-dir> <model>
+  local state=$1 model=$2 providers
+  case "$model" in ''|default|-|unknown) return 0 ;; esac
+  command -v jq >/dev/null 2>&1 || return 0
+  providers=$(fm_quota_catalog "$state" 2>/dev/null |
+    jq -r --arg id "$model" '[.models[]? | select(.id == $id) | .provider] | unique | .[]' 2>/dev/null) || return 0
+  [ -n "$providers" ] || return 0
+  [ "$(printf '%s\n' "$providers" | wc -l | tr -d ' ')" = 1 ] || return 0
+  # The provider token becomes part of a quota-axi argument and of a marker
+  # filename, so only a plain token is accepted from catalog data.
+  case "$providers" in ''|*[!A-Za-z0-9_-]*) return 0 ;; esac
+  printf '%s' "$providers"
+}
+
+# The established provider for a task's recorded meta, or empty when it is not
+# established. Empty is a real answer here: no structural verdict is available
+# for that worker, and nothing downstream may substitute a guess.
+fm_quota_provider_for_meta() {  # <state-dir> <meta>
+  local state=$1 meta=$2 harness model from_harness from_model
+  harness=$(fm_quota_meta_field "$meta" harness) || harness=
+  model=$(fm_quota_meta_field "$meta" model) || model=
+  from_harness=$(fm_quota_provider_for_harness "$harness")
+  from_model=$(fm_quota_provider_for_model "$state" "$model")
+  if [ -n "$from_model" ] && [ -n "$from_harness" ]; then
+    # Two sources that contradict each other are two sources that cannot be
+    # trusted. Refuse rather than rank them.
+    [ "$from_model" = "$from_harness" ] || return 0
+    printf '%s' "$from_model"
+    return 0
+  fi
+  printf '%s' "${from_model:-$from_harness}"
+}
+
+# --- structural probe -------------------------------------------------------
+
+fm_quota_probe_path() {  # <state-dir>
+  printf '%s/.quota-probe.json' "$1"
+}
+
+# Refresh quota-axi's provider report for <providers> (a comma list), reusing a
+# cached copy within FM_QUOTA_PROBE_TTL. The cache is keyed to the provider set
+# it was fetched for, so a fleet that gains a worker on a new provider re-reads
+# immediately instead of serving that provider "unknown" until the TTL lapses.
+#
+# Unlike the catalog, a failed refresh does NOT fall back to a cached copy: an
+# old headroom reading is not evidence about right now, and treating it as such
+# is how a resumed worker would be parked again on a window that already reset.
+fm_quota_probe_refresh() {  # <state-dir> <providers>
+  local state=$1 providers=$2 cache key tmp
+  cache=$(fm_quota_probe_path "$state")
+  key="$cache.providers"
+  if [ -s "$cache" ] && [ "$(fm_path_age "$cache")" -lt "$FM_QUOTA_PROBE_TTL" ] &&
+    [ "$(head -1 "$key" 2>/dev/null || true)" = "$providers" ]; then
+    return 0
+  fi
+  tmp="$cache.tmp.$$"
+  if fm_quota_axi_read --provider "$providers" --json > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    if mv -f "$tmp" "$cache" 2>/dev/null; then
+      printf '%s\n' "$providers" > "$key" 2>/dev/null || true
+      return 0
+    fi
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp" "$cache" "$key"
+  return 1
+}
+
+# Print "<provider>\t<exhausted|available|unknown>\t<reset-epoch|unknown>" for
+# every provider in the current probe snapshot.
+#
+# exhausted requires the all_models scope to report runway.status exhausted_now.
+# The reset epoch is the LATEST reset among that scope's limiting windows,
+# because headroom returns only once every window that is currently limiting has
+# turned over; taking the earliest would resume a worker into a refusal.
+# available and unknown are kept distinct so a caller can tell "the vendor says
+# there is headroom" from "nothing could be read", and only the second one
+# admits the banner fallback.
+fm_quota_probe_report() {  # <state-dir>
+  local state=$1 cache
+  cache=$(fm_quota_probe_path "$state")
+  [ -s "$cache" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -r '
+    .providers[]? as $p
+    | ($p.quotaSemantics.effectiveAvailability[]? | select(.scope == "all_models")) as $scope
+    | ($scope.runway.status // "unknown") as $runway
+    | ([$p.windows[]? | select(.id as $id | ($scope.limitingWindowIds // []) | index($id)) | .resetsAt]
+        | map(select(. != null)) | sort | last) as $reset
+    | [ $p.provider,
+        (if $runway == "exhausted_now" then "exhausted"
+         elif $scope.status == "known" then "available"
+         else "unknown" end),
+        ($reset // "unknown") ]
+    | @tsv
+  ' "$cache" 2>/dev/null
+}
+
+# Convert one ISO-8601 instant to epoch seconds, or print nothing.
+fm_quota_iso_to_epoch() {  # <iso>
+  local iso=$1 epoch
+  case "$iso" in ''|unknown) return 0 ;; esac
+  epoch=$(date -u -d "$iso" +%s 2>/dev/null) ||
+    epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "${iso%%.*}" +%s 2>/dev/null) || return 0
+  case "$epoch" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$epoch"
+}
+
+# Print "<exhausted|available|unknown>\t<reset-epoch|unknown>" for one provider
+# from the current snapshot. An absent provider row is unknown, never available.
+fm_quota_provider_status() {  # <state-dir> <provider>
+  local state=$1 provider=$2 line status reset epoch
+  line=$(fm_quota_probe_report "$state" 2>/dev/null | awk -F'\t' -v p="$provider" '$1 == p {print; exit}') || line=
+  if [ -z "$line" ]; then
+    printf 'unknown\tunknown'
+    return 0
+  fi
+  status=$(printf '%s' "$line" | cut -f2)
+  reset=$(printf '%s' "$line" | cut -f3)
+  epoch=$(fm_quota_iso_to_epoch "$reset")
+  printf '%s\t%s' "$status" "${epoch:-unknown}"
+}
+
+# --- banner corroboration ---------------------------------------------------
+#
+# Independent vendor phrasings, matched case-insensitively. These are separate
+# alternatives rather than one canonical string precisely so that a single
+# vendor wording change cannot silently disable the check: any one of them
+# carries the match, and the live guard in the live-harness-optin family is what
+# proves the set still describes the installed harnesses.
+FM_QUOTA_BANNER_PATTERNS='hit your (session|usage|weekly|5-hour) limit
+usage limit reached
+you.?ve reached your [a-z0-9 -]*limit
+rate limit exceeded
+quota exceeded
+limit reached[.,]? *(resets|try again|upgrade)'
+
+# 0 when <text> carries a provider refusal notice.
+fm_quota_banner_matches() {  # <text>
+  local text=$1 pattern
+  [ -n "$text" ] || return 1
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    printf '%s' "$text" | grep -qiE "$pattern" && return 0
+  done <<EOF
+$FM_QUOTA_BANNER_PATTERNS
+EOF
+  return 1
+}
+
+# Print only the lines of <text> that carry a refusal notice, which is what the
+# banner fingerprint is taken over.
+fm_quota_banner_signature() {  # <text>
+  local text=$1 pattern
+  while IFS= read -r pattern; do
+    [ -n "$pattern" ] || continue
+    printf '%s' "$text" | grep -iE "$pattern" || true
+  done <<EOF
+$FM_QUOTA_BANNER_PATTERNS
+EOF
+}
+
+# Print the epoch a banner's own reset hint names, or nothing when the notice
+# carries none this parser can read without guessing. Two shapes are accepted:
+# an explicit ISO instant, and a bare wall-clock time of day, which is resolved
+# to its NEXT occurrence in local time - the only reading of "resets 8:50am"
+# that cannot land in the past.
+fm_quota_banner_reset_epoch() {  # <text>
+  local text=$1 iso clock hour minute meridiem today epoch now
+  iso=$(printf '%s' "$text" |
+    grep -oiE 'reset[s]?( at)? [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[^ ]*' |
+    head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[^ ]*') || iso=
+  if [ -n "$iso" ]; then
+    epoch=$(fm_quota_iso_to_epoch "$iso")
+    [ -n "$epoch" ] && { printf '%s' "$epoch"; return 0; }
+  fi
+  clock=$(printf '%s' "$text" |
+    grep -oiE 'reset[s]?( at)? [0-9]{1,2}(:[0-9]{2})? ?(am|pm)' | head -1) || clock=
+  [ -n "$clock" ] || return 0
+  hour=$(printf '%s' "$clock" | grep -oE '[0-9]{1,2}(:[0-9]{2})?' | head -1)
+  minute=${hour#*:}
+  [ "$minute" != "$hour" ] || minute=00
+  hour=${hour%%:*}
+  meridiem=$(printf '%s' "$clock" | grep -oiE '(am|pm)$' | tr 'APM' 'apm')
+  case "$hour" in ''|*[!0-9]*) return 0 ;; esac
+  case "$minute" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$hour" -le 12 ] && [ "$minute" -le 59 ] || return 0
+  [ "$meridiem" != pm ] || [ "$hour" -eq 12 ] || hour=$((hour + 12))
+  [ "$meridiem" != am ] || [ "$hour" -ne 12 ] || hour=0
+  today=$(date +%Y-%m-%d)
+  epoch=$(date -d "$today $(printf '%02d:%02d:00' "$hour" "$minute")" +%s 2>/dev/null) ||
+    epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$today $(printf '%02d:%02d:00' "$hour" "$minute")" +%s 2>/dev/null) || return 0
+  case "$epoch" in ''|*[!0-9]*) return 0 ;; esac
+  now=$(date +%s)
+  [ "$epoch" -gt "$now" ] || epoch=$((epoch + 86400))
+  printf '%s' "$epoch"
+}
+
+# --- wait records -----------------------------------------------------------
+
+fm_quota_wait_path() {  # <state-dir> <id>
+  printf '%s/%s.quota-wait' "$1" "$2"
+}
+
+fm_quota_nudged_path() {  # <state-dir> <id>
+  printf '%s/%s.quota-nudged' "$1" "$2"
+}
+
+# Atomically write one wait record. <fingerprint> identifies the EVIDENCE this
+# wait rests on, so the same evidence cannot produce a second wait once this one
+# has ended; an empty fingerprint records a wait that is never suppressed later,
+# which is the safe direction.
+fm_quota_wait_write() {  # <state-dir> <id> <provider> <harness> <reset-epoch|unknown> <evidence> [fingerprint]
+  local state=$1 id=$2 provider=$3 harness=$4 reset=$5 evidence=$6 fp=${7:-} path tmp
+  path=$(fm_quota_wait_path "$state" "$id")
+  tmp="$path.tmp.$$"
+  printf 'v1 provider=%s harness=%s reset=%s evidence=%s detected=%s fp=%s\n' \
+    "$provider" "${harness:-unknown}" "$reset" "$evidence" "$(date +%s)" "$fp" > "$tmp" || return 1
+  mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# The fingerprint of one piece of refusal evidence. Structural evidence is named
+# by the account and the reset it stated; banner evidence by the matched notice
+# lines alone, never the whole capture, so a ticking clock or a repainting footer
+# is not mistaken for a new refusal.
+fm_quota_fingerprint() {  # <evidence> <provider> <reset-or-matched-text>
+  local evidence=$1 provider=$2 detail=$3
+  case "$evidence" in
+    structural) printf 'structural:%s:%s' "$provider" "$detail" ;;
+    *) printf 'banner:%s' "$(printf '%s' "$detail" | cksum | tr -d ' \n')" ;;
+  esac
+}
+
+fm_quota_spent_path() {  # <state-dir> <id>
+  printf '%s/%s.quota-spent' "$1" "$2"
+}
+
+# 0 when <fingerprint> has NOT already produced a wait that ended. An empty
+# fingerprint is never spent, so evidence this code cannot fingerprint keeps its
+# ordinary behavior instead of being silently suppressed.
+fm_quota_fingerprint_unspent() {  # <state-dir> <id> <fingerprint>
+  local state=$1 id=$2 fp=$3
+  [ -n "$fp" ] || return 0
+  [ "$(head -1 "$(fm_quota_spent_path "$state" "$id")" 2>/dev/null || true)" != "$fp" ]
+}
+
+# A reset epoch as a readable instant, for the supervision reasons a human
+# eventually reads. Lives here rather than in one caller because both the scan
+# and the watcher's stale recheck report the same wait.
+fm_quota_format_reset() {  # <epoch|unknown>
+  case "$1" in
+    ''|unknown|*[!0-9]*) printf 'at an unknown time' ;;
+    *) date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null ||
+       date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null ||
+       printf 'at an unknown time' ;;
+  esac
+}
+
+fm_quota_spend_fingerprint() {  # <state-dir> <id> <fingerprint>
+  local path tmp
+  [ -n "$3" ] || return 0
+  path=$(fm_quota_spent_path "$1" "$2")
+  tmp="$path.tmp.$$"
+  printf '%s\n' "$3" > "$tmp" || return 1
+  mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# Print one field of a wait record, or nothing. A record that is not the known
+# schema prints nothing for every field, which every caller reads as absent.
+fm_quota_wait_field() {  # <state-dir> <id> <field>
+  local state=$1 id=$2 field=$3 path line value
+  path=$(fm_quota_wait_path "$state" "$id")
+  [ -s "$path" ] || return 0
+  line=$(head -1 "$path" 2>/dev/null) || return 0
+  case "$line" in 'v1 '*) ;; *) return 0 ;; esac
+  value=$(printf '%s' "$line" | tr ' ' '\n' | sed -n "s/^$field=//p" | head -1)
+  printf '%s' "$value"
+}
+
+# The throttle marker for the bounded re-surface bin/fm-watch.sh gives an
+# absorbed quota wait. It is keyed to the TASK rather than to a window marker so
+# that retiring the wait retires its cadence in the same operation: a later,
+# separate wait then measures its re-surface from its own start instead of
+# inheriting a spent one.
+fm_quota_resurfaced_path() {  # <state-dir> <id>
+  printf '%s/%s.quota-resurfaced' "$1" "$2"
+}
+
+fm_quota_wait_clear() {  # <state-dir> <id>
+  rm -f "$(fm_quota_wait_path "$1" "$2")" "$(fm_quota_resurfaced_path "$1" "$2")"
+}
+
+# The moment a wait stops being a wait even if nothing else happens, so no
+# recorded wait can outlive its own evidence. A structural wait with a real
+# reset expires at that reset; every other case expires on its evidence's own
+# bound, measured from detection.
+fm_quota_wait_deadline() {  # <state-dir> <id>
+  local state=$1 id=$2 reset evidence detected bound
+  reset=$(fm_quota_wait_field "$state" "$id" reset)
+  evidence=$(fm_quota_wait_field "$state" "$id" evidence)
+  detected=$(fm_quota_wait_field "$state" "$id" detected)
+  case "$detected" in ''|*[!0-9]*) return 1 ;; esac
+  case "$evidence" in
+    banner) bound=$FM_QUOTA_BANNER_WAIT_MAX_SECS ;;
+    *)      bound=$FM_QUOTA_UNKNOWN_RESET_MAX_SECS ;;
+  esac
+  case "$reset" in
+    ''|*[!0-9]*) printf '%s' $((detected + bound)) ;;
+    *)
+      if [ "$evidence" = banner ] && [ "$reset" -gt $((detected + bound)) ]; then
+        printf '%s' $((detected + bound))
+      else
+        printf '%s' "$reset"
+      fi
+      ;;
+  esac
+}
+
+# 0 while a recorded wait is still current: the record parses and its deadline
+# has not passed. This is the ONE predicate supervision asks before treating an
+# idle pane as a declared wait rather than a possible wedge, so everything it
+# cannot read positively answers "no" and returns the pane to ordinary handling.
+fm_quota_wait_active() {  # <state-dir> <id>
+  local deadline
+  deadline=$(fm_quota_wait_deadline "$1" "$2") || return 1
+  [ -n "$deadline" ] || return 1
+  [ "$(date +%s)" -lt "$deadline" ]
+}
+
+# 0 when a recorded wait's reset time has arrived and a resume is therefore due.
+# A wait with no readable reset is never due: it expires instead, because a
+# resume time nobody could read is a guess, and guessing is how a nudge lands in
+# a worker that is actually mid-task.
+fm_quota_wait_resume_due() {  # <state-dir> <id>
+  local reset
+  reset=$(fm_quota_wait_field "$1" "$2" reset)
+  case "$reset" in ''|*[!0-9]*|unknown) return 1 ;; esac
+  [ "$(date +%s)" -ge $((reset + FM_QUOTA_RESET_GRACE_SECS)) ]
+}
+
+# 0 when a resume for <reset-epoch> has NOT been delivered before. This is what
+# makes one-nudge-per-reset a property of the durable record rather than of any
+# caller's control flow: a repeated, restarted, or recovered scan reads the same
+# refusal here.
+fm_quota_nudge_unspent() {  # <state-dir> <id> <reset-epoch>
+  local state=$1 id=$2 reset=$3 last
+  case "$reset" in ''|*[!0-9]*) return 1 ;; esac
+  last=$(head -1 "$(fm_quota_nudged_path "$state" "$id")" 2>/dev/null) || last=
+  case "$last" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$reset" -gt "$last" ]
+}
+
+fm_quota_nudge_record() {  # <state-dir> <id> <reset-epoch>
+  local path tmp
+  path=$(fm_quota_nudged_path "$1" "$2")
+  tmp="$path.tmp.$$"
+  printf '%s\n' "$3" > "$tmp" || return 1
+  mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}

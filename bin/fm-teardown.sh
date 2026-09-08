@@ -403,7 +403,9 @@ remote_secondmate_teardown() {
   grep -vE "^- $ID( |$)" "$SECONDMATE_REG" > "$tmp" || true
   mv -f -- "$tmp" "$SECONDMATE_REG"
   status_retire_presentation_task "$STATE" "$ID" || return 1
-  rm -f -- "$STATE/$ID.meta" "$STATE/$ID.turn-ended"
+  rm -f -- "$STATE/$ID.meta" "$STATE/$ID.turn-ended" \
+    "$STATE/$ID.quota-wait" "$STATE/$ID.quota-resurfaced" "$STATE/$ID.quota-nudged" \
+    "$STATE/$ID.quota-spent"
   printf 'teardown %s complete (remote %s:%s)\n' "$ID" "$remote_host" "$remote_home"
   return 0
 }
@@ -2305,6 +2307,8 @@ cleanup_firstmate_home_children() {
     retire_busy_state "$sub_state" "$child_id" "$child_busy_gen" || return 1
     status_retire_presentation_task "$sub_state" "$child_id" || return 1
     rm -f "$sub_state/$child_id.turn-ended" \
+      "$sub_state/$child_id.quota-wait" "$sub_state/$child_id.quota-resurfaced" \
+      "$sub_state/$child_id.quota-nudged" "$sub_state/$child_id.quota-spent" \
       "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" \
       "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.kimi-turnend-token" \
       "$sub_state/$child_id.muse-session" "$sub_state/$child_id.muse-session-current" \
@@ -2585,6 +2589,8 @@ remove_pr_poll_artifacts "$STATE" "$ID" || exit 1
 retire_busy_state "$STATE" "$ID" "$BUSY_GEN" || exit 1
 status_retire_presentation_task "$STATE" "$ID" || exit 1
 rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
+  "$STATE/$ID.quota-wait" "$STATE/$ID.quota-resurfaced" "$STATE/$ID.quota-nudged" \
+  "$STATE/$ID.quota-spent" \
   "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" \
   "$STATE/$ID.kimi-turnend-token" "$STATE/$ID.muse-session" \
   "$STATE/$ID.muse-session-current" "$STATE/$ID.cursor-session" \

@@ -255,6 +255,30 @@ test_stale_captain_held_classifies_pause() {
   pass "a captain-held transfer classifies as pause, not as a wedge candidate"
 }
 
+# A worker refused service on provider quota never gets a turn in which to
+# declare its own wait, so the wait is recorded for it. Away mode must read that
+# record the same way it reads a declared pause: the idle pane is expected and
+# the wait carries its own reset time. The record expires on its own bound, so a
+# worker that does not resume returns to wedge aging here with nothing carried
+# over - which is what keeps this from being a quieter alarm.
+test_stale_quota_wait_classifies_pause() {
+  local dir state out
+  dir=$(make_supercase stale-quota)
+  state="$dir/state"
+  printf 'working: implementing the fix\n' > "$state/quota-w9q.status"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9q" "$state")
+  case "$out" in pause\|*) fail "a pane with no quota record classified as a declared wait: $out" ;; esac
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9q claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the quota wait record"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9q" "$state")
+  case "$out" in pause\|*) ;; *) fail "a recorded quota wait did not classify as pause: $out" ;; esac
+  case "$out" in *"usage limit"*) ;; *) fail "the pause reason did not name the provider limit: $out" ;; esac
+  fm_quota_wait_clear "$state" quota-w9q
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9q" "$state")
+  case "$out" in pause\|*) fail "a retired quota wait still suppressed wedge aging: $out" ;; esac
+  pass "a recorded provider quota wait classifies as pause, and retiring it restores wedge aging"
+}
+
 # handle_wake on a paused stale records a pause marker, drops any pre-existing wedge
 # marker (so a working->paused pane is not still wedge-aged), and does NOT escalate
 # on the wake itself - the recheck is housekeeping's job on the long cadence.
@@ -1972,6 +1996,7 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_stale_captain_held_classifies_pause
+test_stale_quota_wait_classifies_pause
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
