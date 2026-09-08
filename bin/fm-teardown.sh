@@ -109,6 +109,14 @@
 #     instance. A run already terminal
 #     (an outcome is set) or not parked at a gate is left untouched. Idempotent:
 #     an already-aborted run reads back terminal and is skipped on retry.
+#     A parked run on this task's own branch whose head this worktree cannot
+#     resolve refuses the teardown instead. That head is undecidable, not
+#     foreign - routinely it is just the pipeline's own pushed fix commit, not
+#     yet synced here - so reading it as "not ours" skipped the abort and left
+#     exactly the orphaned parked run this fix exists to prevent. The refusal
+#     names the run and the recovery, and it is not bypassed by --force, for the
+#     same reason the still-parked-after-abort refusal below is not: --force
+#     authorizes discarding this task's work, never abandoning a live run.
 #   Fix 2 - reap leaked descendant processes. A backgrounded/disowned process
 #     started under the worktree (or its per-task tasktmp) does not receive the
 #     SIGHUP/SIGTERM that closing the backend pane sends to its own foreground
@@ -1202,14 +1210,23 @@ validate_worktree_teardown_safety() {
 
 # Fix 1 (see script header): does the active-or-most-recent no-mistakes run in
 # worktree $1 belong to THIS task, and is it parked at a gate awaiting an agent
-# that is about to be removed? Prints nothing; returns 0 only on a genuine
-# match so the caller knows it is safe to abort - never a guess.
+# that is about to be removed? Prints nothing. Returns 0 only on a genuine
+# match, so the caller knows it is safe to abort - never a guess - and
+# $TEARDOWN_PARKED_RUN_UNVERIFIABLE when a parked run on this task's own branch
+# cannot be attributed either way, which is a stop-and-check result rather than
+# a licence to abort. Every other outcome is a plain 1: not this task's run.
 NM_TEARDOWN_TIMEOUT=${FM_TEARDOWN_NM_TIMEOUT:-10}
 case "$NM_TEARDOWN_TIMEOUT" in ''|*[!0-9]*) NM_TEARDOWN_TIMEOUT=10 ;; esac
+TEARDOWN_PARKED_RUN_UNVERIFIABLE=2
 TASK_RUN_ID=
+TASK_UNVERIFIED_RUN_ID=
+TASK_UNVERIFIED_RUN_HEAD=
 task_status_is_own_parked_run() {  # <worktree> <axi-status-output>
   local wt=$1 out=$2 branch run_id run_branch run_head status outcome awaiting has_gate
+  local head_rc=0
   TASK_RUN_ID=
+  TASK_UNVERIFIED_RUN_ID=
+  TASK_UNVERIFIED_RUN_HEAD=
   branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 1
   [ -n "$branch" ] || return 1
   [ -n "$out" ] || return 1
@@ -1218,33 +1235,48 @@ task_status_is_own_parked_run() {  # <worktree> <axi-status-output>
   run_branch=$(fm_nm_strip_quotes "$(fm_nm_field "$out" branch)")
   [ -n "$run_branch" ] && [ "$run_branch" = "$branch" ] || return 1
   run_head=$(fm_nm_strip_quotes "$(fm_nm_field "$out" head)")
-  # Boolean on purpose: aborting a run is destructive, so this refuses on ALL
-  # THREE non-match outcomes - a head behind this worktree, a rewritten one, and
-  # a head this copy cannot read. Unlike bin/fm-crew-state.sh, which must report
-  # a state and therefore tells those three apart, there is nothing to gain here
-  # from acting on a head that cannot be verified.
-  fm_nm_head_matches_worktree "$wt" "$run_head" || return 1
+  # Aborting a run is destructive, so ownership is still asserted only on proof:
+  # a head behind this worktree and a rewritten one both stay plain refusals, as
+  # bin/fm-nm-run-lib.sh requires of this caller. UNRESOLVED is the one outcome
+  # that is not proof of anything - the pipeline pushes its fix commits from its
+  # own copy of the branch, so the run tip routinely is not an object this
+  # worktree holds yet - and folding it into "not ours" is what let teardown
+  # skip the abort and orphan the very run Fix 1 exists to conclude. It is kept
+  # apart here and answered by the caller, without widening what counts as ours.
+  fm_nm_head_matches_worktree "$wt" "$run_head" || head_rc=$?
+  case "$head_rc" in
+    "$FM_NM_HEAD_MATCH"|"$FM_NM_HEAD_UNRESOLVED") ;;
+    *) return 1 ;;
+  esac
   outcome=$(fm_nm_strip_quotes "$(fm_nm_field "$out" outcome)")
   [ -z "$outcome" ] || return 1
   status=$(fm_nm_strip_quotes "$(fm_nm_field "$out" status)")
   awaiting=$(printf '%s\n' "$out" | grep -E '^[[:space:]]*awaiting_agent:' | head -1 || true)
   has_gate=$(printf '%s\n' "$out" | grep -Eq '^[[:space:]]*gate:[[:space:]]*' && echo 1 || echo 0)
   case "$status" in
-    awaiting_approval|fix_review) TASK_RUN_ID=$run_id; return 0 ;;
+    awaiting_approval|fix_review) ;;
+    *)
+      if [ -z "$awaiting" ] && [ "$has_gate" != 1 ]; then
+        return 1
+      fi
+      ;;
   esac
-  if [ -n "$awaiting" ] || [ "$has_gate" = 1 ]; then
-    TASK_RUN_ID=$run_id
-    return 0
+  if [ "$head_rc" = "$FM_NM_HEAD_UNRESOLVED" ]; then
+    TASK_UNVERIFIED_RUN_ID=$run_id
+    TASK_UNVERIFIED_RUN_HEAD=$run_head
+    return "$TEARDOWN_PARKED_RUN_UNVERIFIABLE"
   fi
-  return 1
+  TASK_RUN_ID=$run_id
+  return 0
 }
 
 task_run_is_own_parked_run() {  # <worktree>
-  local wt=$1 out
+  local wt=$1 out rc=0
   # Accepted best-effort residual: query failures stay fail-open because making
   # no-mistakes availability a prerequisite would block ship tasks with no run.
   out=$(fm_nm_run "$wt" "$NM_TEARDOWN_TIMEOUT" axi status)
-  task_status_is_own_parked_run "$wt" "$out"
+  task_status_is_own_parked_run "$wt" "$out" || rc=$?
+  return "$rc"
 }
 
 task_status_is_terminal_run() {  # <axi-status-output> <run-id>
@@ -1269,13 +1301,22 @@ task_status_is_run_not_found() {  # <status-error> <run-id>
 # have answered its gate is removed, so no run is left orphaned holding a
 # fleet slot. Only KIND=ship drives a no-mistakes validation of its own
 # worktree (scouts and secondmates never do, mirroring bin/fm-crew-state.sh);
-# a run not attributed to this exact branch+head is left completely alone.
+# a run provably not attributed to this exact branch+head is left completely
+# alone, and one that cannot be attributed either way refuses the teardown
+# rather than being walked away from.
 conclude_task_no_mistakes_run() {  # <worktree>
-  local wt=$1 out run_id
+  local wt=$1 out run_id rc=0
   [ "$KIND" = ship ] || return 0
   [ -d "$wt" ] || return 0
   command -v no-mistakes >/dev/null 2>&1 || return 0
-  task_run_is_own_parked_run "$wt" || return 0
+  task_run_is_own_parked_run "$wt" || rc=$?
+  if [ "$rc" = "$TEARDOWN_PARKED_RUN_UNVERIFIABLE" ]; then
+    echo "REFUSED: a no-mistakes run on $ID's own branch is parked at a gate, but this worktree cannot resolve its head ${TASK_UNVERIFIED_RUN_HEAD:-<none>}, so the run can be neither claimed nor ruled out." >&2
+    echo "Tearing down now would leave that run parked with no worker to answer it; aborting it unverified could stop a run this task does not own." >&2
+    echo "Fetch the branch into $wt so the run head resolves and retry teardown, or confirm the run's owner and abort it manually (no-mistakes axi abort --run ${TASK_UNVERIFIED_RUN_ID:-<id>})." >&2
+    return 1
+  fi
+  [ "$rc" = 0 ] || return 0
   run_id=$TASK_RUN_ID
   echo "teardown: no-mistakes run for $ID is parked at a gate; aborting before the worker is removed" >&2
   # Accepted best-effort residual: abort supports run-id targeting but no atomic
