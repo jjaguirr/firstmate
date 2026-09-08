@@ -249,31 +249,68 @@ end_wait() {  # <id>
   fm_quota_wait_clear "$STATE" "$1"
 }
 
+# The scan-scoped root every resume-time account read lands under, and the one
+# read per provider they share. Set on first use and cleared when the scan ends.
+RESUME_PROBE_ROOT=
+
+# Print "<status>\t<reset>" for <provider> from a snapshot read fresh THIS scan.
+#
+# The one moment where a cached headroom reading is not good enough: this is
+# what decides whether to send text into a live worker, and a cached refusal
+# would defer a resume that is actually due by a whole interval. So the vendor
+# is re-read with the reuse window bypassed.
+#
+# Read once per provider per scan, not once per worker. The incident this exists
+# for refused every worker and every mate on ONE account at once, so their waits
+# all come due in the same pass; a read per worker would spend one bounded
+# vendor call each and hold the supervision loop that launched this scan for the
+# sum of them, under exactly the vendor load that caused the incident. A
+# snapshot taken seconds earlier in the same scan is the same answer.
+#
+# It reads into a snapshot of its own, never the scan's shared one: a forced
+# re-read that times out discards the snapshot it was asked to replace, which
+# would cost every later worker in this scan the structural evidence already
+# read for it.
+# Create that root, in the CALLER's shell. resume_probe_status runs inside a
+# command substitution, whose assignments die with its subshell, so the memo
+# lives in the filesystem and only its root is set here.
+resume_probe_root_ensure() {
+  [ -z "$RESUME_PROBE_ROOT" ] || return 0
+  RESUME_PROBE_ROOT=$(mktemp -d "$STATE/.quota-probe-resume.XXXXXX" 2>/dev/null) || {
+    RESUME_PROBE_ROOT=
+    return 1
+  }
+}
+
+resume_probe_status() {  # <provider>
+  local provider=$1 dir
+  # The token becomes a path component here, so only a plain one is accepted.
+  case "$provider" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+  [ -n "$RESUME_PROBE_ROOT" ] || return 1
+  dir="$RESUME_PROBE_ROOT/$provider"
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir" 2>/dev/null || return 1
+    FM_QUOTA_PROBE_TTL=0 fm_quota_probe_refresh "$dir" "$provider" >/dev/null 2>&1 || true
+  fi
+  fm_quota_provider_status "$dir" "$provider"
+}
+
+resume_probe_discard() {
+  [ -n "$RESUME_PROBE_ROOT" ] || return 0
+  rm -rf "$RESUME_PROBE_ROOT"
+  RESUME_PROBE_ROOT=
+}
+
 resume_task() {  # <id> <meta> <reset-epoch>
-  local id=$1 meta=$2 reset=$3 provider probe_dir status current_status refusal rc
+  local id=$1 meta=$2 reset=$3 provider status current_status refusal rc
   provider=$(fm_quota_wait_field "$STATE" "$id" provider)
   # Re-read the account before resuming. An account still refusing at its own
   # stated reset ends this wait rather than moving its deadline: a record carries
   # ONE deadline and retires at it whether or not anything improved, and if the
   # refusal is real the next detection records a new wait on fresh evidence.
   if [ -n "$provider" ] && [ "$provider" != unattributed ]; then
-    # The one moment where a cached headroom reading is not good enough. Every
-    # other caller can tolerate an answer up to FM_QUOTA_PROBE_TTL old, but this
-    # one decides whether to send text into a live worker, and a cached refusal
-    # here would defer a resume that is actually due by a whole interval.
-    #
-    # It reads into a snapshot of its own. The scan's shared snapshot is what
-    # every later worker in this same scan reads its account from, and a forced
-    # re-read that times out discards the snapshot it was asked to replace - so
-    # writing this answer there would cost those workers the structural evidence
-    # that was already read for them seconds earlier.
-    probe_dir=$(mktemp -d "$STATE/.quota-probe-resume.XXXXXX" 2>/dev/null) || probe_dir=
-    status='unknown	unknown'
-    if [ -n "$probe_dir" ]; then
-      FM_QUOTA_PROBE_TTL=0 fm_quota_probe_refresh "$probe_dir" "$provider" >/dev/null 2>&1 || true
-      status=$(fm_quota_provider_status "$probe_dir" "$provider")
-      rm -rf "$probe_dir"
-    fi
+    resume_probe_root_ensure || true
+    status=$(resume_probe_status "$provider") || status='unknown	unknown'
     current_status=$(printf '%s' "$status" | cut -f1)
     if [ "$current_status" = exhausted ]; then
       end_wait "$id"
@@ -379,6 +416,7 @@ scan_once() {
         ;;
     esac
   done
+  resume_probe_discard
 }
 
 cmd_scan() {

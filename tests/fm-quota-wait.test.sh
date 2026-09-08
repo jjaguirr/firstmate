@@ -186,13 +186,18 @@ if [ "${1:-}" = models ]; then
   exit 0
 fi
 [ -n "${FM_FAKE_QUOTA_JSON:-}" ] && [ -r "$FM_FAKE_QUOTA_JSON" ] || exit 1
-# A vendor call that stops answering partway through one scan, which is how a
-# real 20s-bounded read times out under load.
-if [ -n "${FM_FAKE_QUOTA_FAIL_AFTER:-}" ]; then
+# Every provider read is counted, so a case can assert how many vendor calls one
+# scan actually spent.
+n=0
+if [ -n "${FM_FAKE_QUOTA_CALLS:-}" ]; then
   n=$(cat "$FM_FAKE_QUOTA_CALLS" 2>/dev/null || printf '0')
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   n=$((n + 1))
   printf '%s\n' "$n" > "$FM_FAKE_QUOTA_CALLS"
+fi
+# A vendor call that stops answering partway through one scan, which is how a
+# real 20s-bounded read times out under load.
+if [ -n "${FM_FAKE_QUOTA_FAIL_AFTER:-}" ]; then
   [ "$n" -le "$FM_FAKE_QUOTA_FAIL_AFTER" ] || exit 1
 fi
 cat "$FM_FAKE_QUOTA_JSON"
@@ -502,6 +507,56 @@ test_resume_reads_the_account_fresh_rather_than_from_cache() {
   [ "$(wc -l < "$dir/sent.log" 2>/dev/null | tr -d ' ')" = 1 ] ||
     fail "cachedresume: expected exactly 1 delivered resume"
   pass "cachedresume: the account is re-read fresh before a resume, never from the reuse window"
+}
+
+test_one_account_is_re_read_once_per_scan_not_once_per_worker() {
+  local dir a b out calls i
+  dir=$(make_case oneprobe "the worker stopped mid-task")
+  a=$(case_id oneprobe)
+  b="${a}z"
+  # The founding incident's shape: one account refuses every endpoint at once,
+  # so every wait comes due in the same pass. A vendor read per worker would
+  # spend one bounded call each and hold the supervision loop that launched this
+  # scan for the sum of them, under exactly the load that caused the incident.
+  ln -sf "$SLEEP_BIN" "$dir/bin/claude"
+  PATH="$dir/fakebin:$PATH" tmux new-window -d -n "fm-$b" \
+    "sh -c 'cat $dir/pane.txt; exec $dir/bin/claude 100000'"
+  i=0
+  while [ "$i" -lt 50 ]; do
+    PATH="$dir/fakebin:$PATH" tmux capture-pane -p -t "$SESSION:fm-$b" 2>/dev/null |
+      grep -q . && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  fm_write_meta "$dir/state/$b.meta" \
+    "window=$SESSION:fm-$b" "endpoint_task_id=$b" "worktree=$dir/wt" "project=$dir/wt" \
+    "harness=claude" "kind=ship" "model=default" "effort=default"
+  printf 'working: implementing the fix\n' > "$dir/state/$b.status"
+  set_busy_state "$dir" "$a" idle || fail "oneprobe: could not record an idle busy state"
+  set_busy_state "$dir" "$b" idle || fail "oneprobe: could not record the second idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  write_quota_json "$dir/quota.json" claude through_reset "$(iso_in 3600)"
+  fm_quota_wait_write "$dir/state" "$a" claude claude "$(( $(date +%s) - 600 ))" structural \
+    "$(fm_quota_fingerprint structural claude oneprobea)" ||
+    fail "oneprobe: could not write the first wait record"
+  fm_quota_wait_write "$dir/state" "$b" claude claude "$(( $(date +%s) - 600 ))" structural \
+    "$(fm_quota_fingerprint structural claude oneprobeb)" ||
+    fail "oneprobe: could not write the second wait record"
+
+  rm -f "$dir/quota-calls"
+  out=$(run_scan "$dir" "$a" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+
+  # Both resumes still happen, and both still rest on an account re-read during
+  # THIS scan rather than on the reuse window.
+  [ "$(wc -l < "$dir/sent.log" 2>/dev/null | tr -d ' ')" = 2 ] ||
+    fail "oneprobe: expected both due workers to be resumed"
+  assert_contains "$out" "was resumed automatically" "oneprobe: no resume was reported"
+  # One shared read for the scan, one forced re-read for the account. A third
+  # would be the per-worker fan-out.
+  calls=$(cat "$dir/quota-calls" 2>/dev/null || printf '0')
+  [ "$calls" = 2 ] ||
+    fail "oneprobe: one scan spent $calls vendor reads on one account, expected 2"
+  pass "oneprobe: one account is re-read once per scan, however many workers come due in it"
 }
 
 test_resume_refuses_an_unclassifiable_endpoint() {
@@ -1292,6 +1347,7 @@ test_a_busy_worker_is_never_parked
 test_an_unreadable_pane_is_never_parked
 test_resume_sends_exactly_one_nudge_per_reset
 test_resume_reads_the_account_fresh_rather_than_from_cache
+test_one_account_is_re_read_once_per_scan_not_once_per_worker
 test_resume_refuses_an_unclassifiable_endpoint
 test_resume_refuses_a_worker_that_is_working_again
 test_a_still_refused_account_is_not_resumed
