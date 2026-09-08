@@ -377,19 +377,14 @@ EOF
 }
 
 # Print the epoch a banner's own reset hint names, or nothing when the notice
-# carries none this parser can read without guessing. Two shapes are accepted:
-# an explicit ISO instant, and a bare wall-clock time of day, which is resolved
-# to its NEXT occurrence in local time - the only reading of "resets 8:50am"
-# that cannot land in the past.
+# carries none this parser can read without guessing. One shape is accepted: the
+# bare wall-clock time of day docs/verification/quota-refusal.md records a vendor
+# actually rendering, resolved to its NEXT occurrence in local time - the only
+# reading of "resets 8:50am" that cannot land in the past. A second spelling no
+# harness is observed to produce would widen the weakest signal in this file for
+# no evidence, so there is deliberately none.
 fm_quota_banner_reset_epoch() {  # <text>
-  local text=$1 iso clock hour minute meridiem today epoch now
-  iso=$(printf '%s' "$text" |
-    grep -oiE 'reset[s]?( at)? [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[^ ]*' |
-    head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[^ ]*') || iso=
-  if [ -n "$iso" ]; then
-    epoch=$(fm_quota_iso_to_epoch "$iso")
-    [ -n "$epoch" ] && { printf '%s' "$epoch"; return 0; }
-  fi
+  local text=$1 clock hour minute meridiem today epoch now
   clock=$(printf '%s' "$text" |
     grep -oiE 'reset[s]?( at)? [0-9]{1,2}(:[0-9]{2})? ?(am|pm)' | head -1) || clock=
   [ -n "$clock" ] || return 0

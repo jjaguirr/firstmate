@@ -375,14 +375,34 @@ classify_signal() {  # <reason-after-colon> <state>
   fi
 }
 
+# 0 when a status line belongs to the terminal escalate/dedupe path below, so a
+# quota wait never stands in front of it. A quota-parked worker was refused a
+# turn and could not write anything new; whatever its last line says therefore
+# still describes work this daemon owes the digest, and a wait that swallowed a
+# blocked: or done: would be exactly the quieter alarm this change forbids. The
+# nonterminal progress verbs are excluded here for the same reason the terminal
+# branch excludes them: they are the ordinary shape of a worker that simply
+# stopped mid-task, which is what a quota refusal looks like.
+status_owns_terminal_path() {  # <status-line>
+  local last=$1
+  [ -n "$last" ] || return 1
+  status_is_terminal_verb "$last" && return 0
+  status_is_captain_relevant "$last" || return 1
+  case "$(status_line_verb "$last")" in
+    working|resolved|captain-held) return 1 ;;
+  esac
+  return 0
+}
+
 # classify_stale decides the WAKE itself (one-shot per distinct hash). On a
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last seen
+  local win=$1 state=$2 task last seen provider reset name outcome
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
-  if [ -n "$task" ] && fm_quota_wait_active "$state" "$task"; then
+  if [ -n "$task" ] && ! status_owns_terminal_path "$last" &&
+    fm_quota_wait_active "$state" "$task"; then
     # A recorded provider quota refusal is a declared external wait the worker
     # could not declare for itself: it was refused service, so it never got a
     # turn in which to write a status line. It takes the same long recheck
@@ -390,9 +410,15 @@ classify_stale() {  # <window> <state>
     # expected and the wait carries its own reset time. The record expires on its
     # own bound, so a worker that does not resume returns to wedge escalation
     # here exactly as it would with no record at all.
-    printf 'pause|paused (waiting on the %s usage limit to reset %s), rechecked on a long cadence' \
-      "$(fm_quota_wait_field "$state" "$task" provider)" \
-      "$(fm_quota_format_reset "$(fm_quota_wait_field "$state" "$task" reset)")"
+    provider=$(fm_quota_wait_field "$state" "$task" provider)
+    reset=$(fm_quota_wait_field "$state" "$task" reset)
+    case "$provider" in ''|unattributed) name="provider" ;; *) name="$provider" ;; esac
+    case "$reset" in
+      ''|*[!0-9]*) outcome="no reset time could be read, so this worker is NOT resumed automatically" ;;
+      *) outcome="this worker is resumed automatically when that limit resets" ;;
+    esac
+    printf 'pause|paused (waiting on the %s usage limit to reset %s), rechecked on a long cadence; %s' \
+      "$name" "$(fm_quota_format_reset "$reset")" "$outcome"
     return
   fi
   if [ -n "$last" ] && status_is_paused_or_captain_held "$last"; then

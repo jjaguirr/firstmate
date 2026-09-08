@@ -333,7 +333,18 @@ scan_once() {
     fi
     case "$state_token" in
       exhausted)
-        detect_structural "$id" "$meta" "$provider" "$reset" || true
+        case "$reset" in
+          ''|unknown|*[!0-9]*)
+            # The account is refusing, but the vendor did not say when that
+            # clears - no limiting window carried a readable resetsAt. That is
+            # the same shape as a structural read being unavailable, not a
+            # verdict to act on, so it takes the corroborated fallback rather
+            # than ending the arm and leaving the worker parked on a home that
+            # does have quota-axi.
+            detect_banner "$id" "$meta" "$provider" || true
+            ;;
+          *) detect_structural "$id" "$meta" "$provider" "$reset" || true ;;
+        esac
         ;;
       available)
         # The vendor says this account has headroom. A rendered limit notice is

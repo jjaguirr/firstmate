@@ -67,6 +67,15 @@ iso_in() {  # <seconds-from-now>
     date -u -r "$(( $(date +%s) + $1 ))" '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+# A wall-clock time of day <hours> from now, in the shape the reported notice
+# rendered it ("8:50am"). Local time, because that is what the notice states and
+# what the production parser resolves against.
+clock_in_hours() {  # <hours-from-now>
+  date -d "@$(( $(date +%s) + $1 * 3600 ))" '+%-I:%M%p' 2>/dev/null |
+    tr 'APM' 'apm' ||
+    date -r "$(( $(date +%s) + $1 * 3600 ))" '+%-I:%M%p' | tr 'APM' 'apm'
+}
+
 # quota-axi's provider report, with a runway status and a limiting window reset
 # this test controls. Shaped after the live schema-5 snapshot recorded in
 # docs/verification/dispatch-auth.md.
@@ -586,7 +595,7 @@ test_a_wait_inside_the_reset_grace_window_survives() {
 
 test_a_banner_that_states_its_reset_runs_to_it_and_resumes() {
   local dir id out reset detected
-  dir=$(make_case bannerreset "You have hit your session limit, resets at $(iso_in 9000)")
+  dir=$(make_case bannerreset "You have hit your session limit, resets $(clock_in_hours 3)")
   id=$(case_id bannerreset)
   set_busy_state "$dir" "$id" idle || fail "bannerreset: could not record an idle busy state"
   make_fake_crew_state "$dir" "state: unknown · source: none · idle"
@@ -692,6 +701,42 @@ test_a_failed_resume_read_keeps_the_scan_snapshot() {
   [ "$(fm_quota_wait_field "$dir/state" "$b" evidence)" = structural ] ||
     fail "sharedsnapshot: the later worker fell back to weaker evidence than the scan had already read"
   pass "sharedsnapshot: a resume reads its account into a snapshot of its own, never the one the scan shares"
+}
+
+test_an_exhausted_account_with_no_readable_reset_still_records() {
+  local dir id out
+  dir=$(make_case noreset "$BANNER")
+  id=$(case_id noreset)
+  set_busy_state "$dir" "$id" idle || fail "noreset: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # The vendor says the account is exhausted but names no limiting window, so
+  # nothing carries a resetsAt. Ending the arm there would leave a worker parked
+  # exactly as in the reported incident, on a home that does have quota-axi.
+  cat > "$dir/quota.json" <<'JSON'
+{
+  "schemaVersion": 5,
+  "providers": [
+    {
+      "provider": "claude",
+      "windows": [],
+      "quotaSemantics": {
+        "status": "known",
+        "effectiveAvailability": [
+          { "scope": "all_models", "status": "known", "runway": { "status": "exhausted_now" } }
+        ]
+      }
+    }
+  ]
+}
+JSON
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_present "$dir/state/$id.quota-wait" \
+    "noreset: a machine-verified refusal with no readable reset recorded nothing at all"
+  assert_contains "$out" "quota-limit:" "noreset: the refusal was not reported"
+  [ "$(fm_quota_wait_field "$dir/state" "$id" provider)" = claude ] ||
+    fail "noreset: the wait did not carry the provider the vendor named"
+  pass "noreset: an exhausted account whose reset cannot be read still records a bounded wait"
 }
 
 test_evidence_that_already_made_a_wait_never_makes_another() {
@@ -917,6 +962,7 @@ test_a_worker_parked_by_design_is_never_recorded_as_refused
 test_a_dead_endpoint_never_earns_a_quota_wait
 test_a_wait_whose_agent_died_is_retired_by_the_scan
 test_a_failed_resume_read_keeps_the_scan_snapshot
+test_an_exhausted_account_with_no_readable_reset_still_records
 test_evidence_that_already_made_a_wait_never_makes_another
 test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged

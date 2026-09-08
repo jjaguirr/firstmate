@@ -261,6 +261,40 @@ test_stale_captain_held_classifies_pause() {
 # the wait carries its own reset time. The record expires on its own bound, so a
 # worker that does not resume returns to wedge aging here with nothing carried
 # over - which is what keeps this from being a quieter alarm.
+# A quota wait explains an IDLE pane, never a status line the digest still owes
+# the captain. A worker that reported blocked: before the account was exhausted
+# is still blocked, and letting the wait stand in front of that reading would be
+# a quieter alarm without a rarer condition.
+test_stale_quota_wait_never_swallows_a_terminal_status() {
+  local dir state out
+  dir=$(make_supercase stale-quota-terminal)
+  state="$dir/state"
+  printf 'blocked: cannot reach the staging DB\n' > "$state/quota-w9t.status"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9t claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the quota wait record"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9t" "$state")
+  case "$out" in pause\|*) fail "a recorded quota wait swallowed a terminal status: $out" ;; esac
+  case "$out" in *"cannot reach the staging DB"*) ;; *) fail "the terminal status never reached the digest: $out" ;; esac
+  pass "a recorded quota wait never stands in front of a terminal status"
+}
+
+# The record a human has to pick up: a matched notice that stated no reset time.
+# Away mode must not promise an automatic resume for it, and must not render the
+# internal unattributed token as if it were a vendor name.
+test_stale_quota_wait_with_no_reset_is_reported_as_needing_a_human() {
+  local dir state out
+  dir=$(make_supercase stale-quota-noreset)
+  state="$dir/state"
+  printf 'working: implementing the fix\n' > "$state/quota-w9u.status"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9u unattributed claude \
+    unknown banner || fail "could not write the quota wait record"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")
+  case "$out" in pause\|*) ;; *) fail "a recorded quota wait did not classify as pause: $out" ;; esac
+  case "$out" in *"NOT resumed automatically"*) ;; *) fail "a wait that will never be resumed promised a resume: $out" ;; esac
+  case "$out" in *unattributed*) fail "the internal unattributed token was rendered as a provider name: $out" ;; esac
+  pass "a quota wait with no readable reset is reported as one nothing will resume"
+}
+
 test_stale_quota_wait_classifies_pause() {
   local dir state out
   dir=$(make_supercase stale-quota)
@@ -1997,6 +2031,8 @@ test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_stale_captain_held_classifies_pause
 test_stale_quota_wait_classifies_pause
+test_stale_quota_wait_never_swallows_a_terminal_status
+test_stale_quota_wait_with_no_reset_is_reported_as_needing_a_human
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
