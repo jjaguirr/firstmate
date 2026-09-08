@@ -119,9 +119,6 @@ FM_QUOTA_CATALOG_TTL=${FM_QUOTA_CATALOG_TTL:-3600}
 # open-ended silence. A banner that states its reset runs to that reset instead,
 # because retiring it earlier would drop the resume it was recorded for.
 FM_QUOTA_BANNER_WAIT_MAX_SECS=${FM_QUOTA_BANNER_WAIT_MAX_SECS:-1800}
-# The same bound for a structural wait whose reset time could not be read. A
-# wait with no deadline is exactly the rot this whole change exists to remove.
-FM_QUOTA_UNKNOWN_RESET_MAX_SECS=${FM_QUOTA_UNKNOWN_RESET_MAX_SECS:-21600}
 # Grace added after a reset time before a resume is attempted, so a nudge does
 # not land in the same second the window turns over.
 FM_QUOTA_RESET_GRACE_SECS=${FM_QUOTA_RESET_GRACE_SECS:-60}
@@ -522,21 +519,16 @@ fm_quota_reset_grace() {
 # recorded wait can outlive its own evidence. A wait carrying a readable reset
 # expires when the resume it is owed becomes due, never before it: a deadline
 # earlier than that would retire the record inside the grace window and drop the
-# one resume the wait exists to deliver. A wait with no readable reset has no
-# such moment to reach, so it expires on its evidence's own bound measured from
-# detection - the shorter banner bound where rendered text is all there was.
+# one resume the wait exists to deliver. A reset-less wait has no such moment to
+# reach, and only the banner path can record one, so it expires on that path's
+# own bound measured from detection.
 fm_quota_wait_deadline() {  # <state-dir> <id>
-  local state=$1 id=$2 reset evidence detected bound grace
+  local state=$1 id=$2 reset detected grace
   reset=$(fm_quota_wait_field "$state" "$id" reset)
-  evidence=$(fm_quota_wait_field "$state" "$id" evidence)
   detected=$(fm_quota_wait_field "$state" "$id" detected)
   case "$detected" in ''|*[!0-9]*) return 1 ;; esac
-  case "$evidence" in
-    banner) bound=$FM_QUOTA_BANNER_WAIT_MAX_SECS ;;
-    *)      bound=$FM_QUOTA_UNKNOWN_RESET_MAX_SECS ;;
-  esac
   case "$reset" in
-    ''|*[!0-9]*) printf '%s' $((detected + bound)) ;;
+    ''|*[!0-9]*) printf '%s' $((detected + FM_QUOTA_BANNER_WAIT_MAX_SECS)) ;;
     *) grace=$(fm_quota_reset_grace); printf '%s' $((reset + grace)) ;;
   esac
 }

@@ -452,16 +452,24 @@ wedge_defer_writing() {  # <window> <since-file> <triage-label> <idle-age>
 # directions, which is the same leave-the-schedule-alone treatment every other
 # absent-evidence outcome in this file gets.
 wedge_absorb_quota_wait() {  # <window> <task> <since-file> <idle-age>
-  local win=$1 task=$2 since_file=$3 age=$4 wait_file wage provider reset
+  local win=$1 task=$2 since_file=$3 age=$4 wait_file wage provider reset name outcome
   wait_file=$(fm_quota_wait_path "$STATE" "$task")
   wage=$(age_of "$wait_file")
   provider=$(fm_quota_wait_field "$STATE" "$task" provider)
   reset=$(fm_quota_wait_field "$STATE" "$task" reset)
+  case "$provider" in ''|unattributed) name="provider" ;; *) name="$provider" ;; esac
+  # A wait whose reset time nobody could read is never resumed automatically, so
+  # it must not be reported as one that will be: that record is exactly the one a
+  # human has to pick up before its bound expires.
+  case "$reset" in
+    ''|*[!0-9]*) outcome="no reset time could be read, so this worker is NOT resumed automatically" ;;
+    *) outcome="this worker is resumed automatically when that limit resets" ;;
+  esac
   date +%s > "$since_file"
   clear_write_tracking "$(window_key "$win")"
   resurface_absorbed "$win" "$(fm_quota_resurfaced_path "$STATE" "$task")" "$wage" \
-    "stale: $win (idle ${age}s, waiting ${wage}s on the ${provider:-provider} usage limit to reset $(fm_quota_format_reset "$reset"), rechecked on a long cadence not a wedge; this worker is resumed automatically when that limit resets)"
-  triage_log "absorbed stale (provider quota wait on ${provider:-unknown}, idle ${age}s): $win"
+    "stale: $win (idle ${age}s, waiting ${wage}s on the $name usage limit to reset $(fm_quota_format_reset "$reset"), rechecked on a long cadence not a wedge; $outcome)"
+  triage_log "absorbed stale (provider quota wait on $name, idle ${age}s): $win"
 }
 
 # Drop a window's write-deferral chain wherever its stale bookkeeping resets, so

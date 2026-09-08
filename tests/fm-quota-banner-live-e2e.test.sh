@@ -22,8 +22,12 @@
 #      vendor schema change that silently moved `runway.status` would otherwise
 #      turn the structural verdict into a permanent "unknown" and quietly demote
 #      every worker to the rendered-text fallback.
-#   2. Every INSTALLED harness still attributes to a provider quota-axi accepts,
-#      through the production attribution path rather than a copy of its table.
+#   2. Every INSTALLED harness still attributes the way the production path says
+#      it should: a single-vendor harness names a provider, and a multi-provider
+#      one names none, both read through that path rather than a copy of its
+#      table. Which provider tokens quota-axi accepts is not asserted here: the
+#      report only carries rows for vendors this machine is authenticated to, so
+#      an unauthenticated vendor is missing evidence rather than a fault.
 #   3. The banner patterns do not match ordinary vendor output. Real rendered
 #      text from each installed harness is fed to the production matcher, which
 #      must not claim a limit notice. A pattern that started matching a normal
@@ -75,16 +79,6 @@ table_providers() {
     sort -u | tr '\n' ',' | sed 's/,$//'
 }
 
-# The provider tokens the INSTALLED quota-axi answered for, one per line, taken
-# from the snapshot the structural check above refreshed. This is the accepting
-# side of the same argument the production code passes, so a token quota-axi no
-# longer reports is caught here rather than at the next real refusal. Empty when
-# quota-axi is absent or unreadable, which is the only case in which an
-# attributed token goes unchecked.
-live_providers() {
-  fm_quota_probe_report "$LIVE_DIR/probe" 2>/dev/null | cut -f1 | grep . || true
-}
-
 # --- 1. the structural signal is still reachable -----------------------------
 
 test_structural_signal_reachable() {
@@ -115,8 +109,7 @@ test_structural_signal_reachable() {
 # --- 2 and 3. every installed harness ---------------------------------------
 
 test_installed_harnesses() {
-  local harness bin version provider text accepted
-  accepted=$(live_providers)
+  local harness bin version provider text
   for harness in claude codex opencode pi grok kimi cursor muse; do
     bin=$harness
     [ "$harness" != cursor ] || bin=cursor-agent
@@ -130,15 +123,6 @@ test_installed_harnesses() {
       claude|codex|grok|kimi|cursor)
         [ -n "$provider" ] ||
           fail "$harness ($version): a single-vendor harness no longer attributes to a provider"
-        # Checked against the providers the INSTALLED quota-axi actually reported
-        # on, so a vendor that renames or drops a provider token fails here
-        # rather than silently producing an argument nothing answers to.
-        if [ -n "$accepted" ]; then
-          printf '%s\n' "$accepted" | grep -qx "$provider" ||
-            fail "$harness ($version): attributes to '$provider', which the installed quota-axi did not report on"
-        else
-          note "$harness ($version): no quota-axi report could be read, so '$provider' is unchecked against the accepted provider set"
-        fi
         ;;
       *)
         [ -z "$provider" ] ||

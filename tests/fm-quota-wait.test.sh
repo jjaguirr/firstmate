@@ -95,6 +95,40 @@ write_quota_json() {  # <file> <provider> <runway-status> <resets-at>
 JSON
 }
 
+# The same report for two providers at once, which is what a mixed fleet's one
+# shared scan snapshot holds.
+write_quota_json_pair() {  # <file> <runway-status> <resets-at>
+  cat > "$1" <<JSON
+{
+  "schemaVersion": 5,
+  "providers": [
+    {
+      "provider": "claude",
+      "windows": [ { "id": "five_hour", "kind": "session", "resetsAt": "$3" } ],
+      "quotaSemantics": {
+        "status": "known",
+        "effectiveAvailability": [
+          { "scope": "all_models", "status": "known",
+            "limitingWindowIds": [ "five_hour" ], "runway": { "status": "$2" } }
+        ]
+      }
+    },
+    {
+      "provider": "codex",
+      "windows": [ { "id": "five_hour", "kind": "session", "resetsAt": "$3" } ],
+      "quotaSemantics": {
+        "status": "known",
+        "effectiveAvailability": [
+          { "scope": "all_models", "status": "known",
+            "limitingWindowIds": [ "five_hour" ], "runway": { "status": "$2" } }
+        ]
+      }
+    }
+  ]
+}
+JSON
+}
+
 write_models_json() {  # <file>
   cat > "$1" <<'JSON'
 {
@@ -134,6 +168,15 @@ if [ "${1:-}" = models ]; then
   exit 0
 fi
 [ -n "${FM_FAKE_QUOTA_JSON:-}" ] && [ -r "$FM_FAKE_QUOTA_JSON" ] || exit 1
+# A vendor call that stops answering partway through one scan, which is how a
+# real 20s-bounded read times out under load.
+if [ -n "${FM_FAKE_QUOTA_FAIL_AFTER:-}" ]; then
+  n=$(cat "$FM_FAKE_QUOTA_CALLS" 2>/dev/null || printf '0')
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$FM_FAKE_QUOTA_CALLS"
+  [ "$n" -le "$FM_FAKE_QUOTA_FAIL_AFTER" ] || exit 1
+fi
 cat "$FM_FAKE_QUOTA_JSON"
 exit 0
 SH
@@ -176,13 +219,13 @@ case_id() { printf 'task%s' "$1"; }
 
 # Record a semantic busy state for the case's task, through the production
 # writer, so the idle gate reads a real record rather than a guessed one.
-set_busy_state() {  # <dir> <id> <busy|idle|unknown>
-  local dir=$1 id=$2 want=$3 gen
+set_busy_state() {  # <dir> <id> <busy|idle|unknown> [source]
+  local dir=$1 id=$2 want=$3 source=${4:-claude-hook} gen
   gen=$("$ROOT/bin/fm-busy-event.sh" arm "$dir/state" "$id" >/dev/null 2>&1; \
     cat "$dir/state/$id.busy-gen" 2>/dev/null) || return 1
   [ -n "$gen" ] || return 1
   "$ROOT/bin/fm-busy-event.sh" apply "$dir/state" "$id" "$want" --gen "$gen" \
-    --source claude-hook --event test >/dev/null 2>&1
+    --source "$source" --event test >/dev/null 2>&1
 }
 
 # Run a forced scan inside the case fixture. Every quota read the scan makes
@@ -195,6 +238,7 @@ run_scan() {  # <dir> <id> [extra env assignments...]
     FM_QUOTA_SEND_BIN="$dir/fakebin/fm-send-recorder.sh" \
     FM_FAKE_SEND_LOG="$dir/sent.log" \
     FM_FAKE_QUOTA_MODELS="$dir/models.json" \
+    FM_FAKE_QUOTA_CALLS="$dir/quota-calls" \
     FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" \
     env "$@" "$QUOTA_WATCH" scan --force 2>&1
 }
@@ -578,6 +622,78 @@ test_a_banner_that_states_its_reset_runs_to_it_and_resumes() {
   pass "bannerreset: a notice that states its reset waits until then and resumes on a home with no quota-axi"
 }
 
+test_a_wait_whose_agent_died_is_retired_by_the_scan() {
+  local dir id out
+  dir=$(make_case deadwait "the worker stopped mid-task")
+  id=$(case_id deadwait)
+  set_busy_state "$dir" "$id" idle || fail "deadwait: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # A current wait whose reset is hours away. The watcher absorbs this pane
+  # ahead of its own liveness read on purpose, so if the agent dies mid-wait
+  # nothing else in the fleet can notice until the reset arrives.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) + 7200 ))" structural \
+    "$(fm_quota_fingerprint structural claude deadwait)" ||
+    fail "deadwait: could not write the wait record"
+  write_quota_json "$dir/quota.json" claude exhausted_now "$(iso_in 7200)"
+  PATH="$dir/fakebin:$PATH" tmux kill-window -t "$SESSION:fm-$id" 2>/dev/null || true
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_absent "$dir/state/$id.quota-wait" \
+    "deadwait: a wait kept absorbing the stale path after its agent died"
+  assert_contains "$out" "no longer reports a live agent" \
+    "deadwait: the retired wait was not reported"
+  # The refusal was never resolved, so its evidence must stay unspent and the
+  # pane must be able to earn a wait again if the endpoint comes back.
+  assert_absent "$dir/state/$id.quota-spent" \
+    "deadwait: a wait retired for a dead endpoint spent its evidence fingerprint"
+  pass "deadwait: a wait whose endpoint stops reporting a live agent is retired instead of absorbing the wedge path"
+}
+
+test_a_failed_resume_read_keeps_the_scan_snapshot() {
+  local dir a b out
+  dir=$(make_case sharedsnapshot "the worker stopped mid-task")
+  a=$(case_id sharedsnapshot)
+  # A second worker in the same home, on a different provider, iterated AFTER
+  # the one whose resume is due. It reads its account from the snapshot that one
+  # scan shares, so a forced re-read that fails must not take that snapshot with
+  # it. Its provider comes from quota-axi's published catalog rather than its
+  # harness name, which is the only shape a second provider can take in a home
+  # whose semantic busy contract can classify the pane.
+  b="${a}z"
+  ln -sf "$SLEEP_BIN" "$dir/bin/opencode"
+  PATH="$dir/fakebin:$PATH" tmux new-window -d -n "fm-$b" \
+    "sh -c 'cat $dir/pane.txt; exec $dir/bin/opencode 100000'"
+  local i=0
+  while [ "$i" -lt 50 ]; do
+    PATH="$dir/fakebin:$PATH" tmux capture-pane -p -t "$SESSION:fm-$b" 2>/dev/null |
+      grep -q . && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  fm_write_meta "$dir/state/$b.meta" \
+    "window=$SESSION:fm-$b" "endpoint_task_id=$b" "worktree=$dir/wt" "project=$dir/wt" \
+    "harness=opencode" "kind=ship" "model=gpt-5.3-codex" "effort=default"
+  printf 'working: implementing the fix\n' > "$dir/state/$b.status"
+  set_busy_state "$dir" "$a" idle || fail "sharedsnapshot: could not record an idle busy state"
+  set_busy_state "$dir" "$b" idle opencode-plugin ||
+    fail "sharedsnapshot: could not record the second idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  write_quota_json_pair "$dir/quota.json" exhausted_now "$(iso_in 3600)"
+  fm_quota_wait_write "$dir/state" "$a" claude claude "$(( $(date +%s) - 600 ))" structural \
+    "$(fm_quota_fingerprint structural claude sharedsnapshot)" ||
+    fail "sharedsnapshot: could not write the wait record"
+
+  # The scan's own read succeeds; the forced re-read the resume makes does not.
+  rm -f "$dir/quota-calls"
+  out=$(run_scan "$dir" "$a" FM_FAKE_QUOTA_JSON="$dir/quota.json" FM_FAKE_QUOTA_FAIL_AFTER=1)
+
+  assert_present "$dir/state/$b.quota-wait" \
+    "sharedsnapshot: a failed resume-time read cost a later worker the structural evidence already read for it"
+  [ "$(fm_quota_wait_field "$dir/state" "$b" evidence)" = structural ] ||
+    fail "sharedsnapshot: the later worker fell back to weaker evidence than the scan had already read"
+  pass "sharedsnapshot: a resume reads its account into a snapshot of its own, never the one the scan shares"
+}
+
 test_evidence_that_already_made_a_wait_never_makes_another() {
   local dir id out stale_reset
   dir=$(make_case respend "the worker stopped mid-task")
@@ -750,6 +866,39 @@ test_watcher_absorbs_a_recorded_wait_instead_of_escalating() {
   pass "absorb: a recorded quota wait is rechecked on the bounded cadence, never escalated as a wedge"
 }
 
+test_a_wait_with_no_reset_is_never_reported_as_self_resuming() {
+  local dir id out round
+  dir=$(make_case absorbunknown "the worker stopped mid-task")
+  id=$(case_id absorbunknown)
+  set_busy_state "$dir" "$id" idle || fail "absorbunknown: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # The one wait the design says a human must pick up: a rendered notice matched,
+  # but it stated no reset time, so nothing will ever resume this worker.
+  fm_quota_wait_write "$dir/state" "$id" unattributed claude unknown banner ||
+    fail "absorbunknown: could not write the wait record"
+  write_quota_json "$dir/quota.json" claude through_reset "$(iso_in 3600)"
+  out="$dir/watch.out"
+  : > "$out"
+
+  round=0
+  while [ "$round" -lt 8 ]; do
+    watch_round "$dir" "$out" || break
+    grep -q 'usage limit to reset' "$out" && break
+    grep -q 'possible wedge' "$out" && break
+    round=$((round + 1))
+  done
+
+  assert_grep "usage limit to reset" "$out" \
+    "absorbunknown: the stale recheck did not name the provider limit the worker is waiting on"
+  assert_grep "NOT resumed automatically" "$out" \
+    "absorbunknown: a wait with no readable reset was not reported as needing a human"
+  assert_no_grep "this worker is resumed automatically" "$out" \
+    "absorbunknown: a wait that can never be resumed promised an automatic resume"
+  assert_no_grep "the unattributed usage limit" "$out" \
+    "absorbunknown: the internal unattributed token was rendered as a provider name"
+  pass "absorbunknown: a wait with no readable reset is surfaced as one nothing will resume"
+}
+
 test_provider_attribution
 test_structural_detection_without_a_banner
 test_banner_detection_without_quota_axi
@@ -766,7 +915,10 @@ test_a_wait_inside_the_reset_grace_window_survives
 test_a_banner_that_states_its_reset_runs_to_it_and_resumes
 test_a_worker_parked_by_design_is_never_recorded_as_refused
 test_a_dead_endpoint_never_earns_a_quota_wait
+test_a_wait_whose_agent_died_is_retired_by_the_scan
+test_a_failed_resume_read_keeps_the_scan_snapshot
 test_evidence_that_already_made_a_wait_never_makes_another
 test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged
 test_watcher_absorbs_a_recorded_wait_instead_of_escalating
+test_a_wait_with_no_reset_is_never_reported_as_self_resuming

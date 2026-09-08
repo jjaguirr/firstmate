@@ -216,8 +216,8 @@ end_wait() {  # <id>
   fm_quota_wait_clear "$STATE" "$1"
 }
 
-resume_task() {  # <id> <meta> <reset-epoch> <scan-providers>
-  local id=$1 meta=$2 reset=$3 providers=$4 provider status current_status current_reset refusal rc
+resume_task() {  # <id> <meta> <reset-epoch>
+  local id=$1 meta=$2 reset=$3 provider probe_dir status current_status current_reset refusal rc
   provider=$(fm_quota_wait_field "$STATE" "$id" provider)
   # Re-read the account before resuming. A window that slipped is a corrected
   # deadline for the SAME wait, never a second nudge: the record is updated and
@@ -229,13 +229,18 @@ resume_task() {  # <id> <meta> <reset-epoch> <scan-providers>
     # one decides whether to send text into a live worker, and a cached refusal
     # here would defer a resume that is actually due by a whole interval.
     #
-    # The refresh asks for the WHOLE scan's provider set, not just this worker's.
-    # The snapshot is shared: refreshing one provider into it would leave every
-    # other provider absent, and a later worker in this same scan would then read
-    # its own account as unreadable and fall to the banner path while real
-    # structural evidence existed.
-    FM_QUOTA_PROBE_TTL=0 fm_quota_probe_refresh "$STATE" "${providers:-$provider}" >/dev/null 2>&1 || true
-    status=$(fm_quota_provider_status "$STATE" "$provider")
+    # It reads into a snapshot of its own. The scan's shared snapshot is what
+    # every later worker in this same scan reads its account from, and a forced
+    # re-read that times out discards the snapshot it was asked to replace - so
+    # writing this answer there would cost those workers the structural evidence
+    # that was already read for them seconds earlier.
+    probe_dir=$(mktemp -d "$STATE/.quota-probe-resume.XXXXXX" 2>/dev/null) || probe_dir=
+    status='unknown	unknown'
+    if [ -n "$probe_dir" ]; then
+      FM_QUOTA_PROBE_TTL=0 fm_quota_probe_refresh "$probe_dir" "$provider" >/dev/null 2>&1 || true
+      status=$(fm_quota_provider_status "$probe_dir" "$provider")
+      rm -rf "$probe_dir"
+    fi
     current_status=$(printf '%s' "$status" | cut -f1)
     current_reset=$(printf '%s' "$status" | cut -f2)
     if [ "$current_status" = exhausted ]; then
@@ -302,7 +307,17 @@ scan_once() {
     meta=${meta%%"$FM_QUOTA_TAB"*}
     if [ -s "$(fm_quota_wait_path "$STATE" "$id")" ]; then
       if fm_quota_wait_resume_due "$STATE" "$id"; then
-        resume_task "$id" "$meta" "$(fm_quota_wait_field "$STATE" "$id" reset)" "$providers"
+        resume_task "$id" "$meta" "$(fm_quota_wait_field "$STATE" "$id" reset)"
+      elif ! task_agent_alive "$meta"; then
+        # The absorb in bin/fm-watch.sh runs ahead of that loop's liveness read
+        # on purpose, so this scan is the only place a wait that started over a
+        # live agent can notice the agent has since died. Without this, the
+        # dead-endpoint demand-deep-inspection escalation stays absorbed until
+        # the reset, which is hours. The evidence fingerprint is deliberately NOT
+        # spent: nothing about the refusal was resolved, so an endpoint that
+        # comes back can earn its wait again.
+        fm_quota_wait_clear "$STATE" "$id"
+        printf 'quota-limit: the recorded wait on %s was retired because its endpoint no longer reports a live agent; the ordinary check is back on this worker\n' "$id"
       elif ! fm_quota_wait_active "$STATE" "$id"; then
         end_wait "$id"
         printf 'quota-limit: the recorded wait on %s expired without a usable reset time; the ordinary check is back on this worker\n' "$id"
