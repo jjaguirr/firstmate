@@ -113,11 +113,13 @@ FM_QUOTA_PROBE_TIMEOUT=${FM_QUOTA_PROBE_TIMEOUT:-20}
 FM_QUOTA_PROBE_TTL=${FM_QUOTA_PROBE_TTL:-300}
 # The provider/model catalog changes on vendor releases, not on usage.
 FM_QUOTA_CATALOG_TTL=${FM_QUOTA_CATALOG_TTL:-3600}
-# How long a banner wait that states NO reset time may suppress ordinary stale
-# escalation before it retires itself. Deliberately short: a rendered-text
-# verdict with nothing to wait for must cost a bounded delay rather than an
-# open-ended silence. A banner that states its reset runs to that reset instead,
-# because retiring it earlier would drop the resume it was recorded for.
+# How long a wait carrying NO readable reset time may suppress ordinary stale
+# escalation before it retires itself. Either signal can record one: a matched
+# notice that states no clock, and a structural verdict whose limiting window
+# carried no resetsAt. Deliberately short either way, because a wait with
+# nothing to wait for must cost a bounded delay rather than an open-ended
+# silence. A wait that DOES carry a reset runs to that reset instead, because
+# retiring it earlier would drop the resume it was recorded for.
 FM_QUOTA_BANNER_WAIT_MAX_SECS_DEFAULT=1800
 FM_QUOTA_BANNER_WAIT_MAX_SECS=${FM_QUOTA_BANNER_WAIT_MAX_SECS:-$FM_QUOTA_BANNER_WAIT_MAX_SECS_DEFAULT}
 # Grace added after a reset time before a resume is attempted, so a nudge does
@@ -526,13 +528,14 @@ fm_quota_reset_grace() {
 # expires when the resume it is owed becomes due, never before it: a deadline
 # earlier than that would retire the record inside the grace window and drop the
 # one resume the wait exists to deliver. A reset-less wait has no such moment to
-# reach, and only the banner path can record one, so it expires on that path's
-# own bound measured from detection.
+# reach, so it expires on fm_quota_banner_bound measured from detection -
+# whichever signal recorded it, the notice path or a structural verdict whose
+# limiting window carried no resetsAt.
 #
-# That a notice STATING its reset runs to that reset, with the bound applying
-# only to a notice stating none, is deliberate: the founding incident is a
-# notice at 06:05 naming an 08:50 reset, so a short blanket cap would retire the
-# wait before the resume it exists to deliver. A long wait cannot hide a broken
+# That a wait STATING its reset runs to that reset, with the bound applying only
+# to one stating none, is deliberate: the founding incident is a notice at 06:05
+# naming an 08:50 reset, so a short blanket cap would retire the wait before the
+# resume it exists to deliver. A long wait cannot hide a broken
 # worker either way - it always retires at its own deadline and can never
 # re-extend, and fm_quota_wait_suppresses stands in front of neither a terminal
 # status nor a non-alive reading.

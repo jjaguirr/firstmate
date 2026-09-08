@@ -938,10 +938,10 @@ test_one_reset_is_claimed_by_exactly_one_scan() {
   make_fake_crew_state "$dir" "state: unknown · source: none · idle"
   lock="$dir/state/$id.quota-nudged.lock"
 
-  # Two scans can be in flight at once: the watcher poll launches one on its own
-  # cadence while an operator runs the forced check the header sanctions, and
-  # both sit in the forced re-probe for seconds before either would write. The
-  # claim is what makes the reset one reset rather than two nudges.
+  # Two scans can be in flight at once: a watcher displaced by the stale-lock
+  # steal still overlaps the one that replaced it, and both sit in the forced
+  # re-probe for seconds before either would write. The claim is what makes the
+  # reset one reset rather than two nudges.
   rc=0; fm_quota_nudge_claim "$dir/state" "$id" 1000 || rc=$?
   [ "$rc" = 0 ] || fail "oneclaim: the first claim on an unspent reset was refused (rc=$rc)"
   rc=0; fm_quota_nudge_claim "$dir/state" "$id" 1000 || rc=$?
@@ -973,6 +973,73 @@ test_one_reset_is_claimed_by_exactly_one_scan() {
   rc=0; fm_quota_nudge_claim "$dir/state" "$id" 3000 || rc=$?
   [ "$rc" = 0 ] || fail "oneclaim: a hold left by a dead scan blocked a legitimate later resume (rc=$rc)"
   pass "oneclaim: one reset is claimed by exactly one scan, and a dead holder never blocks a later one"
+}
+
+# The fingerprint gate, reached directly. A reset-less wait is the case that
+# needs it: its evidence is byte-identical on the very next scan after it
+# expires, and nothing else stops the pane oscillating forever between an
+# absorbed wait and an escalating stale pane. A stated reset that has already
+# passed is refused by the contradiction guard BEFORE this gate is consulted,
+# so that shape cannot prove the gate works.
+test_spent_evidence_cannot_record_a_second_wait() {
+  local dir id out detected
+  dir=$(make_case respendunknown "the worker stopped mid-task")
+  id=$(case_id respendunknown)
+  set_busy_state "$dir" "$id" idle || fail "respendunknown: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # Machine-verified refusal, no limiting window, and no notice in the pane, so
+  # the wait carries no readable reset and its fingerprint never changes.
+  PATH="$dir/fakebin:$PATH" tmux capture-pane -p -t "$SESSION:fm-$id" 2>/dev/null |
+    grep -qiE 'limit' && fail "respendunknown: the pane rendered a limit notice, so the evidence is not reset-less"
+  cat > "$dir/quota.json" <<'JSON'
+{
+  "schemaVersion": 5,
+  "providers": [
+    {
+      "provider": "claude",
+      "windows": [],
+      "quotaSemantics": {
+        "status": "known",
+        "effectiveAvailability": [
+          { "scope": "all_models", "status": "known", "runway": { "status": "exhausted_now" } }
+        ]
+      }
+    }
+  ]
+}
+JSON
+
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json")
+  assert_present "$dir/state/$id.quota-wait" "respendunknown: no wait was recorded from the refusal"
+  [ "$(fm_quota_wait_field "$dir/state" "$id" reset)" = unknown ] ||
+    fail "respendunknown: the wait carried a reset time nothing could have read"
+
+  # Age it past its own bound so the next scan retires it, which is what spends
+  # the evidence. The account is still refusing and the pane still renders
+  # nothing, so the evidence the next scan reads is unchanged.
+  detected=$(( $(date +%s) - 7200 ))
+  sed -i.bak "s/detected=[0-9]*/detected=$detected/" "$dir/state/$id.quota-wait" 2>/dev/null ||
+    sed -i '' "s/detected=[0-9]*/detected=$detected/" "$dir/state/$id.quota-wait"
+  rm -f "$dir/state/$id.quota-wait.bak"
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json" FM_QUOTA_PROBE_TTL=0)
+  assert_contains "$out" "expired without a usable reset time" \
+    "respendunknown: the wait did not retire on its own bound"
+  assert_present "$dir/state/$id.quota-spent" "respendunknown: retiring the wait did not spend its evidence"
+
+  # The gate itself: same account, same silent pane, same fingerprint.
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json" FM_QUOTA_PROBE_TTL=0)
+  assert_absent "$dir/state/$id.quota-wait" \
+    "respendunknown: evidence that already produced a wait produced a second one"
+  assert_not_contains "$out" "is waiting on" \
+    "respendunknown: the same spent evidence was reported as a new refusal"
+
+  # And the gate is not a blanket refusal: a reset the vendor can now name is
+  # different evidence and records normally.
+  write_quota_json "$dir/quota.json" claude exhausted_now "$(iso_in 3600)"
+  out=$(run_scan "$dir" "$id" FM_FAKE_QUOTA_JSON="$dir/quota.json" FM_QUOTA_PROBE_TTL=0)
+  assert_present "$dir/state/$id.quota-wait" \
+    "respendunknown: a refusal the vendor can now date did not record a new wait"
+  pass "respendunknown: spent evidence cannot record a second wait, while changed evidence still can"
 }
 
 test_evidence_that_already_made_a_wait_never_makes_another() {
@@ -1241,6 +1308,7 @@ test_a_worker_holding_a_blocker_is_never_parked_or_nudged
 test_a_non_numeric_bound_degrades_to_the_documented_default
 test_one_reset_is_claimed_by_exactly_one_scan
 test_evidence_that_already_made_a_wait_never_makes_another
+test_spent_evidence_cannot_record_a_second_wait
 test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged
 test_watcher_absorbs_a_recorded_wait_instead_of_escalating
