@@ -1,0 +1,6 @@
+AWAY-MODE DIGEST, worker parked on a provider limit with a known reset:
+  | pause|paused (waiting on the claude usage limit to reset 2026-09-08T09:08:37Z; this worker is resumed automatically when that limit resets), rechecked on a long cadence
+AWAY-MODE DIGEST, matched notice that stated no reset (a human must pick it up):
+  | pause|paused (waiting on the provider usage limit to reset at an unknown time; no reset time could be read, so this worker is NOT resumed automatically), rechecked on a long cadence
+AWAY-MODE DIGEST, a blocked worker that also carries a quota wait (never swallowed):
+  | escalate|stale + terminal status: blocked: cannot reach the staging DB

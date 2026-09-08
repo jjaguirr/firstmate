@@ -1,0 +1,47 @@
+
+SETUP - the reported incident, staged for real
+--------------------------------------------------------------------------
+baseline checkout: main @ 9930e68 (evaluation baseline from the intent)
+this branch:       66e67de
+
+the worker pane, as an operator sees it (tmux capture-pane):
+  | You have hit your session limit, resets 8:50am
+
+its foreground process is genuinely alive:
+  | pane 3349381 command=claude dead=0
+  | last status line the worker wrote: working: implementing the fix  | quota-axi says for provider claude: runway=exhausted_now, five_hour window resets 2026-09-08T10:06:03Z
+
+ACT 1 - BASELINE main @ 9930e68: what actually happened on 2026-09-05
+--------------------------------------------------------------------------
+  | signal: /tmp/fm-quota-demo.AoygT7/incident/state/taskincident.status
+  | stale: quota:fm-taskincident
+  | stale: quota:fm-taskincident (idle 2s, possible wedge, escalation 0 unexplained so far, agent alive at the recorded endpoint so this escalation is not counted; confirm what the worker is waiting on)
+
+  quota wait recorded by the baseline?  NO - nothing records a reset time
+  resume nudge ever delivered?          NO - the worker parks until a human notices
+
+ACT 2 - THIS BRANCH: same pane, same account, same banner
+--------------------------------------------------------------------------
+step 1 - the watcher poll loop runs its own quota scan cadence:
+  | quota-limit: taskfixed is waiting on claude, resets 2026-09-08T10:06:15Z
+
+step 2 - the durable wait record it wrote (state/taskfixed.quota-wait):
+  | v1 provider=claude harness=claude reset=1788861975 evidence=structural detected=1788854776 fp=structural:claude:1788861975
+  | reset renders as: 2026-09-08T10:06:15Z
+
+step 3 - the same watcher that escalated in ACT 1, now on this branch:
+  | stale: quota:fm-taskfixed
+  | stale: quota:fm-taskfixed (idle 2s, waiting 11s on the claude usage limit to reset 2026-09-08T10:06:15Z, rechecked on a long cadence not a wedge; this worker is resumed automatically when that limit resets)
+  | affirmative-liveness reading spent by the parked pane (48b3ea3): none - the absorb runs before the liveness read
+
+step 4 - the quota window turns over; the account reports headroom again:
+  | quota-axi for claude: runway=through_reset (limit has reset)
+  | quota-limit: taskfixed was resumed automatically now that its provider limit has reset
+
+  text actually delivered into the worker (target<TAB>message):
+  | quota:fm-taskfixed	The provider usage limit that stopped your last turn has reset - continue the task you were working on from where it stopped.
+
+step 5 - the loop keeps polling. One nudge per reset, never a retry loop:
+  | total resume nudges delivered after 3 scans: 1
+  | wait record after the resume: retired - the pane is back on ordinary supervision
+--------------------------------------------------------------------------

@@ -1,0 +1,10 @@
+ok - structural: quota-axi 0.1.29 still reports through the production probe and parser (2 providers)
+ok - claude (2.1.263 (Claude Code)): attribution is claude, and its ordinary output does not read as a limit notice
+ok - codex (codex-cli 0.148.0): attribution is codex, and its ordinary output does not read as a limit notice
+ok - opencode (1.15.10): attribution is deliberately unattributed, and its ordinary output does not read as a limit notice
+ok - pi (0.84.2): attribution is deliberately unattributed, and its ordinary output does not read as a limit notice
+# grok is not installed on this machine, so its attribution and banner behavior are unverified here
+# kimi is not installed on this machine, so its attribution and banner behavior are unverified here
+# cursor is not installed on this machine, so its attribution and banner behavior are unverified here
+# muse is not installed on this machine, so its attribution and banner behavior are unverified here
+ok - quota refusal live guard: 5 surfaces verified
