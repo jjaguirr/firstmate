@@ -246,7 +246,9 @@ set_busy_state() {  # <dir> <id> <busy|idle|unknown> [source]
     --source "$source" --event test >/dev/null 2>&1
 }
 
-# Run a forced scan inside the case fixture. Every quota read the scan makes
+# Run one scan inside the case fixture. The production script has one entry, its
+# own cadence, so a case that needs an immediate evaluation sets that cadence to
+# zero rather than reaching for a second mode. Every quota read the scan makes
 # goes through the stub on PATH; every send goes to the recorder.
 run_scan() {  # <dir> <id> [extra env assignments...]
   local dir=$1
@@ -258,7 +260,8 @@ run_scan() {  # <dir> <id> [extra env assignments...]
     FM_FAKE_QUOTA_MODELS="$dir/models.json" \
     FM_FAKE_QUOTA_CALLS="$dir/quota-calls" \
     FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state.sh" \
-    env "$@" "$QUOTA_WATCH" scan --force 2>&1
+    FM_QUOTA_SCAN_INTERVAL=0 \
+    env "$@" "$QUOTA_WATCH" scan 2>&1
 }
 
 # A hermetic fm-crew-state.sh so the resume gate's third read is controlled by

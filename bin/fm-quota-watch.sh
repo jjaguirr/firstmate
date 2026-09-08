@@ -2,14 +2,14 @@
 # fm-quota-watch.sh - detect, record, and resume provider quota refusals.
 #
 # Usage:
-#   fm-quota-watch.sh scan [--force]
+#   fm-quota-watch.sh scan
 #
 # `scan` is an adjunct to the existing watcher poll loop, not a watcher, daemon,
 # or vendor client of its own. It self-throttles to one evaluation per
 # FM_QUOTA_SCAN_INTERVAL (default 300) per home. bin/fm-quota-lib.sh owns that
 # cadence and its marker, so the watcher poll can ask whether a scan is due
-# without paying to start one. `--force` runs the evaluation now and is for
-# tests and for a deliberate operator check.
+# without paying to start one. That cadence is the only entry: there is no mode
+# that bypasses it, so nothing invites a second scan alongside the poll's own.
 #
 # It prints one short line per event a supervisor must know about and prints
 # NOTHING otherwise, exactly like bin/fm-inactive-reconcile.sh: a quiet fleet
@@ -382,17 +382,14 @@ scan_once() {
 }
 
 cmd_scan() {
-  local force=${1:-}
   mkdir -p "$STATE" 2>/dev/null || true
-  if [ "$force" != --force ]; then
-    fm_quota_scan_due "$STATE" || return 0
-  fi
+  fm_quota_scan_due "$STATE" || return 0
   fm_quota_scan_defer "$STATE"
   scan_once
 }
 
 case "${1:-}" in
-  scan) shift; cmd_scan "${1:-}" ;;
+  scan) cmd_scan ;;
   -h|--help|help) usage ;;
   *) usage; exit 2 ;;
 esac

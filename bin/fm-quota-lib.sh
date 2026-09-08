@@ -664,9 +664,10 @@ fm_quota_nudge_record() {  # <state-dir> <id> <reset-epoch>
 
 # Claim <reset-epoch>'s one resume, atomically against any other scan. Reading
 # the durable record and writing it are one step here because they are two steps
-# everywhere else: the routine poll scan and an operator's `scan --force` can sit
-# in the same forced re-probe for seconds, and both would otherwise read the same
-# reset as unspent and deliver into the same live pane. The claim is made BEFORE
+# everywhere else: a watcher displaced by the stale-lock steal can still overlap
+# the one that replaced it, both would sit in the same forced re-probe for
+# seconds, and both would otherwise read the same reset as unspent and deliver
+# into the same live pane. The claim is made BEFORE
 # delivery, so a crash between the two costs one missed resume that the ordinary
 # stale path escalates, never a second nudge.
 #
