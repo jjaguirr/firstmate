@@ -482,18 +482,6 @@ fm_quota_fingerprint_unspent() {  # <state-dir> <id> <fingerprint>
   [ "$(head -1 "$(fm_quota_spent_path "$state" "$id")" 2>/dev/null || true)" != "$fp" ]
 }
 
-# A reset epoch as a readable instant, for the supervision reasons a human
-# eventually reads. Lives here rather than in one caller because both the scan
-# and the watcher's stale recheck report the same wait.
-fm_quota_format_reset() {  # <epoch|unknown>
-  case "$1" in
-    ''|unknown|*[!0-9]*) printf 'at an unknown time' ;;
-    *) date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null ||
-       date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null ||
-       printf 'at an unknown time' ;;
-  esac
-}
-
 fm_quota_spend_fingerprint() {  # <state-dir> <id> <fingerprint>
   local path tmp
   [ -n "$3" ] || return 0
@@ -660,7 +648,7 @@ fm_quota_wait_suppresses() {  # <state-dir> <id> <last-status-line> <admission>
 # The provider a recorded wait names, as a human reads it. `unattributed` is an
 # internal token for a worker whose provider could not be established, never a
 # vendor name, so no surface may print it as one. Lives here rather than in one
-# caller for the same reason fm_quota_format_reset does: the watcher's stale
+# caller for the same reason fm_quota_wait_reset_phrase does: the watcher's stale
 # recheck and the away-mode daemon report the same record.
 fm_quota_wait_provider_name() {  # <state-dir> <id>
   local provider
@@ -692,13 +680,18 @@ fm_quota_wait_resume_reachable() {  # <state-dir> <id>
 # The reset a recorded wait carries, as a clause a sentence about that wait can
 # take, and NOTHING at all when no reset could be read. A wait with no reset has
 # no time to state, so no surface may render one: the resume outcome below is
-# where that case is spoken, once. Lives here beside the other renderers so both
-# detection lines ask the same owner rather than each deciding locally.
+# where that case is spoken, once. This is the only place a reset is rendered at
+# all, so an unreadable one has no phrasing to reach for - every surface that
+# reports a wait takes its clause from here: both detection lines in
+# bin/fm-quota-watch.sh, the watcher's stale recheck, and the away-mode daemon.
 fm_quota_wait_reset_phrase() {  # <state-dir> <id>
-  local reset
+  local reset at
   reset=$(fm_quota_wait_field "$1" "$2" reset)
   case "$reset" in ''|*[!0-9]*) return 0 ;; esac
-  printf ', resets %s' "$(fm_quota_format_reset "$reset")"
+  at=$(date -u -d "@$reset" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) ||
+    at=$(date -u -r "$reset" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || return 0
+  [ -n "$at" ] || return 0
+  printf ', resets %s' "$at"
 }
 
 # What a reader must expect of a recorded wait. Only a resume this record can

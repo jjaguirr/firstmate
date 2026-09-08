@@ -381,9 +381,9 @@ classify_signal() {  # <reason-after-colon> <state>
 # wait is called or on what it promises.
 quota_wait_reason() {  # <state> <task>
   local state=$1 task=$2
-  printf 'waiting on the %s usage limit to reset %s; %s' \
+  printf 'waiting on the %s usage limit%s; %s' \
     "$(fm_quota_wait_provider_name "$state" "$task")" \
-    "$(fm_quota_format_reset "$(fm_quota_wait_field "$state" "$task" reset)")" \
+    "$(fm_quota_wait_reset_phrase "$state" "$task")" \
     "$(fm_quota_wait_resume_outcome "$state" "$task")"
 }
 

@@ -327,9 +327,37 @@ test_stale_quota_wait_with_no_reset_is_reported_as_needing_a_human() {
     unknown banner || fail "could not write the quota wait record"
   out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")
   case "$out" in pause\|*) ;; *) fail "a recorded quota wait did not classify as pause: $out" ;; esac
+  # The other half of the same rule, taken first: a wait that DOES carry a
+  # reachable reset states that time here and promises the resume it will get.
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9u claude claude \
+    "$(( $(date +%s) + 3600 ))" structural || fail "could not write the resumable wait record"
+  case "$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")" in
+    *"this worker is resumed automatically"*) ;;
+    *) fail "a wait whose reset is reachable was not reported as one that resumes itself" ;;
+  esac
+  printf '%s' "$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")" |
+    grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}T' ||
+    fail "a wait carrying a reset did not state that time"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9u unattributed claude \
+    unknown banner || fail "could not restore the reset-less wait record"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")
   case "$out" in *"NOT resumed automatically"*) ;; *) fail "a wait that will never be resumed promised a resume: $out" ;; esac
   case "$out" in *unattributed*) fail "the internal unattributed token was rendered as a provider name: $out" ;; esac
-  pass "a quota wait with no readable reset is reported as one nothing will resume"
+  # A wait with no reset has no time to state, so the line must carry no rendered
+  # time, in any shape a surface might reach for.
+  ! printf '%s' "$out" | grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}T|unknown time' ||
+    fail "a wait carrying no reset was described with a reset time: $out"
+
+  # The same surface, against the wait the rendered-text ceiling caps: the record
+  # carries a reset, and the deadline still retires before it, so nothing about
+  # the reset's presence may be read as a promise here either.
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_write "$state" quota-w9u claude claude \
+    "$(( $(date +%s) + 86400 ))" banner '' notice || fail "could not write the capped wait record"
+  FM_STATE_OVERRIDE="$state" fm_quota_wait_resume_reachable "$state" quota-w9u &&
+    fail "the stated reset was not capped, so this case proves nothing"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-quota-w9u" "$state")
+  case "$out" in *"NOT resumed automatically"*) ;; *) fail "a capped wait promised a resume: $out" ;; esac
+  pass "a quota wait nothing will resume is reported as one, whether its reset is unreadable or capped"
 }
 
 # The declared-wait cadence the away branch promises is a property of the pause

@@ -452,16 +452,15 @@ wedge_defer_writing() {  # <window> <since-file> <triage-label> <idle-age>
 # directions, which is the same leave-the-schedule-alone treatment every other
 # absent-evidence outcome in this file gets.
 wedge_absorb_quota_wait() {  # <window> <task> <since-file> <idle-age>
-  local win=$1 task=$2 since_file=$3 age=$4 wait_file wage reset name outcome
+  local win=$1 task=$2 since_file=$3 age=$4 wait_file wage name outcome
   wait_file=$(fm_quota_wait_path "$STATE" "$task")
   wage=$(age_of "$wait_file")
-  reset=$(fm_quota_wait_field "$STATE" "$task" reset)
   name=$(fm_quota_wait_provider_name "$STATE" "$task")
   outcome=$(fm_quota_wait_resume_outcome "$STATE" "$task")
   date +%s > "$since_file"
   clear_write_tracking "$(window_key "$win")"
   resurface_absorbed "$win" "$(fm_quota_resurfaced_path "$STATE" "$task")" "$wage" \
-    "stale: $win (idle ${age}s, waiting ${wage}s on the $name usage limit to reset $(fm_quota_format_reset "$reset"), rechecked on a long cadence not a wedge; $outcome)"
+    "stale: $win (idle ${age}s, waiting ${wage}s on the $name usage limit$(fm_quota_wait_reset_phrase "$STATE" "$task"), rechecked on a long cadence not a wedge; $outcome)"
   triage_log "absorbed stale (provider quota wait on $name, idle ${age}s): $win"
 }
 

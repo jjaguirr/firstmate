@@ -792,7 +792,19 @@ test_a_notice_stated_reset_at_the_ceiling_is_measured_on_the_reset() {
   dir=$(make_case noticeboundary "the worker is idle")
   id=$(case_id noticeboundary)
   now=$(date +%s)
-  ceiling=$FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT
+  # The ceiling comes from the documented-defaults block in
+  # docs/configuration.md, which is this repository's stated contract with an
+  # operator about what each knob does. The number that block prints is asserted
+  # to be both the default the code carries and the boundary the production
+  # deadline actually enforces, because this constant has already drifted from
+  # its documentation twice.
+  ceiling=$(sed -n 's/^FM_QUOTA_NOTICE_RESET_MAX_SECS=\([0-9][0-9]*\) *#.*/\1/p' \
+    "$ROOT/docs/configuration.md")
+  case "$ceiling" in
+    ''|*[!0-9]*) fail "noticeboundary: docs/configuration.md states no FM_QUOTA_NOTICE_RESET_MAX_SECS default" ;;
+  esac
+  [ "$ceiling" = "$FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT" ] ||
+    fail "noticeboundary: the documented ceiling $ceiling is not the default the code carries $FM_QUOTA_NOTICE_RESET_MAX_SECS_DEFAULT"
   fm_quota_wait_write "$dir/state" "$id" claude claude "$(( now + ceiling ))" banner \
     "$(fm_quota_fingerprint banner claude noticeboundary)" notice ||
     fail "noticeboundary: could not write the wait record"
@@ -810,7 +822,9 @@ test_a_notice_stated_reset_at_the_ceiling_is_measured_on_the_reset() {
   set_detected "$dir" "$id" "$now"
   fm_quota_wait_resume_reachable "$dir/state" "$id" &&
     fail "noticeboundary: a reset one second past the ceiling was not truncated"
-  pass "noticeboundary: the ceiling is measured on the reset itself, with the grace added after it"
+  [ "$(fm_quota_wait_deadline "$dir/state" "$id")" = "$(( now + ceiling ))" ] ||
+    fail "noticeboundary: a reset past the ceiling was not truncated to the documented ceiling"
+  pass "noticeboundary: the documented ceiling is the one enforced, measured on the reset with the grace after it"
 }
 
 test_a_notice_stated_reset_beyond_the_ceiling_is_capped() {
@@ -1459,13 +1473,16 @@ test_watcher_absorbs_a_recorded_wait_instead_of_escalating() {
   round=0
   while [ "$round" -lt 8 ]; do
     watch_round "$dir" "$out" || break
-    grep -q 'usage limit to reset' "$out" && break
+    grep -q 'usage limit' "$out" && break
     grep -q 'possible wedge' "$out" && break
     round=$((round + 1))
   done
 
-  assert_grep "usage limit to reset" "$out" \
+  assert_grep "usage limit" "$out" \
     "absorb: the stale recheck did not name the provider limit the worker is waiting on"
+  # The other half of the same rule: a wait that DOES carry a reset states it.
+  grep -F 'usage limit' "$out" | grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}T' ||
+    fail "absorb: the stale recheck did not state the reset the wait carries"
   assert_no_grep "possible wedge" "$out" \
     "absorb: a worker parked on a known provider limit was still escalated as a possible wedge"
   # The absorb runs before the liveness read, so 48b3ea3's affirmative-liveness
@@ -1497,12 +1514,12 @@ test_the_watcher_never_absorbs_a_terminal_status_behind_a_wait() {
   round=0
   while [ "$round" -lt 8 ]; do
     watch_round "$dir" "$out" || break
-    grep -q 'usage limit to reset' "$out" && break
+    grep -q 'usage limit' "$out" && break
     grep -q "stale: quota:fm-$id" "$out" && break
     round=$((round + 1))
   done
 
-  assert_no_grep "usage limit to reset" "$out" \
+  assert_no_grep "usage limit" "$out" \
     "absorbterminal: the watcher absorbed a blocked worker behind its quota wait"
   assert_grep "stale: quota:fm-$id" "$out" \
     "absorbterminal: a blocked worker behind a quota wait never reached the ordinary stale path"
@@ -1526,13 +1543,17 @@ test_a_wait_with_no_reset_is_never_reported_as_self_resuming() {
   round=0
   while [ "$round" -lt 8 ]; do
     watch_round "$dir" "$out" || break
-    grep -q 'usage limit to reset' "$out" && break
+    grep -q 'usage limit' "$out" && break
     grep -q 'possible wedge' "$out" && break
     round=$((round + 1))
   done
 
-  assert_grep "usage limit to reset" "$out" \
+  assert_grep "usage limit" "$out" \
     "absorbunknown: the stale recheck did not name the provider limit the worker is waiting on"
+  # A wait with no reset has no time to state, so every line that names this
+  # limit must carry no rendered time, in any shape a surface might reach for.
+  ! grep -F 'usage limit' "$out" | grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2}T|unknown time' ||
+    fail "absorbunknown: a wait carrying no reset was described with a reset time"
   assert_grep "NOT resumed automatically" "$out" \
     "absorbunknown: a wait with no readable reset was not reported as needing a human"
   assert_no_grep "this worker is resumed automatically" "$out" \
@@ -1540,6 +1561,44 @@ test_a_wait_with_no_reset_is_never_reported_as_self_resuming() {
   assert_no_grep "the unattributed usage limit" "$out" \
     "absorbunknown: the internal unattributed token was rendered as a provider name"
   pass "absorbunknown: a wait with no readable reset is surfaced as one nothing will resume"
+}
+
+# The fourth surface a wait reaches a person through, against the wait the
+# ceiling caps. The record carries a reset, so nothing about its presence tells
+# this surface anything; only the deadline does.
+test_the_watcher_never_reports_a_capped_wait_as_self_resuming() {
+  local dir id out round
+  dir=$(make_case absorbcapped "the worker stopped mid-task")
+  id=$(case_id absorbcapped)
+  set_busy_state "$dir" "$id" idle || fail "absorbcapped: could not record an idle busy state"
+  make_fake_crew_state "$dir" "state: unknown · source: none · idle"
+  # A notice claiming a reset a full day out, which the ceiling truncates to six
+  # hours after detection. The wait is current, so the pane is absorbed - but the
+  # resume its reset implies is never delivered.
+  fm_quota_wait_write "$dir/state" "$id" claude claude "$(( $(date +%s) + 86400 ))" banner \
+    "$(fm_quota_fingerprint banner claude absorbcapped)" notice ||
+    fail "absorbcapped: could not write the wait record"
+  fm_quota_wait_resume_reachable "$dir/state" "$id" &&
+    fail "absorbcapped: the stated reset was not capped, so this case proves nothing"
+  write_quota_json "$dir/quota.json" claude through_reset "$(iso_in 3600)"
+  out="$dir/watch.out"
+  : > "$out"
+
+  round=0
+  while [ "$round" -lt 8 ]; do
+    watch_round "$dir" "$out" || break
+    grep -q 'usage limit' "$out" && break
+    grep -q 'possible wedge' "$out" && break
+    round=$((round + 1))
+  done
+
+  assert_grep "usage limit" "$out" \
+    "absorbcapped: the stale recheck did not name the provider limit the worker is waiting on"
+  assert_grep "NOT resumed automatically" "$out" \
+    "absorbcapped: a wait the ceiling caps was not reported as one nothing will resume"
+  assert_no_grep "this worker is resumed automatically" "$out" \
+    "absorbcapped: a capped wait promised an automatic resume the ceiling retires first"
+  pass "absorbcapped: the watcher's stale recheck never describes a capped wait as self-resuming"
 }
 
 test_the_suppression_owner_honours_both_guards
@@ -1579,4 +1638,5 @@ test_a_local_secondmate_is_treated_like_any_other_worker
 test_an_unreachable_endpoint_is_never_nudged
 test_watcher_absorbs_a_recorded_wait_instead_of_escalating
 test_a_wait_with_no_reset_is_never_reported_as_self_resuming
+test_the_watcher_never_reports_a_capped_wait_as_self_resuming
 test_the_watcher_never_absorbs_a_terminal_status_behind_a_wait
