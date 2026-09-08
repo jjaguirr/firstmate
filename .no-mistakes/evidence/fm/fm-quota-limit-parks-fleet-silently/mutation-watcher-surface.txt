@@ -1,0 +1,39 @@
+ok - suppression: the one owner refuses a terminal status and refuses the busy-turn-bound path
+ok - provider attribution: single-vendor harness, catalogued model, no guess, no contradiction
+ok - structural: an exhausted account records a bounded wait with its reset time, with no banner present
+ok - banner: a rendered limit notice alone records a wait when account headroom cannot be read
+ok - bannernoreset: a banner-detected wait whose notice states no reset is never reported with a time
+ok - outranked: a rendered limit notice never overrides an account the vendor reports as having headroom
+ok - busy: an exhausted account never parks a worker whose pane is still rendering a turn
+ok - unreadable: a worker whose current state cannot be positively classified is never recorded as parked
+ok - resume: exactly one nudge per reset, and the wait retires so ordinary supervision resumes
+ok - cachedresume: the account is re-read fresh before a resume, never from the reuse window
+ok - oneprobe: one account is re-read once per scan, however many workers come due in it
+ok - norresume: a resume is never delivered into an endpoint whose state cannot be positively classified
+ok - working: a worker that is already working again is never sent a resume
+ok - stillrefused: an account still refusing at the wait's own deadline retires it rather than extending it
+ok - expiry: a wait with no readable reset retires on its own bound and is never resumed blindly
+ok - grace: a wait whose reset has passed but whose resume is not yet due survives to deliver it
+ok - bannerreset: a notice that states its reset waits until then and resumes on a home with no quota-axi
+ok - parked: an exhausted account never records a wait for a worker whose own state explains its idleness
+ok - deadendpoint: an exhausted account never parks a pane whose endpoint reports no live agent
+ok - noticeinside: a reset a notice states below the ceiling still governs the wait
+ok - noticeboundary: the documented ceiling is the one enforced, measured on the reset with the grace after it
+ok - noticebeyond: a reset only a notice claims is capped, while the account's own reset is not
+ok - noticecapped: a wait the ceiling caps neither promises nor delivers an automatic resume
+ok - noticedetect: a notice stating a reset past the ceiling is never announced as self-resuming
+ok - structcapped: a structural wait whose borrowed reset is capped is never announced as self-resuming
+ok - deadwait: a wait whose endpoint stops reporting a live agent is retired instead of absorbing the wedge path
+ok - sharedsnapshot: a resume reads its account into a snapshot of its own, never the one the scan shares
+ok - noreset: an exhausted account takes its reset from the notice while the verdict stays structural
+ok - noresetnobanner: an exhausted account with no reset anywhere still records a bounded structural wait
+ok - blockedworker: a worker holding a declared blocker is never quota-parked and never nudged
+ok - badbound: a bound this code cannot read as a number degrades to the documented default
+ok - oneclaim: one reset is claimed by exactly one scan, and a dead holder never blocks a later one
+ok - respend: evidence that already produced a wait cannot produce another, while a moved reset can
+ok - respendunknown: spent evidence cannot record a second wait, while changed evidence still can
+ok - mate: a persistent mate whose endpoint this home can read is resumed on the same terms as any worker
+ok - remote: an endpoint this home cannot probe is reported rather than nudged blind
+ok - absorb: a recorded quota wait is rechecked on the bounded cadence, never escalated as a wedge
+not ok - absorbunknown: a wait carrying no reset was described with a reset time
+exit=1

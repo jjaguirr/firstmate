@@ -1,0 +1,41 @@
+
+=== 1. the incident: a refused worker whose pane and status look like a finished turn ===
+worker id:        taskincident (harness=claude, kind=ship)
+last status line: working: implementing the fix
+pane renders:     You have hit your session limit, resets 8:50am
+account reads:    exhausted_now, resets 2026-09-08T13:31:35Z (2h45m out, as the incident stated)
+quota wait record: none yet
+
+=== 2. bin/fm-quota-watch.sh scan - what the operator sees ===
+quota-limit: taskincident is waiting on claude, resets 2026-09-08T13:31:35Z; this worker is resumed automatically when that limit resets
+
+=== the record the scan persisted (state/taskincident.quota-wait) ===
+v1 provider=claude harness=claude reset=1788874295 evidence=structural detected=1788864395 fp=structural:claude:1788874295 reset_src=vendor
+reset, rendered:  2026-09-08T13:31:35Z
+
+=== 3. bin/fm-watch.sh supervision round - absorbed, not escalated as a wedge ===
+  stale: quota:fm-taskincident
+  stale: quota:fm-taskincident (idle 2s, waiting 11s on the claude usage limit, resets 2026-09-08T13:31:35Z, rechecked on a long cadence not a wedge; this worker is resumed automatically when that limit resets)
+wedge alarms raised: 0
+
+=== 4. the reset arrives - exactly one resume nudge, and only one ===
+wait record now carries a reset already past; account reads through_reset
+quota-limit: taskincident was resumed automatically now that its provider limit has reset
+nudges delivered (fm-send stand-in log):
+  quota:fm-taskincident	The provider usage limit that stopped your last turn has reset - continue the task you were working on from where it stopped.
+second scan over the same reset:
+total nudges after the second scan: 1
+wait record after the resume: retired, ordinary supervision owns this pane again
+
+=== 5. a notice that states no reset time - recorded, never described with a time ===
+pane renders:     Usage limit reached
+account:          unreadable (no quota-axi on this home)
+quota-limit: tasknoclock reports a provider limit on the claude runtime and account headroom could not be read; no reset time could be read, so this worker is NOT resumed automatically
+
+=== the record that detection persisted ===
+v1 provider=claude harness=claude reset=unknown evidence=banner detected=1788864408 fp=banner:2009573119 reset_src=notice
+
+=== the same wait on the away-mode digest surface (bin/fm-supervise-daemon.sh) ===
+pause|paused (waiting on the claude usage limit; no reset time could be read, so this worker is NOT resumed automatically), rechecked on a long cadence
+
+done

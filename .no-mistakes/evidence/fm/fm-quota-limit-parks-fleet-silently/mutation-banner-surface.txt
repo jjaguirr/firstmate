@@ -1,0 +1,6 @@
+ok - suppression: the one owner refuses a terminal status and refuses the busy-turn-bound path
+ok - provider attribution: single-vendor harness, catalogued model, no guess, no contradiction
+ok - structural: an exhausted account records a bounded wait with its reset time, with no banner present
+ok - banner: a rendered limit notice alone records a wait when account headroom cannot be read
+not ok - bannernoreset: a wait carrying no reset was detected with a reset time
+exit=1

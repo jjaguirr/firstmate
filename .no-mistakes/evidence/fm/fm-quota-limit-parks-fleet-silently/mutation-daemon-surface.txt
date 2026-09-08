@@ -1,0 +1,16 @@
+ok - fm-afk-start.sh fails before daemon startup when the afk flag cannot be written
+ok - fm-afk-start.sh ignores stale pidfile-only live pids
+ok - fm-afk-start.sh reclaims stale daemon locks whose live pid identity no longer matches
+ok - supervise daemon state root is scoped by FM_HOME
+ok - routine signal self-handles
+ok - captain-relevant status verbs escalate
+ok - check + unknown escalate; heartbeat self-handles
+ok - transient stale self-handles and records a persistence marker
+ok - enriched stale wedges bypass status absorption without disturbing busy workers
+ok - stale + terminal status escalates immediately
+ok - paused reasons with captain phrases remain pause-classified
+ok - a captain-held transfer classifies as pause, not as a wedge candidate
+ok - a recorded provider quota wait classifies as pause, and retiring it restores wedge aging
+ok - a recorded quota wait never stands in front of a terminal status
+not ok - a wait carrying no reset was described with a reset time: pause|paused (waiting on the provider usage limit, resets at an unknown time; no reset time could be read, so this worker is NOT resumed automatically), rechecked on a long cadence
+exit=1
