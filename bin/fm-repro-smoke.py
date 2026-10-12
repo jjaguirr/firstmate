@@ -51,7 +51,7 @@ def main():
             def captain(prompt):
                 return run(['pi','--print','--no-session','--no-tools','--no-mcp','--no-extensions','--no-skills','--no-context-files','--model',config['models']['captain'],'--thinking','minimal',prompt],timeout=config['timeout_seconds'],cwd=lab)
             assert 'FM_CAPTAIN_READY' in captain('Reply exactly FM_CAPTAIN_READY.'),'captain readiness assertion'
-            run(['bash','bin/fm-spawn.sh','smoke',str(project),'--scout','--harness','pi','--model',config['models']['scout'],'--effort','minimal','--backend','tmux'],timeout=config['timeout_seconds'])
+            run(['bash','bin/fm-spawn.sh','smoke',str(project),'--scout','--harness','pi','--model',config['models']['scout'],'--effort','low','--backend','tmux'],timeout=config['timeout_seconds'])
             receipt['dispatch']='real fm-spawn.sh'
             meta=(home/'state/smoke.meta').read_text()
             assert 'kind=scout' in meta and config['models']['scout'] in meta,'dispatch metadata assertion'
