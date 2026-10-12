@@ -48,6 +48,7 @@ def main():
             (project/'fixture.txt').write_text('tiny deterministic smoke fixture\n')
             run(['git','add','fixture.txt'],cwd=project)
             run(['git','-c','user.name=Smoke','-c','user.email=smoke@invalid','commit','-qm','fixture'],cwd=project)
+            run(['git','remote','add','origin',str(project)],cwd=project)
             def captain(prompt):
                 return run(['pi','--print','--no-session','--no-tools','--no-mcp','--no-extensions','--no-skills','--no-context-files','--model',config['models']['captain'],'--thinking','minimal',prompt],timeout=config['timeout_seconds'],cwd=lab)
             assert 'FM_CAPTAIN_READY' in captain('Reply exactly FM_CAPTAIN_READY.'),'captain readiness assertion'
