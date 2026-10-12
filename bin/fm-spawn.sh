@@ -1289,7 +1289,15 @@ launch_template() {
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     pi|pi-signed)
+      case "${FM_PI_NO_TOOLS:-0}" in
+        0) ;;
+        1) ;;
+        *) printf '%s\n' 'FM_PI_NO_TOOLS must be 0 or 1' >&2; return 1 ;;
+      esac
       printf '%s' '__PIBIN____PITUIMODE__'
+      if [ "${FM_PI_NO_TOOLS:-0}" = 1 ]; then
+        printf '%s' ' --no-tools --no-mcp --no-extensions --no-skills --no-context-files'
+      fi
       if [ "$kind" = secondmate ]; then
         printf '%s' ' __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
